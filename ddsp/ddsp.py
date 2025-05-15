@@ -4,11 +4,13 @@ import torch
 import numpy as np
 import auraloss
 import laion_clap
+from music2latent import EncoderDecoder
+from music2latent.audio import to_representation_encoder
 
 from ddsp.blocks import VariationalEncoder, Decoder
-from ddsp.synths import SineSynth, NoiseBandSynth
+from ddsp.synths import BaseSynth, SineSynth, NoiseBandSynth
 
-from typing import List, Tuple, Dict
+from typing import List, Tuple, Dict, Callable
 
 class CLAPLoss(torch.nn.Module):
   def __init__(self):
@@ -22,7 +24,25 @@ class CLAPLoss(torch.nn.Module):
       x_emb = self.clap.get_audio_embedding_from_data(x.reshape(x.shape[0], -1).float(), use_tensor=True)
       y_emb = self.clap.get_audio_embedding_from_data(y.reshape(y.shape[0], -1).float(), use_tensor=True)
 
-    return torch.nn.functional.mse_loss(x_emb, y_emb, reduction='mean')
+    return 1-torch.nn.functional.cosine_similarity(x_emb, y_emb).mean()
+
+class M2LLoss(torch.nn.Module):
+  def __init__(self):
+    super().__init__()
+    self.m2l = EncoderDecoder()
+    self.m2l.gen.eval()
+
+  def forward(self, x: torch.tensor, y: torch.tensor):
+    # with torch.no_grad():
+    x_repr = to_representation_encoder(x.detach().squeeze(1))
+    x_emb = self.m2l.gen.encoder(x_repr, extract_features=True)
+
+    y_repr = to_representation_encoder(y.squeeze(1))
+    y_emb = self.m2l.gen.encoder(y_repr, extract_features=True)
+
+    return torch.nn.functional.mse_loss(y_emb, x_emb).mean()
+    # return 1-torch.nn.functional.cosine_similarity(x_emb, y_emb).mean()
+
 
 class DDSP(L.LightningModule):
   """
@@ -30,12 +50,11 @@ class DDSP(L.LightningModule):
   precalculated, loopable noise bands.
 
   Args:
-    - n_filters: int, the number of filters in the filterbank
-    - n_sines: int, the number of sines to synthesise
+    - synth_builders: List[Callable[[], BaseSynth]], the differentiable synthesiser builders
     - latent_size: int, number of latent dimensions
     - fs : int, the sampling rate of the input signal
     - encoder_ratios: List[int], the capacity ratios for encoder layers
-    - n_mfcc: int, the number of MFCCs to extract
+    - n_melbands: int, the number of MFCCs to extract
     - decoder_ratios: List[int], the capacity ratios for decoder layers
     - capacity: int, the capacity of the model
     - resampling_factor: int, internal up / down sampling factor for control signal and noisebands
@@ -45,17 +64,17 @@ class DDSP(L.LightningModule):
     - device: str, the device to run the model on
   """
   def __init__(self,
-               n_filters: int = 2048,
-               n_sines: int = 500,
+               synth_builders: Callable[[], BaseSynth],
                latent_size: int = 16,
                fs: int = 44100,
                encoder_ratios: List[int] = [8, 4, 2],
-               n_mfcc: int = 30,
+               n_melbands: int = 128,
                decoder_ratios: List[int] = [2, 4, 8],
                capacity: int = 64,
                resampling_factor: int = 32,
                learning_rate: float = 1e-3,
                kld_weight: float = 0.00025,
+               perceptual_loss_weight: float = 1.0,
                streaming: bool = False,
                device: str = 'cuda'):
     super().__init__()
@@ -66,18 +85,12 @@ class DDSP(L.LightningModule):
     self.latent_size = latent_size
     self.resampling_factor = resampling_factor
 
-    if n_filters == 0 and n_sines == 0:
-      raise ValueError("At least one of n_filters or n_sines must be greater than 0.")
+    # self.synths = synths
+    self.synths = [builder() for builder in synth_builders]
+    total_synth_params = sum([s.n_params for s in self.synths])
+    # total_synth_params = 1000
 
-    # Noisebands synthesiser
-    self._noisebands_synth = None
-    if n_filters > 0:
-      self._noisebands_synth = NoiseBandSynth(n_filters=n_filters, fs=fs, resampling_factor=self.resampling_factor, device=self._device)
-
-    # Sine synthesiser
-    self._sine_synth = None
-    if n_sines > 0:
-      self._sine_synth = SineSynth(n_sines=n_sines, fs=fs, resampling_factor=self.resampling_factor, streaming=streaming)
+    # self.synths = [NoiseBandSynth(n_filters=1000, fs=fs, resampling_factor=resampling_factor)]
 
     # ELBO regularization params
     self._beta = 0
@@ -90,21 +103,27 @@ class DDSP(L.LightningModule):
       sample_rate=fs,
       latent_size=latent_size,
       streaming=streaming,
-      n_mfcc=n_mfcc,
+      n_melbands=n_melbands,
       resampling_factor=self.resampling_factor,
+      features=False
     )
 
     ## Decoder to predict the amplitudes of the noise bands
     self.decoder = Decoder(
+      n_params=total_synth_params,
       latent_size=latent_size,
       layer_sizes=(np.array(decoder_ratios)*capacity).tolist(),
-      n_bands=n_filters,
       streaming=streaming,
-      n_sines=n_sines,
     )
 
     # Define the loss
-    self._recons_loss = self._construct_mrstft_loss() # MRSTFT loss
+    self._mr_stft_loss = self._construct_mrstft_loss() # MRSTFT loss
+    self._mr_mel_loss = self._construct_mel_loss() # MEL-scale loss
+    self._mr_chroma_loss = self._construct_chroma_loss() # CHROMA-scale loss
+
+    # Perceptual loss
+    self._m2l_loss = M2LLoss()
+    self._perceptual_loss_weight = perceptual_loss_weight
     # self._recons_loss = CLAPLoss() # CLAP loss
 
     # Learning rate
@@ -131,7 +150,7 @@ class DDSP(L.LightningModule):
 
     # Predict the parameters of the synthesiser and synthesize
     synth_params = self.decoder(z)
-    signal = self._synthesize(*synth_params)
+    signal = self._synthesize(synth_params)
     return signal
 
 
@@ -153,10 +172,10 @@ class DDSP(L.LightningModule):
 
     self.log("recons_loss", losses["recons_loss"], prog_bar=True, logger=True)
     self.log("kld_loss", losses["kld_loss"], prog_bar=True, logger=True)
+    self.log("m2l_loss", losses["m2l_loss"], prog_bar=True, logger=True)
     self.log("train_loss", losses["loss"], prog_bar=True, logger=True)
     self.log("beta", self._beta, prog_bar=True, logger=True)
     self.log('lr', self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=True)
-
 
     return losses["loss"]
 
@@ -196,18 +215,26 @@ class DDSP(L.LightningModule):
     synth_params = self.decoder(z)
 
     # Synthesize the output signal
-    y_audio = self._synthesize(*synth_params)
+    y_audio = self._synthesize(synth_params)
 
     # Compute the reconstruction loss
-    recons_loss = self._reconstruction_loss(y_audio, x_audio)
+    recons_loss = self._reconstruction_loss(y_audio.float(), x_audio.float())
 
     # Compute the total loss using β parameter
     loss = recons_loss + self._kld_weight * self._beta * kld_loss
+
+    m2l_loss = 0
+    # Compute the perceptual loss with music2latent
+    if self._perceptual_loss_weight > 0.0:
+      m2l_loss = self._m2l_loss(y_audio, x_audio)
+      loss += self._perceptual_loss_weight * m2l_loss
+    # loss = m2l_loss
 
     # Construct losses dictionary
     losses = {
       "recons_loss": recons_loss,
       "kld_loss": kld_loss,
+      "m2l_loss": m2l_loss,
       "loss": loss
     }
 
@@ -250,30 +277,27 @@ class DDSP(L.LightningModule):
     return [optimizer], [scheduler]
 
 
-  def _synthesize(self, noiseband_amps: torch.Tensor, sine_freqs: torch.Tensor, sine_amps: torch.Tensor) -> torch.Tensor:
+  def _synthesize(self, params: torch.Tensor) -> torch.Tensor:
     """
     Synthesizes a signal from the predicted amplitudes and the baked noise bands.
     Args:
-      - noiseband_amps: torch.Tensor[batch_size, n_bands, sig_length], the predicted amplitudes of the noise bands
-      - sine_freqs: torch.Tensor[batch_size, n_sines, sig_length], the predicted frequencies of the sines
-      - sine_amps: torch.Tensor[batch_size, n_sines, sig_length], the predicted amplitudes of the sines
+      - params: torch.Tensor[batch_size, params, sig_length], the predicted synth parameters
     Returns:
       - signal: torch.Tensor[batch_size, sig_length], the synthesized signal
     """
-    if self._sine_synth is not None:
-      sines = self._sine_synth(sine_freqs, sine_amps)
-    if self._noisebands_synth is not None:
-      noisebands = self._noisebands_synth(noiseband_amps)
+    params_idx = 0
+    audio = []
+    for synth in self.synths:
+      synth_params = params[:, params_idx:synth.n_params, :]
+      params_idx += synth.n_params
+      audio.append(synth(synth_params))
 
-    if self._sine_synth is not None and self._noisebands_synth is not None:
-      return torch.sum(torch.hstack([noisebands, sines]), dim=1, keepdim=True)
-    elif self._sine_synth is not None:
-      return sines
-    elif self._noisebands_synth is not None:
-      return noisebands
+    return torch.sum(torch.hstack(audio), dim=1, keepdim=True)
+
 
   def _reconstruction_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Computes the reconstruction loss"""
+    """Computes the reconstruction loss using weighted sum of perceptually
+    weighted multi-resolution chroma STFT and mel STFT with a regular MR-STFT"""
     if y.dim() == 2:
       y = y.unsqueeze(1)
 
@@ -283,12 +307,44 @@ class DDSP(L.LightningModule):
       x = x[..., :min_length]
       y = y[..., :min_length]
 
-    return self._recons_loss(y, x)
+    w_stft = 0.5
+    w_mel = 1.0
+    w_chroma = 0.1
+
+    loss = (w_stft * self._mr_stft_loss(y, x) \
+        + w_chroma * self._mr_chroma_loss(y, x) \
+        + w_mel * self._mr_mel_loss(y, x) \
+      ) / (w_stft + w_mel + w_chroma)
+    return loss
+
+  @torch.jit.ignore
+  def _construct_mel_loss(self):
+    """Construct the loss function for the model: a multi-resolution STFT loss"""
+    fft_sizes = np.array([32768, 16384, 8192, 4096, 2048])
+    return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[32768, 16384, 8192, 4096, 2048],
+                                                hop_sizes=fft_sizes//4,
+                                                win_lengths=fft_sizes,
+                                                scale='mel',
+                                                n_bins=256,
+                                                sample_rate=self.fs,
+                                                perceptual_weighting=True).to(self._device)
+
+  @torch.jit.ignore
+  def _construct_chroma_loss(self):
+    fft_sizes = np.array([16384, 8192, 4096])
+    return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[16384, 8192, 4096],
+                                                hop_sizes=fft_sizes//4,
+                                                win_lengths=fft_sizes,
+                                                scale='chroma',
+                                                n_bins=128,
+                                                sample_rate=self.fs,
+                                                perceptual_weighting=True).to(self._device)
 
   @torch.jit.ignore
   def _construct_mrstft_loss(self):
     """Construct the loss function for the model: a multi-resolution STFT loss"""
-    fft_sizes = np.array([8192, 4096, 2048, 1024, 512, 128, 32])
-    return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[8192, 4096, 2048, 1024, 512, 128, 32],
+    fft_sizes = np.array([1024, 512, 128, 64, 32])
+    return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[1024, 512, 128, 64, 32],
                                                 hop_sizes=fft_sizes//4,
-                                                win_lengths=fft_sizes)
+                                                win_lengths=fft_sizes).to(self._device)
+

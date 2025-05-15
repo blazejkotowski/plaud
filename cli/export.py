@@ -140,7 +140,7 @@ class PriorWrapper(torch.nn.Module):
     else:
       self.prior_buffer[:, self.current_buffer_len:self.current_buffer_len+seq_len, :] = x
       self.current_buffer_len += seq_len
-  
+
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     """
@@ -152,7 +152,7 @@ class PriorWrapper(torch.nn.Module):
     # Ignore the batch dimension
     transposition = x[:1, :-2, :]
     temperature = x[:1, -2, :]
-    prediction_annealing = 1 - x[:1, -1, :] 
+    prediction_annealing = 1 - x[:1, -1, :]
 
     steps = x.shape[-1]
 
@@ -178,7 +178,7 @@ class PriorWrapper(torch.nn.Module):
       if current_len >= self.max_len:
         local_buffer[:, :self.init_primer_len, :] = local_buffer[:, -self.init_primer_len:, :].clone()
         current_len = self.init_primer_len
-    
+
     if x.size(0) > 1:
       output = output.repeat_interleave(x.size(0), dim=0)
 
@@ -246,8 +246,14 @@ if __name__ == '__main__':
       torch.zeros(1, 1, 2**14),
     ).save(config.output_path)
   elif format == 'ts':
-    ddsp._trainer = L.Trainer() # ugly workaround
-    ddsp._recons_loss = None # for the torchscript
+    # ugly workaround for the torchscript
+    ddsp._trainer = L.Trainer()
+    ddsp._recons_loss = None
+    ddsp._mr_stft_loss = None
+    ddsp._mr_mel_loss = None
+    ddsp._mr_chroma_loss = None
+    ddsp._m2l_loss = None
+
     ddsp.eval()
 
 

@@ -4,8 +4,11 @@ import torch.nn.functional as F
 import cached_conv as cc
 import math
 from torchaudio.transforms import MFCC, MelSpectrogram
+import torch.jit as jit
 
 from typing import Tuple, List
+
+# from .feature_extractor import FeatureExtractor
 
 def _make_mlp(in_size: int, hidden_layers: int, hidden_size: int) -> cc.CachedSequential:
   """
@@ -67,7 +70,8 @@ class VariationalEncoder(nn.Module):
                layer_sizes: List[int] = [128, 64, 32],
                latent_size: int = 16,
                resampling_factor: int = 32,
-               n_mfcc: int = 30,
+               n_melbands: int = 128,
+               features: bool = False,
                streaming: bool = False):
     """
     Arguments:
@@ -76,19 +80,25 @@ class VariationalEncoder(nn.Module):
       - latent_size: int, the size of the output latent space
       - resampling_factor: int, the factor by which to downsample the mfccs
       - n_mfcc : int, the number of mfccs to extract
+      - features: bool, if True, the model will precalculate the features on the input
       - streaming: bool, streaming mode (realtime)
     """
     super().__init__()
 
     self.streaming = streaming
+    self.features = features
 
     self.resampling_factor = resampling_factor
-    self.mfcc = MFCC(sample_rate = sample_rate, n_mfcc = n_mfcc)
-    # self.mfcc = MelSpectrogram(sample_rate, n_mels=n_mfcc)
+    # self.mfcc = MFCC(sample_rate = sample_rate, n_mfcc = n_mfcc)
+    self.mfcc = MelSpectrogram(sample_rate, n_mels=n_melbands)
 
-    self.normalization = nn.LayerNorm(n_mfcc)
+    self.normalization = nn.LayerNorm(n_melbands)
 
-    self.gru = nn.GRU(n_mfcc, layer_sizes[0], batch_first = True)
+    # if features:
+    #   self._feature_extaractor = FeatureExtractor()
+    #   gru_input_size += FeatureExtractor.N_FEATURES
+
+    self.gru = nn.GRU(n_melbands, layer_sizes[0], batch_first = True)
     self.register_buffer('_hidden_state', torch.zeros(1, 1, layer_sizes[0]), persistent=False)
 
     self.bottleneck = _make_sequential(layer_sizes)
@@ -110,8 +120,17 @@ class VariationalEncoder(nn.Module):
     # Expand the MFCCs to match the audio length
     mfcc = F.interpolate(mfcc, size = audio.shape[-1], mode = 'nearest')
 
-    # Downsample the MFCCs
-    x = F.interpolate(mfcc, scale_factor = 1/self.resampling_factor, mode = 'linear')
+    input = mfcc
+
+    # Features
+    # if self.features:
+    #   features = self._calculate_features(audio)
+    #   print("features shape", features.shape)
+    #   print("mfcc shape", mfcc.shape)
+    #   input = torch.cat([mfcc, features], dim = 1)
+
+    # Downsample the input representation
+    x = F.interpolate(input, scale_factor = 1/self.resampling_factor, mode = 'linear')
 
     # Reshape to [batch_size, signal_length, n_mfcc]
     x = x.permute(0, 2, 1)
@@ -154,18 +173,30 @@ class VariationalEncoder(nn.Module):
 
     return z, kl
 
+  @jit.ignore
+  def _calculate_features(self, audio: torch.Tensor) -> torch.Tensor:
+    """
+    Calculate the features of the audio signal.
+    Arguments:
+      - audio: torch.Tensor[batch_size, n_samples], the input audio tensor
+    Returns:
+      - features: torch.Tensor, the features of the audio signal
+    """
+    # Placeholder for feature calculation
+    return FeatureExtractor()(audio)
+
+
 
 class Decoder(nn.Module):
   def __init__(self,
-               n_bands: int = 512,
-               n_sines: int = 500,
+               n_params: int = 500,
                latent_size: int = 16,
                layer_sizes: List[int] = [32, 64, 128],
                output_mlp_layers: int = 3,
                streaming: bool = False):
     """
     Arguments:
-      - n_bands: int, the number of noise bands
+      - n_params: int, the number of synthesis parameters
       - latent_size: int, the size of the latent space
       - layer_sizes: List[int], the sizes of the layers in the bottleneck
       - output_mlp_layers: int, the number of layers in the output MLP
@@ -173,8 +204,7 @@ class Decoder(nn.Module):
     """
     super().__init__()
 
-    self.n_bands = n_bands
-    self.n_sines = n_sines
+    self.n_params = n_params
     self.streaming = streaming
 
     # MLP mapping from the latent space
@@ -190,7 +220,7 @@ class Decoder(nn.Module):
     self.inter_mlp = _make_mlp(hidden_size, output_mlp_layers, hidden_size)
 
     # Output layer predicting noiseband amplitudes, and sine frequencies and amplitudes
-    self.output_params = nn.Linear(hidden_size, n_bands + n_sines * 2 + 1)
+    self.output_params = nn.Linear(hidden_size, n_params)
 
 
   def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -219,8 +249,4 @@ class Decoder(nn.Module):
     # Pass through the output layer
     output = _scaled_sigmoid(self.output_params(x))
 
-    noiseband_amps = output[..., :self.n_bands].permute(0, 2, 1)
-    sine_freqs = output[..., self.n_bands:self.n_bands + self.n_sines].permute(0, 2, 1)
-    sine_amps = output[..., self.n_bands + self.n_sines:].permute(0, 2, 1)
-
-    return noiseband_amps, sine_freqs, sine_amps
+    return output.permute(0, 2, 1)

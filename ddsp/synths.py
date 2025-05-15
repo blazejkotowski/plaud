@@ -7,6 +7,8 @@ import numpy as np
 
 from ddsp.filterbank import FilterBank
 
+from typing import Type, Callable
+
 class BaseSynth(nn.Module):
   """
   Base class for synthesizers.
@@ -22,6 +24,26 @@ class BaseSynth(nn.Module):
 
   def forward(self, *args, **kwargs):
     raise NotImplementedError
+
+  @property
+  def n_params(self) -> int:
+    """Returns the number of control parameters"""
+    raise NotImplementedError
+
+  @classmethod
+  def builder(cls: Type['BaseSynth'], **kwargs) -> Callable[[], 'BaseSynth']:
+    """
+    Returns a builder function that instantiates the class with the given arguments.
+
+    Usage:
+      synth_builder = SineSynth.builder(n_sines=100)
+      synth = synth_builder()  # creates a new instance of SineSynth
+    """
+    def _builder():
+      return cls(**kwargs)
+    return _builder
+
+
 
 class NoiseBandSynth(BaseSynth):
   """
@@ -47,6 +69,11 @@ class NoiseBandSynth(BaseSynth):
 
     # Shift of the noisebands between inferences, to maintain continuity
     self._noisebands_shift = 0
+
+
+  @property
+  def n_params(self):
+    return len(self._filterbank.noisebands)
 
 
   def forward(self, amplitudes: torch.Tensor) -> torch.Tensor:
@@ -85,6 +112,66 @@ class NoiseBandSynth(BaseSynth):
     """Delegate the noisebands to the filterbank object."""
     return self._filterbank.noisebands
 
+
+
+class HarmonicSynth(BaseSynth):
+  """
+  Harmonic synthesizer that generates a signal as a sum of harmonically-related sine waves.
+
+  Arguments:
+    - n_harmonics: int, the maximum number of harmonics to synthesize
+    - fs: int, sampling rate
+    - resampling_factor: int, upsampling factor for control parameters
+    - streaming: bool, whether to use continuous phase (not implemented here yet)
+    - device: str, computation device
+  """
+  def __init__(self,
+              n_harmonics: int = 100,
+              fs: int = 44100,
+              resampling_factor: int = 32,
+              streaming: bool = False,
+              device: str = 'cuda'):
+    super().__init__(fs=fs, resampling_factor=resampling_factor)
+    self._n_harmonics = n_harmonics
+    self._streaming = streaming
+    self._device = device
+
+  @property
+  def n_params(self):
+    return self._n_harmonics + 1  # 1 pitch + n_harmonics amplitudes
+
+  def forward(self, parameters: torch.Tensor, amplitudes: torch.Tensor) -> torch.Tensor:
+    """
+    Synthesizes a harmonic signal.
+
+    Arguments:
+      - parameters: [batch_size, 1+n_harmonics, time], fundamental frequency in Hz and amplitudes per harmonic
+    Returns:
+      - signal: [batch_size, 1, time], synthesized signal
+    """
+    pitch = parameters[:, :1, :]
+    amplitudes = parameters[:, 1:, :]
+
+    # Upsample inputs to match the target sample rate
+    pitch = F.interpolate(pitch, scale_factor=float(self._resampling_factor), mode='linear')
+    amplitudes = F.interpolate(amplitudes, scale_factor=float(self._resampling_factor), mode='linear')
+
+    # Compute angular frequency (omega) by integrating pitch over time
+    omega = torch.cumsum(2 * math.pi * pitch / self._fs, dim=-1)  # [B, 1, T]
+
+    # Generate harmonic numbers [1, 2, ..., n]
+    harmonics = torch.arange(1, self._n_harmonics + 1, device=omega.device).view(1, -1, 1)  # [1, n, 1]
+
+    # Multiply each harmonic index with base omega
+    omegas = omega * harmonics  # [B, n_harmonics, T]
+
+    # Compute signal as weighted sum of harmonic sines
+    signal = (torch.sin(omegas) * amplitudes).sum(dim=1, keepdim=True)  # [B, 1, T]
+
+    return signal
+
+
+
 class SineSynth(BaseSynth):
   """
   Mixture of sinweaves synthesiser.
@@ -111,23 +198,28 @@ class SineSynth(BaseSynth):
     self._device = device
 
     # self._base_freqs = torch.linspace(40, self._fs / 2, self._n_sines, device=self._device)
-    # self._base_freqs = 
+    # self._base_freqs =
     self.register_buffer('_base_freqs', self._bark_freqs(self._fs, self._n_sines, device=self._device))
     # shift ranges are the maximum shift according to the difference between the base frequencies
     shift_ranges = (self._base_freqs[1:] - self._base_freqs[:-1]) / 2
     shift_ranges = torch.cat((shift_ranges, shift_ranges[-1].view(1)))
     self.register_buffer('_shift_ranges', shift_ranges)
-    
+
+  @property
+  def n_params(self):
+    return 2*self._n_sines + 1
 
 
-  def forward(self, shift_ratios: torch.Tensor, amplitudes: torch.Tensor):
+  def forward(self, parameters: torch.Tensor):
     """
     Generates a mixture of sinewaves with the given frequencies and amplitudes per sample.
 
     Arguments:
-      - shift_ratios: torch.Tensor[batch_size, n_sines, n_samples], the shifts ratios of the sinewaves between -1 and 1
-      - amplitudes: torch.Tensor[batch_size, n_sines, n_samples], the amplitudes of the sinewaves
+      - parameters: torch.Tensor[batch_size, n_params, n_samples], the parameters of the synthesizer
     """
+    shift_ratios = parameters[:, :self._n_sines, :] # n_sines shift ratios
+    amplitudes = parameters[:, self._n_sines:, :] # n_sines amplitudes
+
     batch_size = shift_ratios.shape[0]
 
     general_amplitude = amplitudes[:, :1, :]
@@ -187,7 +279,7 @@ class SineSynth(BaseSynth):
     bark = 6 * torch.arcsinh(freqs/600.)
     scaled = 30 + bark / max(bark) * freqs
     return scaled
-  
+
 
   def _test(self, batch_size: int = 1, n_changes: int = 5, duration: float = 0.5, audiofile: str = 'sinewaves.wav'):
     # Generate a test signal of randomised sine frequencies and amplitudes
