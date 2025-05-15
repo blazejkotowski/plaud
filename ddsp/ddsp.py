@@ -10,7 +10,7 @@ from music2latent.audio import to_representation_encoder
 from ddsp.blocks import VariationalEncoder, Decoder
 from ddsp.synths import BaseSynth, SineSynth, NoiseBandSynth
 
-from typing import List, Tuple, Dict, Callable
+from typing import List, Tuple, Dict, Any
 
 class CLAPLoss(torch.nn.Module):
   def __init__(self):
@@ -64,7 +64,7 @@ class DDSP(L.LightningModule):
     - device: str, the device to run the model on
   """
   def __init__(self,
-               synth_builders: Callable[[], BaseSynth],
+               synth_configs: List[Dict[Any, Any]] = [],
                latent_size: int = 16,
                fs: int = 44100,
                encoder_ratios: List[int] = [8, 4, 2],
@@ -80,14 +80,21 @@ class DDSP(L.LightningModule):
     super().__init__()
     # Save hyperparameters in the checkpoints
     self.save_hyperparameters()
+    self._synth_configs = synth_configs
     self._device = device
     self.fs = fs
     self.latent_size = latent_size
     self.resampling_factor = resampling_factor
 
     # self.synths = synths
-    self.synths = [builder() for builder in synth_builders]
-    total_synth_params = sum([s.n_params for s in self.synths])
+    # self.synths = torch.nn.ModuleList([builder() for builder in self._synth_builders])
+    self.synths = torch.nn.ModuleList([
+      BaseSynth.from_config(cfg) for cfg in self._synth_configs
+    ])
+
+    self._total_synth_params = sum([s.n_params for s in self.synths])
+    # self.register_buffer('_total_synth_params', torch.tensor(total_params, dtype=torch.long))
+    # self._total_synth_params = sum([s.n_params for s in self.synths])
     # total_synth_params = 1000
 
     # self.synths = [NoiseBandSynth(n_filters=1000, fs=fs, resampling_factor=resampling_factor)]
@@ -110,7 +117,7 @@ class DDSP(L.LightningModule):
 
     ## Decoder to predict the amplitudes of the noise bands
     self.decoder = Decoder(
-      n_params=total_synth_params,
+      n_params=self._total_synth_params,
       latent_size=latent_size,
       layer_sizes=(np.array(decoder_ratios)*capacity).tolist(),
       streaming=streaming,

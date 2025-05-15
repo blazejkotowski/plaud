@@ -84,7 +84,7 @@ class ScriptedDDSP(nn_tilde.Module):
   @torch.jit.export
   def decode(self, latents: torch.Tensor):
     synth_params = self.pretrained.decoder(latents.permute(0, 2, 1))
-    audio = self.pretrained._synthesize(*synth_params)
+    audio = self.pretrained._synthesize(synth_params)
     return audio.float()
 
   @torch.jit.export
@@ -195,7 +195,7 @@ class ONNXDDSP(torch.nn.Module):
 
   def decode(self, latents: torch.Tensor):
     synth_params = self.pretrained.decoder(latents.permute(0, 2, 1))
-    audio = self.pretrained._synthesize(*synth_params)
+    audio = self.pretrained._synthesize(synth_params)
     return audio
 
   def encode(self, audio: torch.Tensor):

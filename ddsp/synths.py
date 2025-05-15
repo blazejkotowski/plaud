@@ -7,7 +7,7 @@ import numpy as np
 
 from ddsp.filterbank import FilterBank
 
-from typing import Type, Callable
+from typing import Type, Callable, Dict, Any
 
 class BaseSynth(nn.Module):
   """
@@ -42,6 +42,24 @@ class BaseSynth(nn.Module):
     def _builder():
       return cls(**kwargs)
     return _builder
+
+  @classmethod
+  def to_config(cls, **kwargs) -> dict:
+    """Returns a configuration dictionary for instantiating the synth."""
+    return {
+        "class": cls.__name__,
+        "params": kwargs,
+    }
+
+  @staticmethod
+  def from_config(config: dict) -> "BaseSynth":
+    """Instantiates the synth from a config dictionary."""
+    cls_name = config["class"]
+    params = config["params"]
+
+    # Lookup in global scope (assuming classes are imported)
+    cls = globals()[cls_name]
+    return cls(**params)
 
 
 
@@ -193,7 +211,9 @@ class SineSynth(BaseSynth):
     self._n_sines = n_sines
     self._resampling_factor = resampling_factor
     # self._phases = None
-    self.register_buffer('_phases', None)
+    self.register_buffer("_phases", torch.empty(0))
+    self._phases_initialized = False
+
     self._streaming = streaming
     self._device = device
 
@@ -207,7 +227,7 @@ class SineSynth(BaseSynth):
 
   @property
   def n_params(self):
-    return 2*self._n_sines + 1
+    return 2*self._n_sines
 
 
   def forward(self, parameters: torch.Tensor):
@@ -222,19 +242,21 @@ class SineSynth(BaseSynth):
 
     batch_size = shift_ratios.shape[0]
 
-    general_amplitude = amplitudes[:, :1, :]
-    amplitudes = amplitudes[:, 1:, :]
     shift_ratios = (shift_ratios - 1)*2 # shift from [0, 2] to [-2, 2] range
 
     # We only need to initialise phases buffer if we are in streaming mode
-    if self._streaming and (self._phases is None or self._phases.shape[0] != batch_size):
-      # self._phases = torch.zeros(batch_size, self._n_sines, device=self._device)
+    # if self._streaming and (self._phases is None or self._phases.shape[0] != batch_size):
+    #   # self._phases = torch.zeros(batch_size, self._n_sines, device=self._device)
+    #   self._phases = torch.zeros(batch_size, self._n_sines)
+
+    # We only need to initialise phases buffer if we are in streaming mode
+    if self._streaming and (not self._phases_initialized or self._phases.shape[0] != batch_size):
       self._phases = torch.zeros(batch_size, self._n_sines)
+      self._phases_initialized = True
 
     # Upsample from the internal sampling rate to the target sampling rate
     shift_ratios = F.interpolate(shift_ratios, scale_factor=float(self._resampling_factor), mode='linear')
     amplitudes = F.interpolate(amplitudes, scale_factor=float(self._resampling_factor), mode='linear')
-    general_amplitude = F.interpolate(general_amplitude, scale_factor=float(self._resampling_factor), mode='linear')
 
     # Calculate the shifts from the ratios
     shifts = shift_ratios * self._shift_ranges.view(1, -1, 1)
@@ -246,10 +268,10 @@ class SineSynth(BaseSynth):
 
     # Normalize the amplitudes
     # amplitudes /= amplitudes.sum(-1, keepdim=True)
-    amplitudes /= amplitudes.sum(1, keepdim=True)
+    # amplitudes /= amplitudes.sum(1, keepdim=True)
 
     # Multiply the amplitudes by the general loudness
-    amplitudes *= general_amplitude
+    # amplitudes *= general_amplitude
 
     # Calculate the phase increments
     omegas = frequencies * 2 * math.pi / self._fs

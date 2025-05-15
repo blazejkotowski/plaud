@@ -223,7 +223,7 @@ class Decoder(nn.Module):
     self.output_params = nn.Linear(hidden_size, n_params)
 
 
-  def forward(self, z: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+  def forward(self, z: torch.Tensor) -> torch.Tensor:
     """
     Forward pass of the decoder.
     Arguments:
