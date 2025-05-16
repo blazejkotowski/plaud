@@ -295,7 +295,7 @@ class DDSP(L.LightningModule):
     params_idx = 0
     audio = []
     for synth in self.synths:
-      synth_params = params[:, params_idx:synth.n_params, :]
+      synth_params = params[:, params_idx:params_idx+synth.n_params, :]
       params_idx += synth.n_params
       audio.append(synth(synth_params))
 
