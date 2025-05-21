@@ -151,12 +151,12 @@ class HarmonicSynth(BaseSynth):
               device: str = 'cuda'):
     super().__init__(fs=fs, resampling_factor=resampling_factor)
     self._n_harmonics = n_harmonics
-    self._streaming = streaming
+    self.streaming = streaming
     self._device = device
 
   @property
   def n_params(self):
-    return self._n_harmonics + 1  # 1 pitch + n_harmonics amplitudes
+    return self._n_harmonics + 1  # 1 fundamental + n_harmonics amplitudes
 
   def forward(self, parameters: torch.Tensor, amplitudes: torch.Tensor) -> torch.Tensor:
     """
@@ -214,7 +214,7 @@ class SineSynth(BaseSynth):
     self.register_buffer("_phases", torch.empty(0))
     self._phases_initialized = False
 
-    self._streaming = streaming
+    self.streaming = streaming
     self._device = device
 
     # self._base_freqs = torch.linspace(40, self._fs / 2, self._n_sines, device=self._device)
@@ -250,7 +250,7 @@ class SineSynth(BaseSynth):
     #   self._phases = torch.zeros(batch_size, self._n_sines)
 
     # We only need to initialise phases buffer if we are in streaming mode
-    if self._streaming and (not self._phases_initialized or self._phases.shape[0] != batch_size):
+    if self.streaming and (not self._phases_initialized or self._phases.shape[0] != batch_size):
       self._phases = torch.zeros(batch_size, self._n_sines)
       self._phases_initialized = True
 
@@ -280,7 +280,7 @@ class SineSynth(BaseSynth):
     phases = omegas.cumsum(dim=-1)
     phases = phases % (2 * math.pi)
 
-    if self._streaming:
+    if self.streaming:
       # Shift the phases by the last phase from last generation
       # breakpoint()
       phases = (phases.permute(2, 0, 1) + self._phases).permute(1, 2, 0)

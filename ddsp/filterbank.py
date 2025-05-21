@@ -42,7 +42,7 @@ class FilterBank(nn.Module):
 
     self._filters = self._build_filterbank()
 
-    self.noisebands = torch.from_numpy(np.array(self._bake_noisebands())).to(device)
+    self.register_buffer('noisebands', torch.from_numpy(np.array(self._bake_noisebands())))
 
 
   def _build_filterbank(self):

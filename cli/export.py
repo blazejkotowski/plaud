@@ -36,7 +36,7 @@ class ScriptedDDSP(nn_tilde.Module):
     # in_ratio = y.shape[-1] / x_len
     # print(f"in_ratio: {in_ratio}")
 
-    # self.register_buffer("prior_buffer", torch.randn(1, self.prior_model._max_len, self.prior_model._latent_size))
+    # self.register_buffer("prior_buffer", torch.randn(1, self.prior_model._max_len, self.prior_model._num_params))
 
     self.register_method(
       "forward",
@@ -51,11 +51,11 @@ class ScriptedDDSP(nn_tilde.Module):
 
     self.register_method(
       "decode",
-      in_channels = self.pretrained.latent_size,
+      in_channels = self.pretrained.num_params,
       in_ratio = self.pretrained.resampling_factor,
       out_channels = 1, # number of output audio channels
       out_ratio = 1,
-      input_labels=[f'(signal) Latent Dimension {i}' for i in range(1, self.pretrained.latent_size+1)],
+      input_labels=[f'(signal) Latent Dimension {i}' for i in range(1, self.pretrained.num_params+1)],
       output_labels=['(signal) Audio Output'],
       test_method=True,
     )
@@ -64,25 +64,30 @@ class ScriptedDDSP(nn_tilde.Module):
       "encode",
       in_channels = 1,
       in_ratio = 1,
-      out_channels = self.pretrained.latent_size,
+      out_channels = self.pretrained.num_params,
       out_ratio = self.pretrained.resampling_factor,
       input_labels=['(signal) Audio Input'],
-      output_labels=[f'(signal) Latent Dimension {i}' for i in range(1, self.pretrained.latent_size+1)],
+      output_labels=[f'(signal) Latent Dimension {i}' for i in range(1, self.pretrained.num_params+1)],
       test_method=True
     )
 
     if not isinstance(self.prior_model, FakePrior):
       self.register_method(
         "prior",
-        in_channels=self.pretrained.latent_size + 2, # latent transposition + temperature + prediction_strength
+        in_channels=self.pretrained.num_params + 2, # latent transposition + temperature + prediction_strength
         in_ratio=self.pretrained.resampling_factor,
-        out_channels=self.pretrained.latent_size,
+        out_channels=self.pretrained.num_params,
         out_ratio=self.pretrained.resampling_factor,
-        input_labels=[f'(signal) Transposition {i}' for i in range(1, self.pretrained.latent_size+1)] + ['(signal) Temperature', '(signal) Prediction strenght'],
+        input_labels=[f'(signal) Transposition {i}' for i in range(1, self.pretrained.num_params+1)] + ['(signal) Temperature', '(signal) Prediction strenght'],
       )
 
   @torch.jit.export
   def decode(self, latents: torch.Tensor):
+    # params = params.permute(0, 2, 1)
+    # print('params', params.shape)
+    # print(self.pretrained.latent_size)
+    # print(self.pretrained.num_params)
+    # latents = self.pretrained.params_to_latents(params)
     synth_params = self.pretrained.decoder(latents.permute(0, 2, 1))
     audio = self.pretrained._synthesize(synth_params)
     return audio.float()
@@ -92,6 +97,7 @@ class ScriptedDDSP(nn_tilde.Module):
     mu, scale = self.pretrained.encoder(audio.squeeze(1))
     # latents = self.pretrained.encoder.reparametrize(mu, logvar)
     latents, _ = self.pretrained.encoder.reparametrize(mu, scale)
+    # params = self.pretrained.latents_to_params(latents)
     return latents.permute(0, 2, 1).float()
 
   @torch.jit.export
@@ -118,8 +124,8 @@ class PriorWrapper(torch.nn.Module):
     self.max_len = self.prior._max_len
     self.init_primer_len = self.max_len // 4
     self.current_buffer_len = self.init_primer_len
-    self.register_buffer("prior_buffer", torch.randn(1, self.max_len, self.prior._latent_size))
-    # self.prior_buffer = torch.randn(1, self.max_len, self.prior._latent_size)
+    self.register_buffer("prior_buffer", torch.randn(1, self.max_len, self.prior._num_params))
+    # self.prior_buffer = torch.randn(1, self.max_len, self.prior._num_params)
 
 
   def append_to_buffer(self, x: torch.Tensor):
@@ -128,7 +134,7 @@ class PriorWrapper(torch.nn.Module):
     it is reset to the initial primer length.
 
     Args:
-      x, torch.Tensor[batch_size, seq_len, latent_size]
+      x, torch.Tensor[batch_size, seq_len, num_params]
     """
     x = x[:1, ...] # only first in batch
     seq_len = x.shape[1]
@@ -145,7 +151,7 @@ class PriorWrapper(torch.nn.Module):
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     """
     Args:
-      x, torch.Tensor[batch_size, latent_size + 1, seq_len]
+      x, torch.Tensor[batch_size, num_params + 1, seq_len]
     """
     # self.append_to_buffer(x.permute(0, 2, 1))
 
@@ -156,7 +162,7 @@ class PriorWrapper(torch.nn.Module):
 
     steps = x.shape[-1]
 
-    output = torch.zeros(1, steps, self.prior._latent_size)
+    output = torch.zeros(1, steps, self.prior._num_params)
     local_buffer = self.prior_buffer.clone()
     current_len = self.current_buffer_len
 
@@ -238,6 +244,7 @@ if __name__ == '__main__':
     prior._trainer = L.Trainer()
 
   ddsp = DDSP.load_from_checkpoint(checkpoint_path, strict=False, streaming=True, device='cpu').to('cpu')
+  ddsp.streaming(True)
   if format == 'onnx':
     ddsp.eval()
     scripted = ONNXDDSP(ddsp).to('cpu')

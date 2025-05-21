@@ -96,29 +96,30 @@ class PriorDataset(Dataset):
     encodings = []
 
     for audio in audio_tensors:
-      with torch.no_grad():
-        mu, scale = self._encoder(audio.unsqueeze(0))
-        latents, _ = self._encoder.reparametrize(mu, scale)
-        latents = latents.squeeze(0)
-        # mu_scale = torch.cat([mu, scale], dim = -1).squeeze(0)
+      for audio_chunk in audio.split(self._sampling_rate*10):
+        with torch.no_grad():
+          mu, scale = self._encoder(audio_chunk.unsqueeze(0))
+          latents, _ = self._encoder.reparametrize(mu, scale)
+          latents = latents.squeeze(0)
+          # mu_scale = torch.cat([mu, scale], dim = -1).squeeze(0)
 
-        # mu_scale = mu.squeeze(0) # try only mu
-        # mu_scale = mu_scale[..., :1] # try only one (the first) latent variable
+          # mu_scale = mu.squeeze(0) # try only mu
+          # mu_scale = mu_scale[..., :1] # try only one (the first) latent variable
 
-        # Overlapping, shifting window chunks
-        # for i in range(mu_scale.size(0) - (self._sequence_length)):
-        #   encodings.append(mu_scale[i:i+self._sequence_length])
+          # Overlapping, shifting window chunks
+          # for i in range(mu_scale.size(0) - (self._sequence_length)):
+          #   encodings.append(mu_scale[i:i+self._sequence_length])
 
-        # # Non-overlapping chunks
-        # for chunk in mu_scale.split(self._sequence_length):
-        #   if chunk.size(0) == self._sequence_length:
-        #     encodings.append(chunk)
+          # # Non-overlapping chunks
+          # for chunk in mu_scale.split(self._sequence_length):
+          #   if chunk.size(0) == self._sequence_length:
+          #     encodings.append(chunk)
 
-        # Stratified sampling with stride
-        stride = int(self._sequence_length * self._stride_factor)
-        num_chunks = (latents.size(0) - self._sequence_length) // stride + 1
-        for i in range(num_chunks):
-          encodings.append(latents[i*stride:i*stride+self._sequence_length])
+          # Stratified sampling with stride
+          stride = int(self._sequence_length * self._stride_factor)
+          num_chunks = (latents.size(0) - self._sequence_length) // stride + 1
+          for i in range(num_chunks):
+            encodings.append(latents[i*stride:i*stride+self._sequence_length])
 
     return encodings
 

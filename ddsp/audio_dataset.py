@@ -4,8 +4,10 @@ import librosa as li
 import os
 from glob import glob
 
+from typing import Callable
+
 class AudioDataset(Dataset):
-  def __init__(self, dataset_path: str, n_signal: int, sampling_rate: int = 44100, device='cuda'):
+  def __init__(self, dataset_path: str, n_signal: int, sampling_rate: int = 44100, transform_fn: Callable = None, device: str = 'cuda'):
     """
     Arguments:
       - dataset_path: str, the path to the dataset
@@ -20,6 +22,8 @@ class AudioDataset(Dataset):
     self._audio = self._load_dataset(dataset_path).to(self._device)
     self._dataset_length = int(len(self._audio) // self._n_signal)
 
+    self._transform_fn = transform_fn
+
   def __len__(self):
     return self._dataset_length
 
@@ -33,6 +37,9 @@ class AudioDataset(Dataset):
       audio = torch.cat([self._audio[sample_start:], self._audio[:sample_end - len(self._audio)]])
     else:
       audio = self._audio[sample_start:sample_end]
+
+    if self._transform_fn is not None:
+      audio = self._transform_fn(audio)
 
     return audio
 

@@ -8,7 +8,8 @@ from music2latent import EncoderDecoder
 from music2latent.audio import to_representation_encoder
 
 from ddsp.blocks import VariationalEncoder, Decoder
-from ddsp.synths import BaseSynth, SineSynth, NoiseBandSynth
+from ddsp.synths import BaseSynth
+from sklearn.decomposition import PCA
 
 from typing import List, Tuple, Dict, Any
 
@@ -66,6 +67,7 @@ class DDSP(L.LightningModule):
   def __init__(self,
                synth_configs: List[Dict[Any, Any]] = [],
                latent_size: int = 16,
+               num_params: int = 4,
                fs: int = 44100,
                encoder_ratios: List[int] = [8, 4, 2],
                n_melbands: int = 128,
@@ -84,13 +86,17 @@ class DDSP(L.LightningModule):
     self._device = device
     self.fs = fs
     self.latent_size = latent_size
+    self.num_params = num_params
     self.resampling_factor = resampling_factor
 
     # self.synths = synths
     # self.synths = torch.nn.ModuleList([builder() for builder in self._synth_builders])
     self.synths = torch.nn.ModuleList([
-      BaseSynth.from_config(cfg) for cfg in self._synth_configs
+      BaseSynth.from_config(cfg).to(self._device) for cfg in self._synth_configs
     ])
+
+    self.register_buffer('_latent_pca', torch.eye(self.latent_size))
+    self.register_buffer('_latent_mean', torch.zeros(self.latent_size))
 
     self._total_synth_params = sum([s.n_params for s in self.synths])
     # self.register_buffer('_total_synth_params', torch.tensor(total_params, dtype=torch.long))
@@ -126,7 +132,7 @@ class DDSP(L.LightningModule):
     # Define the loss
     self._mr_stft_loss = self._construct_mrstft_loss() # MRSTFT loss
     self._mr_mel_loss = self._construct_mel_loss() # MEL-scale loss
-    self._mr_chroma_loss = self._construct_chroma_loss() # CHROMA-scale loss
+    # self._mr_chroma_loss = self._construct_chroma_loss() # CHROMA-scale loss
 
     # Perceptual loss
     self._m2l_loss = M2LLoss()
@@ -140,6 +146,91 @@ class DDSP(L.LightningModule):
     self._last_validation_in = None
     self._last_validation_out = None
     self._validation_index = 1
+
+
+  def streaming(self, streaming: bool) -> None:
+    """Set streaming mode"""
+    self.streaming = streaming
+    for synth in self.synths:
+      synth.streaming = streaming
+
+    self.decoder.streaming = streaming
+
+
+  def analyze_latent_space(self, z: torch.Tensor) -> None:
+    """
+    Saves the PCA decomposition and the mean of the latent space
+
+    Args:
+      z: torch.Tensor[n, latent_size]
+    """
+    print("Analyze_latent_space")
+    latent_mean = z.mean(0)
+    z -= latent_mean
+    print("Going to do PCA")
+    latent_pca = PCA(n_components=self.latent_size)
+    latent_pca.fit(z.cpu().numpy())
+
+    self._latent_mean.copy_(latent_mean)
+    self._latent_pca.copy_(torch.from_numpy(latent_pca.components_))
+
+
+  def latents_to_params(self, z: torch.Tensor) -> torch.Tensor:
+    """
+    Converts the given latents to params using the saved PCA and mean
+
+    Args:
+      - z: torch.Tensor[batch_size, n, latent_size]
+    Returns:
+      - params: torch.Tensor[batch_size, n, num_params]
+    """
+    # Do not do anything if no projection is necessary
+    if z.shape[-1] == self.num_params:
+      return z
+
+    z_centered = z - self._latent_mean
+    pca = self._latent_pca[:self.num_params, :]
+    params = torch.matmul(pca, z_centered.permute(0, 2, 1))
+    return params.permute(0, 2, 1)
+
+
+  def params_to_latents(self, params: torch.Tensor) -> torch.Tensor:
+    """
+    Converts given params to the latent space using the saved PCA and mean.
+    It fills the missing information with gaussian noise with the right mean.
+
+    Args:
+      - params: torch.Tensor[batch_size, n, num_params]
+    Returns:
+      - latents: torch.Tensor[batch_size, n, latent_size]
+    """
+    # Do not do anything if no projection is necessary
+    if params.shape[-1] == self.latent_size:
+      return params
+
+    # params: [batch_size, n, num_params]
+    batch_size, n, num_params = params.shape
+    latent_size = self.latent_size
+
+    # Get PCA and mean
+    pca = self._latent_pca[:num_params, :]  # [num_params, latent_size]
+    latent_mean = self._latent_mean  # [latent_size]
+
+    # Invert PCA: x = pca @ z.T  =>  z = pca_pinv @ x.T
+    pca_pinv = torch.linalg.pinv(pca)  # [latent_size, num_params]
+    params_t = params.permute(0, 2, 1)  # [batch_size, num_params, n]
+    z_centered = torch.matmul(pca_pinv, params_t)  # [batch_size, latent_size, n]
+    z_centered = z_centered.permute(0, 2, 1)  # [batch_size, n, latent_size]
+
+    # Fill missing latent dims with noise if needed
+    if num_params < latent_size:
+      noise = torch.randn(batch_size, n, latent_size - num_params, device=params.device)
+      z_centered[..., num_params:] = noise
+
+    # Add mean back
+    latents = z_centered + latent_mean
+    return latents
+
 
 
   def forward(self, audio: torch.Tensor) -> torch.Tensor:
@@ -201,6 +292,22 @@ class DDSP(L.LightningModule):
     #   self._last_validation_out = y_audio.squeeze(1)
 
     return y_audio
+
+
+  def configure_optimizers(self):
+    """Configure the optimizer for the model"""
+    # return torch.optim.Adam(self.parameters(), lr=self._learning_rate)
+
+    optimizer = torch.optim.Adam(self.parameters(), lr=self._learning_rate)
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=50, verbose=False, threshold=1e-2)
+
+    scheduler = {
+      'scheduler': lr_scheduler,
+      'monitor': 'val_loss',
+      'interval': 'epoch'
+    }
+
+    return [optimizer], [scheduler]
 
 
   def _autoencode(self, x_audio: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -268,22 +375,6 @@ class DDSP(L.LightningModule):
   #   self._validation_index += 1
 
 
-  def configure_optimizers(self):
-    """Configure the optimizer for the model"""
-    # return torch.optim.Adam(self.parameters(), lr=self._learning_rate)
-
-    optimizer = torch.optim.Adam(self.parameters(), lr=self._learning_rate)
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=50, verbose=False, threshold=1e-2)
-
-    scheduler = {
-      'scheduler': lr_scheduler,
-      'monitor': 'val_loss',
-      'interval': 'epoch'
-    }
-
-    return [optimizer], [scheduler]
-
-
   def _synthesize(self, params: torch.Tensor) -> torch.Tensor:
     """
     Synthesizes a signal from the predicted amplitudes and the baked noise bands.
@@ -319,7 +410,7 @@ class DDSP(L.LightningModule):
     w_chroma = 0.1
 
     loss = (w_stft * self._mr_stft_loss(y, x) \
-        + w_chroma * self._mr_chroma_loss(y, x) \
+        # + w_chroma * self._mr_chroma_loss(y, x) \
         + w_mel * self._mr_mel_loss(y, x) \
       ) / (w_stft + w_mel + w_chroma)
     return loss
@@ -350,8 +441,8 @@ class DDSP(L.LightningModule):
   @torch.jit.ignore
   def _construct_mrstft_loss(self):
     """Construct the loss function for the model: a multi-resolution STFT loss"""
-    fft_sizes = np.array([1024, 512, 128, 64, 32])
-    return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[1024, 512, 128, 64, 32],
+    fft_sizes = np.array([1024, 512, 128])
+    return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[1024, 512, 128],
                                                 hop_sizes=fft_sizes//4,
                                                 win_lengths=fft_sizes).to(self._device)
 
