@@ -230,12 +230,13 @@ class SineSynth(BaseSynth):
     return 2*self._n_sines
 
 
-  def forward(self, parameters: torch.Tensor):
+  def forward(self, parameters: torch.Tensor, sines_number_attenuation: float = 0.0):
     """
     Generates a mixture of sinewaves with the given frequencies and amplitudes per sample.
 
     Arguments:
       - parameters: torch.Tensor[batch_size, n_params, n_samples], the parameters of the synthesizer
+      - sines_number_attenuation: float, the attenuation factor for the number of sinewaves
     """
     shift_ratios = parameters[:, :self._n_sines, :] # n_sines shift ratios
     amplitudes = parameters[:, self._n_sines:, :] # n_sines amplitudes
@@ -287,6 +288,27 @@ class SineSynth(BaseSynth):
 
       # Copy the last phases for next iteration
       self._phases.copy_(phases[: ,: , -1] % (2 * math.pi))
+
+
+    # If the sines_number_attenuation is higher than 0, we need to limit the number of sinewaves
+    # by choosing the first max_sines, in relation to their amplitudes
+    # clamp sines_number_attenuation to [0, 1]
+    sines_number_attenuation = max(0.0, min(sines_number_attenuation, 1.0))
+    if sines_number_attenuation > 0:
+      # Calculate the number of sinewaves to keep (at least 1)
+      max_sines = int(self._n_sines * (1 - sines_number_attenuation))
+      max_sines = max(max_sines, 1)
+
+      # Get the indices of the max_sines largest amplitudes
+      _, indices = torch.topk(amplitudes, max_sines, dim=1)
+      # Create a mask of the same shape as the amplitudes
+      mask = torch.zeros_like(amplitudes)
+      # Set the values at the indices to 1
+      mask.scatter_(1, indices, 1)
+
+      # Apply the mask to the frequencies and amplitudes
+      frequencies = frequencies * mask
+      amplitudes = amplitudes * mask
 
     # Generate and sum the sinewaves
     signal = torch.sum(amplitudes * torch.sin(phases), dim=1, keepdim=True)

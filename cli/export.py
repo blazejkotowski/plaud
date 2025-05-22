@@ -38,6 +38,10 @@ class ScriptedDDSP(nn_tilde.Module):
 
     # self.register_buffer("prior_buffer", torch.randn(1, self.prior_model._max_len, self.prior_model._num_params))
 
+    self.register_attribute("sines_number_attenuation", 0.0)
+    self.register_attribute("noise_amplitude_attenuation", 0.0)
+    self.register_attribute("sines_amplitude_attenuation", 0.0)
+
     self.register_method(
       "forward",
       in_channels = 1,
@@ -89,7 +93,7 @@ class ScriptedDDSP(nn_tilde.Module):
     # print(self.pretrained.num_params)
     # latents = self.pretrained.params_to_latents(params)
     synth_params = self.pretrained.decoder(latents.permute(0, 2, 1))
-    audio = self.pretrained._synthesize(synth_params)
+    audio = self.pretrained._synthesize(synth_params, sines_amp_attenuation=self.sines_amplitude_attenuation[0], noise_amp_attenuation=self.noise_amplitude_attenuation[0], sines_number_attenuation=self.sines_number_attenuation[0])
     return audio.float()
 
   @torch.jit.export
@@ -98,6 +102,7 @@ class ScriptedDDSP(nn_tilde.Module):
     # latents = self.pretrained.encoder.reparametrize(mu, logvar)
     latents, _ = self.pretrained.encoder.reparametrize(mu, scale)
     # params = self.pretrained.latents_to_params(latents)
+    latents = self.pretrained._smooth_latents(latents)
     return latents.permute(0, 2, 1).float()
 
   @torch.jit.export
@@ -107,6 +112,31 @@ class ScriptedDDSP(nn_tilde.Module):
   @torch.jit.export
   def prior(self, x: torch.Tensor):
     return self.prior_model(x)
+  
+  @torch.jit.export
+  def get_sines_number_attenuation(self) -> float:
+    return self.sines_number_attenuation[0]
+  
+  @torch.jit.export
+  def set_sines_number_attenuation(self, value: float):
+    self.sines_number_attenuation = (value, )
+
+  @torch.jit.export
+  def get_noise_amplitude_attenuation(self) -> float:
+    return self.noise_amplitude_attenuation[0]
+  
+  @torch.jit.export
+  def set_noise_amplitude_attenuation(self, value: float):
+    self.noise_amplitude_attenuation = (value, )
+
+  @torch.jit.export
+  def get_sines_amplitude_attenuation(self) -> float:
+    return self.sines_amplitude_attenuation[0]
+  
+  @torch.jit.export
+  def set_sines_amplitude_attenuation(self, value: float):
+    self.sines_amplitude_attenuation = (value, )
+
 
 
 

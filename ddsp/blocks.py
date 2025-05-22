@@ -193,6 +193,7 @@ class Decoder(nn.Module):
                latent_size: int = 16,
                layer_sizes: List[int] = [32, 64, 128],
                output_mlp_layers: int = 3,
+               gru_layers: int = 1,
                streaming: bool = False):
     """
     Arguments:
@@ -200,6 +201,7 @@ class Decoder(nn.Module):
       - latent_size: int, the size of the latent space
       - layer_sizes: List[int], the sizes of the layers in the bottleneck
       - output_mlp_layers: int, the number of layers in the output MLP
+      - gru_layers: int, the number of GRU layers in the decoder
       - streaming: bool, streaming mode (realtime)
     """
     super().__init__()
@@ -213,8 +215,8 @@ class Decoder(nn.Module):
     hidden_size = layer_sizes[-1]
 
     # Intermediate GRU layer
-    self.gru = nn.GRU(hidden_size, hidden_size, batch_first=True)
-    self.register_buffer('_hidden_state', torch.zeros(1, 1, hidden_size), persistent=False)
+    self.gru = nn.GRU(hidden_size, hidden_size, num_layers=gru_layers, batch_first=True)
+    self.register_buffer('_hidden_state', torch.zeros(gru_layers, 1, hidden_size), persistent=False)
 
     # Intermediary 3-layer MLP
     self.inter_mlp = _make_mlp(hidden_size, output_mlp_layers, hidden_size)
