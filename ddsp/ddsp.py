@@ -101,8 +101,10 @@ class DDSP(L.LightningModule):
       BaseSynth.from_config(cfg).to(self._device) for cfg in self._synth_configs
     ])
 
+    # Latent space analyzis buffers
     self.register_buffer('_latent_pca', torch.eye(self.latent_size))
     self.register_buffer('_latent_mean', torch.zeros(self.latent_size))
+    self.register_buffer('_latent_quantiles', torch.zeros(2, self.latent_size))
 
     self._total_synth_params = sum([s.n_params for s in self.synths])
     # self.register_buffer('_total_synth_params', torch.tensor(total_params, dtype=torch.long))
@@ -171,15 +173,68 @@ class DDSP(L.LightningModule):
     Args:
       z: torch.Tensor[n, latent_size]
     """
-    print("Analyze_latent_space")
+    # Extract and store the mean
     latent_mean = z.mean(0)
+    self._latent_mean.copy_(latent_mean)
+    
+    # Center the latents
     z -= latent_mean
-    print("Going to do PCA")
+
+    # Fit and strore the PCA
     latent_pca = PCA(n_components=self.latent_size)
     latent_pca.fit(z.cpu().numpy())
-
-    self._latent_mean.copy_(latent_mean)
     self._latent_pca.copy_(torch.from_numpy(latent_pca.components_))
+
+    # Compute 5th and 95th percentile for each component
+    quantiles = torch.quantile(z, torch.tensor([0.01, 0.99]), dim=0)
+    self._latent_quantiles.copy_(quantiles)
+
+
+  def normalize_latents(self, z: torch.Tensor) -> torch.Tensor:
+    """
+    Normalizes the given latents using the saved mean and quantils
+
+    Args:
+      z: torch.Tensor[batch_size, n, latent_size]
+    Returns:
+      z: torch.Tensor[batch_size, n, latent_size], normalized latents
+    """
+    # Center the latents
+    z_centered = z - self._latent_mean
+
+    # Normalize the latents using the quantiles to range [-1, 1]
+    quantiles = self._latent_quantiles
+    z_normalized = 2*(z_centered - quantiles[0]) / (quantiles[1] - quantiles[0])-1
+    
+    # Ensure the latents are in the range [-1, 1]
+    z_normalized = torch.clamp(z_normalized, -1.0, 1.0)
+
+    return z_normalized
+  
+
+  def denormalize_latents(self, z: torch.Tensor) -> torch.Tensor:
+    """
+    Denormalizes the given latents using the saved mean and quantils
+
+    Args:
+      z: torch.Tensor[batch_size, n, latent_size]
+    Returns:
+      z: torch.Tensor[batch_size, n, latent_size], denormalized latents
+    """
+    # Ensure the latents are in the range [-1, 1]
+    z_clamped = torch.clamp(z, -1.0, 1.0)
+
+    # Denormalize the latents using the quantiles
+    quantiles = self._latent_quantiles
+
+    # From [-1, 1] to [quantiles[0], quantiles[1]]
+    z_denormalized = (z_clamped + 1) / 2 * (quantiles[1] - quantiles[0]) + quantiles[0]
+
+    # Add the mean back
+    z_denormalized += self._latent_mean
+
+    return z_denormalized
+
 
 
   def latents_to_params(self, z: torch.Tensor) -> torch.Tensor:
@@ -309,7 +364,7 @@ class DDSP(L.LightningModule):
     # return torch.optim.Adam(self.parameters(), lr=self._learning_rate)
 
     optimizer = torch.optim.Adam(self.parameters(), lr=self._learning_rate)
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=50, verbose=False, threshold=1e-2)
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=500, verbose=False, threshold=1e-3)
 
     scheduler = {
       'scheduler': lr_scheduler,
@@ -331,7 +386,7 @@ class DDSP(L.LightningModule):
     """
     if self._latent_smoothing_kernel == 1:
       return z
-    
+
     # smooth the latent envelopes, individually
     # Apply a simple moving average (low-pass filter) along the time axis for each latent dimension
     padding = self._latent_smoothing_kernel // 2

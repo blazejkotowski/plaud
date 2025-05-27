@@ -33,10 +33,12 @@ class PriorDataset(Dataset):
     self._stride_factor = stride_factor
 
     vae_model = jit.load(encoding_model_path, map_location=device).pretrained.to(device)
+    vae_model.encoder.streaming = False
+    self._vae = vae_model
     self._resampling_factor = vae_model.resampling_factor
 
-    self._encoder = vae_model.encoder
-    self._encoder.streaming = False
+    # self._encoder = vae_model.encoder
+    # self._encoder.streaming = False
 
     audio_tensors = self._load_audio_dataset(audio_dataset_path)
 
@@ -98,8 +100,9 @@ class PriorDataset(Dataset):
     for audio in audio_tensors:
       for audio_chunk in audio.split(self._sampling_rate*10):
         with torch.no_grad():
-          mu, scale = self._encoder(audio_chunk.unsqueeze(0))
-          latents, _ = self._encoder.reparametrize(mu, scale)
+          mu, scale = self._vae.encoder(audio_chunk.unsqueeze(0))
+          latents, _ = self._vae.encoder.reparametrize(mu, scale)
+          latents = self._vae._smooth_latents(latents)
           latents = latents.squeeze(0)
           # mu_scale = torch.cat([mu, scale], dim = -1).squeeze(0)
 
