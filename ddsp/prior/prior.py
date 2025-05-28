@@ -149,7 +149,7 @@ class Prior(L.LightningModule):
         logits = self(x)
         y_hat = self.sample(logits, temperature=temperature)
       x = torch.cat((x, y_hat[:, -1:, :]), dim=1)
-      output_seq[i, :] = y_hat.squeeze()[-1, :]
+      output_seq[i, :] = y_hat.squeeze(0)[-1, :]
 
       if x.size(1) > self._max_len:
         x = x[:, -prime_len:, :]

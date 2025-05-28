@@ -8,8 +8,6 @@ import torch.jit as jit
 
 from typing import Tuple, List
 
-# from .feature_extractor import FeatureExtractor
-
 def _make_mlp(in_size: int, hidden_layers: int, hidden_size: int) -> cc.CachedSequential:
   """
   Constructs a multi-layer perceptron.
@@ -71,7 +69,6 @@ class VariationalEncoder(nn.Module):
                latent_size: int = 16,
                resampling_factor: int = 32,
                n_melbands: int = 128,
-               features: bool = False,
                streaming: bool = False):
     """
     Arguments:
@@ -80,23 +77,17 @@ class VariationalEncoder(nn.Module):
       - latent_size: int, the size of the output latent space
       - resampling_factor: int, the factor by which to downsample the mfccs
       - n_mfcc : int, the number of mfccs to extract
-      - features: bool, if True, the model will precalculate the features on the input
       - streaming: bool, streaming mode (realtime)
     """
     super().__init__()
 
     self.streaming = streaming
-    self.features = features
 
     self.resampling_factor = resampling_factor
     # self.mfcc = MFCC(sample_rate = sample_rate, n_mfcc = n_mfcc)
     self.mfcc = MelSpectrogram(sample_rate, n_mels=n_melbands)
 
     self.normalization = nn.LayerNorm(n_melbands)
-
-    # if features:
-    #   self._feature_extaractor = FeatureExtractor()
-    #   gru_input_size += FeatureExtractor.N_FEATURES
 
     self.gru = nn.GRU(n_melbands, layer_sizes[0], batch_first = True)
     self.register_buffer('_hidden_state', torch.zeros(1, 1, layer_sizes[0]), persistent=False)
@@ -121,13 +112,6 @@ class VariationalEncoder(nn.Module):
     mfcc = F.interpolate(mfcc, size = audio.shape[-1], mode = 'nearest')
 
     input = mfcc
-
-    # Features
-    # if self.features:
-    #   features = self._calculate_features(audio)
-    #   print("features shape", features.shape)
-    #   print("mfcc shape", mfcc.shape)
-    #   input = torch.cat([mfcc, features], dim = 1)
 
     # Downsample the input representation
     x = F.interpolate(input, scale_factor = 1/self.resampling_factor, mode = 'linear')
@@ -172,18 +156,6 @@ class VariationalEncoder(nn.Module):
     kl = (mean * mean + var - logvar - 1).sum(1).mean()
 
     return z, kl
-
-  @jit.ignore
-  def _calculate_features(self, audio: torch.Tensor) -> torch.Tensor:
-    """
-    Calculate the features of the audio signal.
-    Arguments:
-      - audio: torch.Tensor[batch_size, n_samples], the input audio tensor
-    Returns:
-      - features: torch.Tensor, the features of the audio signal
-    """
-    # Placeholder for feature calculation
-    return FeatureExtractor()(audio)
 
 
 

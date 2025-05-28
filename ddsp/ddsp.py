@@ -3,46 +3,14 @@ import torch
 
 import numpy as np
 import auraloss
-import laion_clap
-from music2latent import EncoderDecoder
-from music2latent.audio import to_representation_encoder
 
 from ddsp.blocks import VariationalEncoder, Decoder
 from ddsp.synths import BaseSynth, SineSynth, NoiseBandSynth
 from sklearn.decomposition import PCA
 
-from typing import List, Tuple, Dict, Any, Optional
+from typing import List, Tuple, Dict, Any
 
-class CLAPLoss(torch.nn.Module):
-  def __init__(self):
-    super().__init__()
-    self.clap = laion_clap.CLAP_Module(enable_fusion=False, device='cuda')
-    self.clap.requires_grad_(False)
-    self.clap.load_ckpt()
-
-  def forward(self, x: torch.tensor, y: torch.tensor):
-    with torch.no_grad():
-      x_emb = self.clap.get_audio_embedding_from_data(x.reshape(x.shape[0], -1).float(), use_tensor=True)
-      y_emb = self.clap.get_audio_embedding_from_data(y.reshape(y.shape[0], -1).float(), use_tensor=True)
-
-    return 1-torch.nn.functional.cosine_similarity(x_emb, y_emb).mean()
-
-class M2LLoss(torch.nn.Module):
-  def __init__(self):
-    super().__init__()
-    self.m2l = EncoderDecoder()
-    self.m2l.gen.eval()
-
-  def forward(self, x: torch.tensor, y: torch.tensor):
-    # with torch.no_grad():
-    x_repr = to_representation_encoder(x.detach().squeeze(1))
-    x_emb = self.m2l.gen.encoder(x_repr, extract_features=True)
-
-    y_repr = to_representation_encoder(y.squeeze(1))
-    y_emb = self.m2l.gen.encoder(y_repr, extract_features=True)
-
-    return torch.nn.functional.mse_loss(y_emb, x_emb).mean()
-    # return 1-torch.nn.functional.cosine_similarity(x_emb, y_emb).mean()
+from ddsp.losses import M2LLoss
 
 
 class DDSP(L.LightningModule):
@@ -126,7 +94,6 @@ class DDSP(L.LightningModule):
       streaming=streaming,
       n_melbands=n_melbands,
       resampling_factor=self.resampling_factor,
-      features=False
     )
 
     ## Decoder to predict the amplitudes of the noise bands
@@ -176,7 +143,7 @@ class DDSP(L.LightningModule):
     # Extract and store the mean
     latent_mean = z.mean(0)
     self._latent_mean.copy_(latent_mean)
-    
+
     # Center the latents
     z -= latent_mean
 
@@ -205,12 +172,12 @@ class DDSP(L.LightningModule):
     # Normalize the latents using the quantiles to range [-1, 1]
     quantiles = self._latent_quantiles
     z_normalized = 2*(z_centered - quantiles[0]) / (quantiles[1] - quantiles[0])-1
-    
+
     # Ensure the latents are in the range [-1, 1]
     z_normalized = torch.clamp(z_normalized, -1.0, 1.0)
 
     return z_normalized
-  
+
 
   def denormalize_latents(self, z: torch.Tensor) -> torch.Tensor:
     """
