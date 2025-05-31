@@ -1,10 +1,26 @@
-# VAE-controlled DDSP
-This project is a pytorch implementation of DDSP based on the paper [DDSP: Differentiable Digital Signal Processing](https://arxiv.org/abs/2001.04643), customised for the generation of environmental sound, with the control of the generation process based on the latent variables of a Variational Autoencoder.
+# Performative Latents for Adaptive Unsupervised DDSP (PLAUD)
 
-The important differences include:
-- latent space is regularised with a VAE loss and there is no explicit features extraction block. Therefore the control of generation is based solely on latent variables.
-- the residual part is based on [NoiseBandNet](https://arxiv.org/abs/2307.08007) instead of a simple noise generator.
-- sinusoidal modeling is used instead of the harmonic one for modeling of the tonal component.
+**PLAUD** is a PyTorch-based modular synthesis framework that extends [DDSP: Differentiable Digital Signal Processing](https://arxiv.org/abs/2001.04643) for **real-time**, **performance-oriented**, and **latent-variable-controlled** sound generation. It is specifically designed for **small, personal datasets**, and prioritizes **playability**, **modularity**, and **exploration** over strict reconstruction quality.
+
+At its core, PLAUD is a reconfigurable DDSP synthesizer where **every aspect of the synthesis and training process is steered by a structured latent space**. It supports **intervenable architectures**, allowing real-time constraints (e.g., number of oscillators) and flexible loss objectives. 
+
+## Key Features
+
+- **Exclusively latent-based control**: The entire generation process is conditioned on a regularized latent space—there is no explicit audio feature extraction.
+- **Smoothed latent trajectories**: Temporal structure and controllability are improved via latent smoothing (e.g., average pooling over time).
+- **Modular synthesis blocks**:
+  - **Sinusoidal** additive synthesis
+  - **Harmonic** oscillator banks (optional)
+  - **NoiseBandNet**-based residual modeling ([NoiseBandNet paper](https://arxiv.org/abs/2307.08007))
+- **Customizable loss functions**:
+  - Multi-resolution STFT loss
+  - Perceptual **CLAP** loss (audio-text contrastive model)
+  - Perceptual **M2L** loss (mel-to-latent for realism)
+- **Optional attribute regularization**: Add task-specific structure to latent space for controlled generation. ([Attribute Regularization paper](https://arxiv.org/abs/2004.05485)
+- **Highly customizable**: Modular training interface for swapping losses, synthesis blocks, and regularization strategies.
+- **Real-time deployment**: Compatible with `nn~` externals for **Max/MSP** and **PureData** for live performance environments.
+
+---
 
 ## Installation
 Clone the repository and install the package locally with pip:
