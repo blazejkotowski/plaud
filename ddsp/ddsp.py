@@ -70,6 +70,7 @@ class DDSP(L.LightningModule):
     ])
 
     # Latent space analyzis buffers
+    
     self.register_buffer('_latent_pca', torch.eye(self.latent_size))
     self.register_buffer('_latent_mean', torch.zeros(self.latent_size))
     self.register_buffer('_latent_quantiles', torch.zeros(2, self.latent_size))
