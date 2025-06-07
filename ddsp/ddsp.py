@@ -1,5 +1,6 @@
 import lightning as L
 import torch
+import torch.nn.functional as F
 
 import numpy as np
 import auraloss
@@ -11,6 +12,7 @@ from sklearn.decomposition import PCA
 from typing import List, Tuple, Dict, Any
 
 from ddsp.losses import M2LLoss
+
 
 
 class DDSP(L.LightningModule):
@@ -70,7 +72,7 @@ class DDSP(L.LightningModule):
     ])
 
     # Latent space analyzis buffers
-    
+
     self.register_buffer('_latent_pca', torch.eye(self.latent_size))
     self.register_buffer('_latent_mean', torch.zeros(self.latent_size))
     self.register_buffer('_latent_quantiles', torch.zeros(2, self.latent_size))
@@ -108,7 +110,7 @@ class DDSP(L.LightningModule):
 
     # Define the loss
     self._mr_stft_loss = self._construct_mrstft_loss() # MRSTFT loss
-    self._mr_mel_loss = self._construct_mel_loss() # MEL-scale loss
+    # self._mr_mel_loss = self._construct_mel_loss() # MEL-scale loss
     # self._mr_chroma_loss = self._construct_chroma_loss() # CHROMA-scale loss
 
     # Perceptual loss
@@ -355,11 +357,16 @@ class DDSP(L.LightningModule):
     if self._latent_smoothing_kernel == 1:
       return z
 
+    kernel_size = self._latent_smoothing_kernel
+    if kernel_size % 2 == 0:
+      # Ensure the kernel size is odd for the avg_pool1d
+      kernel_size += 1
+
     # smooth the latent envelopes, individually
     # Apply a simple moving average (low-pass filter) along the time axis for each latent dimension
-    padding = self._latent_smoothing_kernel // 2
+    padding = kernel_size // 2
     z_smooth = torch.nn.functional.avg_pool1d(
-      z.transpose(1, 2), kernel_size=self._latent_smoothing_kernel, stride=1, padding=padding
+      z.transpose(1, 2), kernel_size=kernel_size, stride=1, padding=padding
     ).transpose(1, 2)
     return z_smooth
 
@@ -479,10 +486,11 @@ class DDSP(L.LightningModule):
     w_mel = 0.3
     w_chroma = 0.1
 
-    loss = (w_stft * self._mr_stft_loss(y, x) \
-        # + w_chroma * self._mr_chroma_loss(y, x) \
-        + w_mel * self._mr_mel_loss(y, x) \
-      ) / (w_stft + w_mel + w_chroma)
+    # loss = (w_stft * self._mr_stft_loss(y, x) \
+    #     # + w_chroma * self._mr_chroma_loss(y, x) \
+    #     + w_mel * self._mr_mel_loss(y, x) \
+    #   ) / (w_stft + w_mel + w_chroma)
+    loss = self._mr_stft_loss(y, x)
     return loss
 
   @torch.jit.ignore
@@ -497,22 +505,22 @@ class DDSP(L.LightningModule):
                                                 sample_rate=self.fs,
                                                 perceptual_weighting=True).to(self._device)
 
-  @torch.jit.ignore
-  def _construct_chroma_loss(self):
-    fft_sizes = np.array([16384, 8192, 4096])
-    return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[16384, 8192, 4096],
-                                                hop_sizes=fft_sizes//4,
-                                                win_lengths=fft_sizes,
-                                                scale='chroma',
-                                                n_bins=128,
-                                                sample_rate=self.fs,
-                                                perceptual_weighting=True).to(self._device)
+  # @torch.jit.ignore
+  # def _construct_chroma_loss(self):
+  #   fft_sizes = np.array([16384, 8192, 4096])
+  #   return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[16384, 8192, 4096],
+  #                                               hop_sizes=fft_sizes//4,
+  #                                               win_lengths=fft_sizes,
+  #                                               scale='chroma',
+  #                                               n_bins=128,
+  #                                               sample_rate=self.fs,
+  #                                               perceptual_weighting=True).to(self._device)
 
   @torch.jit.ignore
   def _construct_mrstft_loss(self):
     """Construct the loss function for the model: a multi-resolution STFT loss"""
-    fft_sizes = np.array([1024, 512, 128])
-    return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[1024, 512, 128],
+    fft_sizes = np.array([8192, 4096, 2048, 1024, 512, 128])
+    return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[8192, 4096, 2048, 1024, 512, 128],
                                                 hop_sizes=fft_sizes//4,
                                                 win_lengths=fft_sizes).to(self._device)
 

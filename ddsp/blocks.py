@@ -40,6 +40,7 @@ def _make_sequential(sizes: List[int]):
 
   return nn.Sequential(*layers)
 
+
 def _scaled_sigmoid(x: torch.Tensor):
   """
   Custom activation function for the output layer. It is a scaled sigmoid function,
@@ -85,14 +86,26 @@ class VariationalEncoder(nn.Module):
 
     self.resampling_factor = resampling_factor
     # self.mfcc = MFCC(sample_rate = sample_rate, n_mfcc = n_mfcc)
-    self.mfcc = MelSpectrogram(sample_rate, n_mels=n_melbands)
+    self.melspec = MelSpectrogram(sample_rate, n_mels=n_melbands)
 
-    self.normalization = nn.LayerNorm(n_melbands)
+    self.cnn = nn.Sequential(
+      nn.Conv2d(1, 4, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+      nn.BatchNorm2d(4),
+      nn.LeakyReLU(),
+      nn.Conv2d(4, 8, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+      nn.BatchNorm2d(8),
+      nn.LeakyReLU(),
+      nn.Conv2d(8, 16, kernel_size=(3, 3), stride=(1, 1), padding=(1, 1)),
+      nn.BatchNorm2d(16),
+      nn.LeakyReLU(),
+    )
 
-    self.gru = nn.GRU(n_melbands, layer_sizes[0], batch_first = True)
-    self.register_buffer('_hidden_state', torch.zeros(1, 1, layer_sizes[0]), persistent=False)
+    # self.normalization = nn.LayerNorm(n_melbands)
 
-    self.bottleneck = _make_sequential(layer_sizes)
+    self.gru = nn.GRU(16*n_melbands, layer_sizes[-1], batch_first = True)
+    self.register_buffer('_hidden_state', torch.zeros(1, 1, layer_sizes[-1]), persistent=False)
+
+    # self.bottleneck = _make_sequential(layer_sizes)
 
     self.mu_logvar_out = nn.Linear(layer_sizes[-1], 2*latent_size)
 
@@ -105,22 +118,26 @@ class VariationalEncoder(nn.Module):
     Returns:
       - mu, logvar: Tuple[torch.Tensor, torch.Tensor], the latent space tensor
     """
-    # Extract MFCCs
-    mfcc = self.mfcc(audio)
+    # Extract MelSpectrogram
+    melspec = self.melspec(audio) # [batch_size, n_melbands, melspec_length]
 
-    # Expand the MFCCs to match the audio length
-    mfcc = F.interpolate(mfcc, size = audio.shape[-1], mode = 'nearest')
+    # Pass through the CNN layers
+    x = self.cnn(melspec.unsqueeze(1)) # [batch_size, channels, n_melbands, melspec_length]
 
-    input = mfcc
+    # Expand the features to match the audio length
+    x = F.interpolate(x, size = (melspec.shape[-2], audio.shape[-1]//self.resampling_factor), mode = 'bilinear') # [batch_size, channels, n_melbands, n_samples//resampling_factor]
 
-    # Downsample the input representation
-    x = F.interpolate(input, scale_factor = 1/self.resampling_factor, mode = 'linear')
+    # Flatten the features
+    x = x.view(x.shape[0], -1, x.shape[-1]) # [batch_size, n_melbands*channels, n_samples//resampling_factor]
 
-    # Reshape to [batch_size, signal_length, n_mfcc]
-    x = x.permute(0, 2, 1)
+    # # Downsample the input representation
+    # x = F.interpolate(melspec, scale_factor = 1/self.resampling_factor, mode = 'linear') # [batch_size, n_melbands, n_samples//resampling_factor]
 
     # Normalize the input
-    x = self.normalization(x)
+    # x = self.normalization(x)
+
+    # # Reshape to [batch_size, n_samples//resampling_factor, n_melbands*channels]
+    x = x.permute(0, 2, 1)
 
     # Pass through the GRU layer
     if self.streaming and _is_batch_size_one(x):
@@ -130,7 +147,7 @@ class VariationalEncoder(nn.Module):
       x, _ = self.gru(x)
 
     # Pass through bottleneck
-    x = self.bottleneck(x)
+    # x = self.bottleneck(x)
 
     # Pass through the dense layer
     z = self.mu_logvar_out(x)
