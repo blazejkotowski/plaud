@@ -85,7 +85,7 @@ class VariationalEncoder(nn.Module):
 
     self.resampling_factor = resampling_factor
     # self.mfcc = MFCC(sample_rate = sample_rate, n_mfcc = n_mfcc)
-    self.mfcc = MelSpectrogram(sample_rate, n_mels=n_melbands)
+    self.melspec = MelSpectrogram(sample_rate, n_mels=n_melbands)
 
     self.normalization = nn.LayerNorm(n_melbands)
 
@@ -105,18 +105,16 @@ class VariationalEncoder(nn.Module):
     Returns:
       - mu, logvar: Tuple[torch.Tensor, torch.Tensor], the latent space tensor
     """
-    # Extract MFCCs
-    mfcc = self.mfcc(audio)
+    # Calculate Mel spectrogram
+    melspec = self.melspec(audio)
 
-    # Expand the MFCCs to match the audio length
-    mfcc = F.interpolate(mfcc, size = audio.shape[-1], mode = 'nearest')
-
-    input = mfcc
+    # Expand the Mel spectrogram to match the audio length
+    melspec = F.interpolate(melspec, size = audio.shape[-1], mode = 'nearest')
 
     # Downsample the input representation
-    x = F.interpolate(input, scale_factor = 1/self.resampling_factor, mode = 'linear')
+    x = F.interpolate(melspec, scale_factor = 1/self.resampling_factor, mode = 'linear')
 
-    # Reshape to [batch_size, signal_length, n_mfcc]
+    # Reshape to [batch_size, signal_length, n_melbands]
     x = x.permute(0, 2, 1)
 
     # Normalize the input
@@ -138,6 +136,7 @@ class VariationalEncoder(nn.Module):
     mu, logvar = z.chunk(2, dim = -1)
 
     return mu, logvar
+
 
   def reparametrize(self, mean: torch.Tensor, scale: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     """

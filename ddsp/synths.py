@@ -309,6 +309,7 @@ class SineSynth(BaseSynth):
       # Apply the mask to the frequencies and amplitudes
       frequencies = frequencies * mask
       amplitudes = amplitudes * mask
+      phases = phases * mask
 
     # Generate and sum the sinewaves
     signal = torch.sum(amplitudes * torch.sin(phases), dim=1, keepdim=True)

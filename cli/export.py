@@ -91,8 +91,8 @@ class ScriptedDDSP(nn_tilde.Module):
     # print('params', params.shape)
     # print(self.pretrained.latent_size)
     # print(self.pretrained.num_params)
-    # latents = self.pretrained.params_to_latents(params)
     latents = latents.permute(0, 2, 1)
+    latents = self.pretrained.params_to_latents(latents)
     latents = self.pretrained.denormalize_latents(latents)
     synth_params = self.pretrained.decoder(latents)
     audio = self.pretrained._synthesize(synth_params, sines_amp_attenuation=self.sines_amplitude_attenuation[0], noise_amp_attenuation=self.noise_amplitude_attenuation[0], sines_number_attenuation=self.sines_number_attenuation[0])
@@ -103,9 +103,9 @@ class ScriptedDDSP(nn_tilde.Module):
     mu, scale = self.pretrained.encoder(audio.squeeze(1))
     # latents = self.pretrained.encoder.reparametrize(mu, logvar)
     latents, _ = self.pretrained.encoder.reparametrize(mu, scale)
-    # params = self.pretrained.latents_to_params(latents)
     latents = self.pretrained._smooth_latents(latents)
     latents = self.pretrained.normalize_latents(latents)
+    latents = self.pretrained.latents_to_params(latents)
     return latents.permute(0, 2, 1).float()
 
   @torch.jit.export

@@ -70,9 +70,10 @@ class DDSP(L.LightningModule):
     ])
 
     # Latent space analyzis buffers
-    
+
     self.register_buffer('_latent_pca', torch.eye(self.latent_size))
     self.register_buffer('_latent_mean', torch.zeros(self.latent_size))
+    self.register_buffer('_latent_std', torch.ones(self.latent_size))
     self.register_buffer('_latent_quantiles', torch.zeros(2, self.latent_size))
 
     self._total_synth_params = sum([s.n_params for s in self.synths])
@@ -144,6 +145,10 @@ class DDSP(L.LightningModule):
     # Extract and store the mean
     latent_mean = z.mean(0)
     self._latent_mean.copy_(latent_mean)
+
+    # Extract and store the std
+    latent_std = z.std(0)
+    self._latent_std.copy_(latent_std)
 
     # Center the latents
     z -= latent_mean
@@ -255,6 +260,8 @@ class DDSP(L.LightningModule):
     # Fill missing latent dims with noise if needed
     if num_params < latent_size:
       noise = torch.randn(batch_size, n, latent_size - num_params, device=params.device)
+      # Scale the noise to have the same std as the latent space
+      noise *= self._latent_std[num_params:]  # [batch_size, n, latent_size - num_params]
       z_centered[..., num_params:] = noise
 
     # Add mean back
@@ -355,11 +362,16 @@ class DDSP(L.LightningModule):
     if self._latent_smoothing_kernel == 1:
       return z
 
+    smoothing_kernel = self._latent_smoothing_kernel
+    # Ensure the latent smoothing kernel is odd
+    if smoothing_kernel % 2 == 0:
+      smoothing_kernel += 1
+
     # smooth the latent envelopes, individually
     # Apply a simple moving average (low-pass filter) along the time axis for each latent dimension
-    padding = self._latent_smoothing_kernel // 2
+    padding = smoothing_kernel // 2
     z_smooth = torch.nn.functional.avg_pool1d(
-      z.transpose(1, 2), kernel_size=self._latent_smoothing_kernel, stride=1, padding=padding
+      z.transpose(1, 2), kernel_size=smoothing_kernel, stride=1, padding=padding
     ).transpose(1, 2)
     return z_smooth
 
