@@ -18,7 +18,7 @@ class DDSP(L.LightningModule):
   A neural network that learns how to resynthesise signal, predicting amplitudes of
   precalculated, loopable noise bands.
 
-  Args:
+  Arguments:
     - synth_builders: List[Callable[[], BaseSynth]], the differentiable synthesiser builders
     - latent_size: int, number of latent dimensions
     - fs : int, the sampling rate of the input signal
@@ -32,7 +32,6 @@ class DDSP(L.LightningModule):
     - learning_rate: float, the learning rate for the optimizer
     - streaming: bool, whether to run the model in streaming mode
     - perceptual_loss_weight: float, the weight for the perceptual loss
-    - kld_weight: float, the weight for the KLD loss
     - device: str, the device to run the model on
   """
   def __init__(self,
@@ -48,15 +47,16 @@ class DDSP(L.LightningModule):
                capacity: int = 64,
                resampling_factor: int = 32,
                learning_rate: float = 1e-3,
-               kld_weight: float = 0.00025,
                perceptual_loss_weight: float = 1.0,
                streaming: bool = False,
+               plateau_patience: int = 20,
                device: str = 'cuda'):
     super().__init__()
     # Save hyperparameters in the checkpoints
     self.save_hyperparameters()
     self._synth_configs = synth_configs
     self._device = device
+    self._plateau_patience = plateau_patience
     self.fs = fs
     self.latent_size = latent_size
     self.num_params = num_params
@@ -85,7 +85,6 @@ class DDSP(L.LightningModule):
 
     # ELBO regularization params
     self._beta = 0
-    self._kld_weight = kld_weight
 
     # Define the neural network
     ## Encoder to extract latents from the input audio signal
@@ -128,7 +127,7 @@ class DDSP(L.LightningModule):
 
   def streaming(self, streaming: bool) -> None:
     """Set streaming mode"""
-    self.streaming = streaming
+    self._streaming = streaming
     for synth in self.synths:
       synth.streaming = streaming
 
@@ -309,7 +308,7 @@ class DDSP(L.LightningModule):
     _, losses = self._autoencode(x_audio)
 
     self.log("recons_loss", losses["recons_loss"], prog_bar=True, logger=True)
-    self.log("kld_loss", losses["kld_loss"], prog_bar=True, logger=True)
+    self.log("kld", losses["kld"], prog_bar=True, logger=True)
     self.log("m2l_loss", losses["m2l_loss"], prog_bar=True, logger=True)
     self.log("train_loss", losses["loss"], prog_bar=True, logger=True)
     self.log("beta", self._beta, prog_bar=True, logger=True)
@@ -339,7 +338,7 @@ class DDSP(L.LightningModule):
     # return torch.optim.Adam(self.parameters(), lr=self._learning_rate)
 
     optimizer = torch.optim.Adam(self.parameters(), lr=self._learning_rate)
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=500, verbose=False, threshold=1e-3)
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=self._plateau_patience, verbose=False, threshold=1e-3)
 
     scheduler = {
       'scheduler': lr_scheduler,
@@ -389,7 +388,7 @@ class DDSP(L.LightningModule):
     mu, scale = self.encoder(x_audio)
 
     # Reparametrization trick
-    z, kld_loss = self.encoder.reparametrize(mu, scale)
+    z, kld = self.encoder.reparametrize(mu, scale)
 
     # smooth the latent envelopes
     z = self._smooth_latents(z)
@@ -404,7 +403,7 @@ class DDSP(L.LightningModule):
     recons_loss = self._reconstruction_loss(y_audio.float(), x_audio.float())
 
     # Compute the total loss using β parameter
-    loss = recons_loss + self._kld_weight * self._beta * kld_loss
+    loss = recons_loss +  self._beta * kld
 
     m2l_loss = 0
     # Compute the perceptual loss with music2latent
@@ -416,7 +415,7 @@ class DDSP(L.LightningModule):
     # Construct losses dictionary
     losses = {
       "recons_loss": recons_loss,
-      "kld_loss": kld_loss,
+      "kld": kld,
       "m2l_loss": m2l_loss,
       "loss": loss
     }

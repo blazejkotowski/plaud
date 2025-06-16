@@ -142,19 +142,28 @@ class VariationalEncoder(nn.Module):
     """
     Reparametrize the latent variable z.
     Args:
-      - z: torch.Tensor[batch_size, latent_size], the latent variable
+      - z: torch.Tensor[batch_size, n_latents, latent_size], the latent variable
     Returns:
-      - z: torch.Tensor[batch_size, latent_size], the reparametrized latent variable
-      - kl: torch.Tensor[batch_size, 1], the KL divergence
+      - z: torch.Tensor[batch_size, n_latents, latent_size], the reparametrized latent variable
+      - kl: torch.Tensor[1], the KL divergence
     """
     std = F.softplus(scale) + 1e-4
     var = std * std
     logvar = torch.log(var)
 
     z = torch.randn_like(mean) * std + mean
+
+    # Calculate KL divergence
+    kl_weight = 1.0 / (z.shape[1] * z.shape[2])  # KL weight for averaging
     kl = (mean * mean + var - logvar - 1).sum(1).mean()
 
-    return z, kl
+    return z, kl*kl_weight
+
+  # def reparametrize(self, mu, logvar):
+  #   sigma = torch.sqrt(torch.exp(logvar))
+  #   eps = torch.distributions.normal.Normal(0, 1).sample(sample_shape=sigma.size()).to(mu.device) # perche' lo devo mandare a device?
+  #   z = mu + sigma * eps
+  #   return z, torch.tensor([1])
 
 
 
