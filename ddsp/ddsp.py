@@ -5,12 +5,12 @@ import numpy as np
 import auraloss
 
 from ddsp.blocks import VariationalEncoder, Decoder
-from ddsp.synths import BaseSynth, SineSynth, NoiseBandSynth
+from ddsp.synths import BaseSynth, SineSynth, NoiseBandSynth, ComplexSineSynth
 from sklearn.decomposition import PCA
 
 from typing import List, Tuple, Dict, Any
 
-from ddsp.losses import M2LLoss
+from ddsp.losses import M2LLoss, SlicedWassersteinLoss
 
 
 class DDSP(L.LightningModule):
@@ -108,9 +108,16 @@ class DDSP(L.LightningModule):
 
     # Define the loss
     self._mr_stft_loss = self._construct_mrstft_loss() # MRSTFT loss
-    self._mr_mel_loss = self._construct_mel_loss() # MEL-scale loss
+    # self._mr_mel_loss = self._construct_mel_loss() # MEL-scale loss
     # self._mr_chroma_loss = self._construct_chroma_loss() # CHROMA-scale loss
 
+    # Wasserstein loss
+    self._sliced_wasserstein_loss = SlicedWassersteinLoss(
+      win_size=512,
+      hop_size=128,
+      n_projections=100,
+      device=self._device
+    )
     # Perceptual loss
     self._m2l_loss = M2LLoss()
     self._perceptual_loss_weight = perceptual_loss_weight
@@ -468,6 +475,8 @@ class DDSP(L.LightningModule):
         audio.append(synth(synth_params, sines_number_attenuation=sines_number_attenuation)*sines_amp)
       elif isinstance(synth, NoiseBandSynth):
         audio.append(synth(synth_params)*noise_amp)
+      elif isinstance(synth, ComplexSineSynth):
+        audio.append(synth(synth_params))
 
       # audio.append(synth(synth_params))
 
@@ -486,14 +495,17 @@ class DDSP(L.LightningModule):
       x = x[..., :min_length]
       y = y[..., :min_length]
 
-    w_stft = 0.7
-    w_mel = 0.3
-    w_chroma = 0.1
+    # w_stft = 0.7
+    # w_mel = 0.3
+    # w_chroma = 0.1
 
-    loss = (w_stft * self._mr_stft_loss(y, x) \
-        # + w_chroma * self._mr_chroma_loss(y, x) \
-        + w_mel * self._mr_mel_loss(y, x) \
-      ) / (w_stft + w_mel + w_chroma)
+    # loss = (w_stft * self._mr_stft_loss(y, x) \
+    #     # + w_chroma * self._mr_chroma_loss(y, x) \
+    #     + w_mel * self._mr_mel_loss(y, x) \
+    #   ) / (w_stft + w_mel + w_chroma)
+
+    # loss = self._mr_stft_loss(y, x)
+    loss = self._sliced_wasserstein_loss(y.squeeze(1), x.squeeze(1))
     return loss
 
   @torch.jit.ignore
@@ -522,8 +534,14 @@ class DDSP(L.LightningModule):
   @torch.jit.ignore
   def _construct_mrstft_loss(self):
     """Construct the loss function for the model: a multi-resolution STFT loss"""
-    fft_sizes = np.array([1024, 512, 128])
-    return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[1024, 512, 128],
+    fft_sizes = np.array([2053, 1021, 509, 257])
+    # Modification from log to log1p according to
+    # Schwär, S., & Müller, M. (2023). Multi-Scale Spectral Loss Revisited. 
+    # IEEE Signal Processing Letters, 30, 1712–1716. https://doi.org/10.1109/LSP.2023.3333205
+    return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[2053, 1021, 509, 257],
                                                 hop_sizes=fft_sizes//4,
-                                                win_lengths=fft_sizes).to(self._device)
+                                                win_lengths=fft_sizes,
+                                                window='flattop_window',
+                                                mag_distance='L2',
+                                                ).to(self._device)
 
