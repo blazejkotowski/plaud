@@ -1,0 +1,6 @@
+[submodule "ddsp/sinusoidal-gradient-descent"]
+	path = ddsp/sinusoidal-gradient-descent
+	url = git@github.com:ben-hayes/sinusoidal-gradient-descent.git
+[submodule "ddsp/sgd"]
+	path = ddsp/sgd
+	url = git@github.com:ben-hayes/sinusoidal-gradient-descent.git
