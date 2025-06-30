@@ -113,9 +113,10 @@ class DDSP(L.LightningModule):
 
     # Wasserstein loss
     self._sliced_wasserstein_loss = SlicedWassersteinLoss(
-      win_size=512,
-      hop_size=128,
+      win_size=2048,
+      hop_size=512,
       n_projections=100,
+      p=2,
       device=self._device
     )
     # Perceptual loss
@@ -506,6 +507,7 @@ class DDSP(L.LightningModule):
 
     # loss = self._mr_stft_loss(y, x)
     loss = self._sliced_wasserstein_loss(y.squeeze(1), x.squeeze(1))
+    # loss += self._mr_stft_loss(y, x)
     return loss
 
   @torch.jit.ignore
@@ -536,7 +538,7 @@ class DDSP(L.LightningModule):
     """Construct the loss function for the model: a multi-resolution STFT loss"""
     fft_sizes = np.array([2053, 1021, 509, 257])
     # Modification from log to log1p according to
-    # Schwär, S., & Müller, M. (2023). Multi-Scale Spectral Loss Revisited. 
+    # Schwär, S., & Müller, M. (2023). Multi-Scale Spectral Loss Revisited.
     # IEEE Signal Processing Letters, 30, 1712–1716. https://doi.org/10.1109/LSP.2023.3333205
     return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[2053, 1021, 509, 257],
                                                 hop_sizes=fft_sizes//4,

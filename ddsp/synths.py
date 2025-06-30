@@ -191,8 +191,112 @@ class HarmonicSynth(BaseSynth):
     return signal
 
 
-
 class SineSynth(BaseSynth):
+  """
+  Mixture of sinweaves synthesiser.
+
+  Arguments:
+    - fs: int, the sampling rate of the input signal
+    - n_sines: int, the number of sinewaves to synthesise
+    - resampling_factor: int, the internal up / down sampling factor for the sinewaves
+    - streaming: bool, whether to run the model in streaming mode
+  """
+  def __init__(self,
+               fs: int = 44100,
+               n_sines: int = 500,
+               resampling_factor: int = 32,
+               streaming: bool = False,
+               device: str = 'cuda'):
+    super().__init__()
+    self._fs = fs
+    self._n_sines = n_sines
+    self._resampling_factor = resampling_factor
+    # self._phases = None
+    self.register_buffer("_phases", torch.empty(0))
+    self._phases_initialized = False
+
+    self.streaming = streaming
+    self._device = device
+
+
+  @property
+  def n_params(self):
+    return 2*self._n_sines
+
+
+  def forward(self, parameters: torch.Tensor, sines_number_attenuation: float = 0.0):
+    """
+    Generates a mixture of sinewaves with the given frequencies and amplitudes per sample.
+
+    Arguments:
+      - parameters: torch.Tensor[batch_size, n_params, n_samples], the parameters of the synthesizer
+      - sines_number_attenuation: float, the attenuation factor for the number of sinewaves
+    """
+    frequencies = parameters[:, :self._n_sines, :] # n_sines frequencies
+    amplitudes = parameters[:, self._n_sines:, :] # n_sines amplitudes
+
+    batch_size = frequencies.shape[0]
+
+    # We only need to initialise phases buffer if we are in streaming mode
+    if self.streaming and (not self._phases_initialized or self._phases.shape[0] != batch_size):
+      self._phases = torch.zeros(batch_size, self._n_sines)
+      self._phases_initialized = True
+
+    # Upsample from the internal sampling rate to the target sampling rate
+    frequencies = F.interpolate(frequencies, scale_factor=float(self._resampling_factor), mode='linear')
+    amplitudes = F.interpolate(amplitudes, scale_factor=float(self._resampling_factor), mode='linear')
+
+    # Scale the frequencies to the Nyquist frequency
+    frequencies = frequencies * self._fs / 4 # range [0, 2] to [0, fs/2]
+
+    # print(f'est freq range in batch: {frequencies.min().item()} - {frequencies.max().item()}')
+
+    # cancel the sines above nyquist frequency
+    amplitudes *= (frequencies < self._fs / 2).float() + 1e-4
+
+    # Calculate the phase increments
+    omegas = frequencies * 2 * math.pi / self._fs
+
+    # Calculate the phases at points, in place
+    phases = omegas.cumsum(dim=-1)
+    phases = phases % (2 * math.pi)
+
+    if self.streaming:
+      # Shift the phases by the last phase from last generation
+      # breakpoint()
+      phases = (phases.permute(2, 0, 1) + self._phases).permute(1, 2, 0)
+
+      # Copy the last phases for next iteration
+      self._phases.copy_(phases[: ,: , -1] % (2 * math.pi))
+
+
+    # If the sines_number_attenuation is higher than 0, we need to limit the number of sinewaves
+    # by choosing the first max_sines, in relation to their amplitudes
+    # clamp sines_number_attenuation to [0, 1]
+    sines_number_attenuation = max(0.0, min(sines_number_attenuation, 1.0))
+    if sines_number_attenuation > 0:
+      # Calculate the number of sinewaves to keep (at least 1)
+      max_sines = int(self._n_sines * (1 - sines_number_attenuation))
+      max_sines = max(max_sines, 1)
+
+      # Get the indices of the max_sines largest amplitudes
+      _, indices = torch.topk(amplitudes, max_sines, dim=1)
+      # Create a mask of the same shape as the amplitudes
+      mask = torch.zeros_like(amplitudes)
+      # Set the values at the indices to 1
+      mask.scatter_(1, indices, 1)
+
+      # Apply the mask to the frequencies and amplitudes
+      frequencies = frequencies * mask
+      amplitudes = amplitudes * mask
+      phases = phases * mask
+
+    # Generate and sum the sinewaves
+    signal = torch.sum(amplitudes * torch.sin(phases), dim=1, keepdim=True)
+    return signal
+
+
+class SubbandSineSynth(BaseSynth):
   """
   Mixture of sinweaves synthesiser.
 
