@@ -234,6 +234,7 @@ class SineSynth(BaseSynth):
     """
     frequencies = parameters[:, :self._n_sines, :] # n_sines frequencies
     amplitudes = parameters[:, self._n_sines:, :] # n_sines amplitudes
+    # amplitudes = torch.ones_like(amplitudes) # workaround for now, amplitudes are not used
 
     batch_size = frequencies.shape[0]
 
@@ -246,8 +247,11 @@ class SineSynth(BaseSynth):
     frequencies = F.interpolate(frequencies, scale_factor=float(self._resampling_factor), mode='linear')
     amplitudes = F.interpolate(amplitudes, scale_factor=float(self._resampling_factor), mode='linear')
 
+    # round frequencies to the 2nd decimal place
+    # frequencies = torch.round(frequencies * 100) / 100.0
     # Scale the frequencies to the Nyquist frequency
-    frequencies = frequencies * self._fs / 4 # range [0, 2] to [0, fs/2]
+    # frequencies = frequencies * self._fs / 4 # range [0, 2] to [0, fs/2]
+    frequencies = frequencies * self._fs / 2 # range [0, 1] to [0, fs/2]
 
     # print(f'est freq range in batch: {frequencies.min().item()} - {frequencies.max().item()}')
 

@@ -40,14 +40,14 @@ class DDSP(L.LightningModule):
                num_params: int = 4,
                fs: int = 44100,
                encoder_ratios: List[int] = [8, 4, 2],
-               latent_smoothing_kernel: int = 129,
+               latent_smoothing_kernel: int = 1,
                n_melbands: int = 128,
                decoder_ratios: List[int] = [2, 4, 8],
                decoder_gru_layers: int = 1,
                capacity: int = 64,
                resampling_factor: int = 32,
                learning_rate: float = 1e-3,
-               perceptual_loss_weight: float = 1.0,
+               perceptual_loss_weight: float = 0.0,
                streaming: bool = False,
                plateau_patience: int = 20,
                device: str = 'cuda'):
@@ -113,9 +113,9 @@ class DDSP(L.LightningModule):
 
     # Wasserstein loss
     self._sliced_wasserstein_loss = SlicedWassersteinLoss(
-      win_size=2048,
-      hop_size=512,
-      n_projections=100,
+      win_size=512,
+      hop_size=256,
+      n_projections=10,
       p=2,
       device=self._device
     )
