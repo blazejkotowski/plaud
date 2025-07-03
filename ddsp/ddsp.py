@@ -5,7 +5,7 @@ import numpy as np
 import auraloss
 
 from ddsp.blocks import VariationalEncoder, Decoder
-from ddsp.synths import BaseSynth, SineSynth, NoiseBandSynth, ComplexSineSynth
+from ddsp.synths import BaseSynth, SineSynth, SubbandSineSynth, NoiseBandSynth, ComplexSineSynth
 from sklearn.decomposition import PCA
 
 from typing import List, Tuple, Dict, Any
@@ -23,31 +23,32 @@ class DDSP(L.LightningModule):
     - latent_size: int, number of latent dimensions
     - fs : int, the sampling rate of the input signal
     - encoder_ratios: List[int], the capacity ratios for encoder layers
-    - latent_smoothing_kernel: int, the kernel size for the smoothing filter
-    - num_params: int, the number of parameters to predict
-    - n_melbands: int, the number of MFCCs to extract
+    - latent_smoothing_kernel: int, the kernel size for the smoothing filter [TODO: make it optional]
+    - num_params: int, the number of parameters to predict [TODO: make it optional]
+    - n_melbands: int, the number of melbands to extract
     - decoder_ratios: List[int], the capacity ratios for decoder layers
     - capacity: int, the capacity of the model
     - resampling_factor: int, internal up / down sampling factor for control signal and noisebands
     - learning_rate: float, the learning rate for the optimizer
     - streaming: bool, whether to run the model in streaming mode
-    - perceptual_loss_weight: float, the weight for the perceptual loss
+    - perceptual_loss_weight: float, the weight for the perceptual loss [TODO: make it optional]
+    - plateau_patience: int, the patience for the learning rate scheduler
     - device: str, the device to run the model on
   """
   def __init__(self,
                synth_configs: List[Dict[Any, Any]] = [],
-               latent_size: int = 16,
+               latent_size: int = 4,
                num_params: int = 4,
                fs: int = 44100,
                encoder_ratios: List[int] = [8, 4, 2],
-               latent_smoothing_kernel: int = 129,
+               latent_smoothing_kernel: int = 1,
                n_melbands: int = 128,
                decoder_ratios: List[int] = [2, 4, 8],
                decoder_gru_layers: int = 1,
                capacity: int = 64,
                resampling_factor: int = 32,
                learning_rate: float = 1e-3,
-               perceptual_loss_weight: float = 1.0,
+               perceptual_loss_weight: float = 0.0,
                streaming: bool = False,
                plateau_patience: int = 20,
                device: str = 'cuda'):
@@ -472,7 +473,7 @@ class DDSP(L.LightningModule):
     for synth in self.synths:
       synth_params = params[:, params_idx:params_idx+synth.n_params, :]
       params_idx += synth.n_params
-      if isinstance(synth, SineSynth):
+      if isinstance(synth, SubbandSineSynth):
         audio.append(synth(synth_params, sines_number_attenuation=sines_number_attenuation)*sines_amp)
       elif isinstance(synth, NoiseBandSynth):
         audio.append(synth(synth_params)*noise_amp)
