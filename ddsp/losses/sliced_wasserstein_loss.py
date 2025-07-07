@@ -24,6 +24,7 @@ class SlicedWassersteinLoss(torch.nn.Module):
     - n_projections: int, the number of projections to use for the sliced Wasserstein distance
     - sampling_rate: int, the sampling rate for the STFT
     - p: int, the p in the p-Wasserstein distance
+    - magnitude: str, the type of magnitude to use ('lin' for linear, 'log' for logarithmic)
     - device: str, the device to use for the computation (e.g., 'cuda' or 'cpu')
   """
 
@@ -104,12 +105,12 @@ class SlicedWassersteinLoss(torch.nn.Module):
     Y_flat = Y_mag.flatten(1) # shape: [B, T*F]
 
     # Option 1: POT
-    diffs = []
-    for projection in self._projections:
-      # print(X_flat.shape, Y_flat.shape, projection.shape)
-      diff = wasserstein_1d(projection, projection, X_flat.squeeze(), Y_flat.squeeze(), p=2, require_sort=True)
-      diffs.append(diff)
-    return torch.stack(diffs).mean()
+    # diffs = []
+    # for projection in self._projections:
+    #   # print(X_flat.shape, Y_flat.shape, projection.shape)
+    #   diff = wasserstein_1d(projection, projection, X_flat.squeeze(), Y_flat.squeeze(), p=2, require_sort=True)
+    #   diffs.append(diff)
+    # return torch.stack(diffs).mean()
 
     # Option 2: manual cdf looping
     # diffs = []
@@ -179,8 +180,7 @@ class SlicedWassersteinLoss(torch.nn.Module):
     # Compress amplitudes for the softmax
     elif self.magnitude == 'log':
       B, T, F = X.shape
-      X = torch.log(X)
-      X = torch.softmax(X.flatten(1), dim=1).reshape(B, T, F)
+      return torch.softmax(X.flatten(1), dim=1).reshape(B, T, F)
 
 
   def _compute_energy_loss(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:
@@ -233,8 +233,8 @@ class SlicedWassersteinLoss(torch.nn.Module):
     for fi in fis:
       coords = torch.cos(fi) * X_coords  + torch.sin(fi) * Y_coords
       coords = coords.flatten()
-      projections.append(coords)
-      # projections.append(torch.argsort(coords))
+      # projections.append(coords)
+      projections.append(torch.argsort(coords))
 
     projections = torch.stack(projections)  # shape: [n_angles, X*Y]
     return projections

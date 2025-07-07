@@ -507,7 +507,7 @@ class DDSP(L.LightningModule):
 
     # loss = self._mr_stft_loss(y, x)
     loss = self._sliced_wasserstein_loss(y.squeeze(1), x.squeeze(1))
-    # loss += self._mr_stft_loss(y, x)
+    loss += 0.1 * self._mr_stft_loss(y, x)
     return loss
 
   @torch.jit.ignore

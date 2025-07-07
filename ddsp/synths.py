@@ -250,8 +250,8 @@ class SineSynth(BaseSynth):
     # round frequencies to the 2nd decimal place
     # frequencies = torch.round(frequencies * 100) / 100.0
     # Scale the frequencies to the Nyquist frequency
-    # frequencies = frequencies * self._fs / 4 # range [0, 2] to [0, fs/2]
-    frequencies = frequencies * self._fs / 2 # range [0, 1] to [0, fs/2]
+    frequencies = frequencies * self._fs / 4 # range [0, 2] to [0, fs/2]
+    # frequencies = frequencies * self._fs / 2 # range [0, 1] to [0, fs/2]
 
     # print(f'est freq range in batch: {frequencies.min().item()} - {frequencies.max().item()}')
 
