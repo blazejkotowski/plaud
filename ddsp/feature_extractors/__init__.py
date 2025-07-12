@@ -2,3 +2,4 @@ from .base_extractor import BaseExtractor
 from .loudness_extractor import LoudnessExtractor
 from .pitch_extractor import PitchExtractor
 from .spectral_centroid_extractor import SpectralCentroidExtractor
+from .sinusoids_extractor import SinusoidsExtractor
