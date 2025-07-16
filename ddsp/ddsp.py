@@ -5,12 +5,14 @@ import numpy as np
 import auraloss
 
 from ddsp.blocks import VariationalEncoder, Decoder
-from ddsp.synths import BaseSynth, SineSynth, NoiseBandSynth, ComplexSineSynth
+from ddsp.synths import BaseSynth, SineSynth, NoiseBandSynth, ComplexSineSynth, SpectralSineSynth
 from sklearn.decomposition import PCA
 
 from typing import List, Tuple, Dict, Any
 
-from ddsp.losses import M2LLoss, SlicedWassersteinLoss
+from ddsp.losses import M2LLoss, SlicedWassersteinLoss, ScatteringLoss, MSSWassersteinLoss
+
+from torch.nn.functional import mse_loss
 
 
 class DDSP(L.LightningModule):
@@ -112,13 +114,15 @@ class DDSP(L.LightningModule):
     # self._mr_chroma_loss = self._construct_chroma_loss() # CHROMA-scale loss
 
     # Wasserstein loss
-    self._sliced_wasserstein_loss = SlicedWassersteinLoss(
-      win_size=512,
-      hop_size=256,
-      n_projections=10,
-      p=2,
-      device=self._device
-    )
+    # win_sizes = [2048, 1024, 512, 256, 128]
+    # windows = [torch.hann_window(window_length=win_length, periodic=True, device='cuda') for win_length in win_sizes]
+    # self._mssw_loss = MSSWassersteinLoss(
+    #   windows=windows,
+    #   n_projections=10,
+    #   magnitude='log',
+    #   p=2,
+    # )
+
     # Perceptual loss
     self._m2l_loss = M2LLoss()
     self._perceptual_loss_weight = perceptual_loss_weight
@@ -299,7 +303,7 @@ class DDSP(L.LightningModule):
     return signal
 
 
-  def training_step(self, x_audio: torch.Tensor, batch_idx: int) -> torch.Tensor:
+  def training_step(self, batch, batch_idx: int) -> torch.Tensor:
     """
     Compute the loss for a batch of data
 
@@ -313,7 +317,8 @@ class DDSP(L.LightningModule):
     Returns:
       loss: torch.Tensor[batch_size, 1], tensor of loss
     """
-    _, losses = self._autoencode(x_audio)
+    x_audio, y_params = batch
+    _, losses = self._autoencode(x_audio, y_params)
 
     self.log("recons_loss", losses["recons_loss"], prog_bar=True, logger=True)
     self.log("kld", losses["kld"], prog_bar=True, logger=True)
@@ -325,10 +330,12 @@ class DDSP(L.LightningModule):
     return losses["loss"]
 
 
-  def validation_step(self, x_audio: torch.Tensor, batch_idx: int) -> torch.Tensor:
+  def validation_step(self, batch, batch_idx: int) -> torch.Tensor:
     """Compute the loss for validation data"""
+    x_audio, y_params = batch
+
     with torch.no_grad():
-      y_audio, losses = self._autoencode(x_audio)
+      y_audio, losses = self._autoencode(x_audio, y_params)
 
     loss = losses["recons_loss"]
 
@@ -383,7 +390,7 @@ class DDSP(L.LightningModule):
     return z_smooth
 
 
-  def _autoencode(self, x_audio: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+  def _autoencode(self, audio: torch.Tensor, params: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Autoencode the audio signal
     Args:
@@ -393,7 +400,7 @@ class DDSP(L.LightningModule):
       - losses: Dict[str, torch.Tensor], the losses computed during the autoencoding
     """
     # Encode the audio signal
-    mu, scale = self.encoder(x_audio)
+    mu, scale = self.encoder(audio)
 
     # Reparametrization trick
     z, kld = self.encoder.reparametrize(mu, scale)
@@ -402,33 +409,39 @@ class DDSP(L.LightningModule):
     z = self._smooth_latents(z)
 
     # Predict the parameters of the synthesiser
-    synth_params = self.decoder(z)
+    params_pred = self.decoder(z)
 
     # Synthesize the output signal
-    y_audio = self._synthesize(synth_params)
+    audio_pred = self._synthesize(params_pred)
+
+    # Synthesise from the given parameters
+    synth_audio = self._synthesize(params)
 
     # Compute the reconstruction loss
-    recons_loss = self._reconstruction_loss(y_audio.float(), x_audio.float())
+    params_loss = self._compute_params_loss(params_pred, params)
+    # recons_loss = torch.nn.functional.mse_loss(synth_params, y_params)
+    # recons_loss = self._reconstruction_loss(audio_pred.float(), synth_audio.float())
+    # params_loss += 3e-2 * recons_loss
 
     # Compute the total loss using β parameter
-    loss = recons_loss +  self._beta * kld
+    loss = params_loss + self._beta * kld
 
     m2l_loss = 0
     # Compute the perceptual loss with music2latent
     if self._perceptual_loss_weight > 0.0:
-      m2l_loss = self._m2l_loss(y_audio, x_audio)
+      m2l_loss = self._m2l_loss(audio_pred, audio)
       loss += self._perceptual_loss_weight * m2l_loss
     # loss = m2l_loss
 
     # Construct losses dictionary
     losses = {
-      "recons_loss": recons_loss,
+      "recons_loss": params_loss,
       "kld": kld,
       "m2l_loss": m2l_loss,
       "loss": loss
     }
 
-    return y_audio, losses
+    return audio_pred, losses
 
 
   # def on_validation_epoch_end(self):
@@ -449,6 +462,60 @@ class DDSP(L.LightningModule):
   #   self._last_validation_in = None
   #   self._last_validation_out = None
   #   self._validation_index += 1
+
+
+  def _compute_params_loss(self, y_pred: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    """
+    Compute the loss between the predicted parameters and the ground truth parameters.
+    Args:
+      - y_pred: torch.Tensor[batch_size, n_params, n_signal], the predicted parameters
+      - y: torch.Tensor[batch_size, n_params, n_signal], the ground truth parameters
+    Returns:
+      - loss: torch.Tensor[1], the computed loss
+    """
+    # params_loss = mse_loss(y_pred, y)
+    # weighting differences in lower frequencies higher
+
+    eps = 1e-3
+    params_loss = torch.square(torch.log1p(y_pred / eps) - torch.log1p(y / eps)).mean()
+
+    interframe_diff_loss = torch.tensor([0], dtype=torch.float32, device=y_pred.device)
+    for stride in [1, 2, 4, 8]:
+      y_diff = y[:, :, ::stride].diff(dim=-1, n=1)
+      y_pred_diff = y_pred[:, :, ::stride].diff(dim=-1, n=1)
+      interframe_diff_loss += mse_loss(y_pred_diff, y_diff)
+
+    # control the inter-sinusoid differences
+    freqs_pred = y_pred[:, :y_pred.shape[1]//2, :]
+    amps_pred = y_pred[:, y_pred.shape[1]//2:, :]
+    freqs = y[:, :y.shape[1]//2, :]
+    amps = y[:, y.shape[1]//2:, :]
+    intersin_freq_diff = mse_loss(freqs_pred.diff(dim=1, n=1), freqs.diff(dim=1, n=1))
+    intersin_amp_diff = mse_loss(amps_pred.diff(dim=1, n=1), amps.diff(dim=1, n=1))
+    intersin_diff_loss = intersin_freq_diff + intersin_amp_diff
+
+    # Maximmum inter-frame differences
+    # threshold = 0.1  # Adjust this threshold as needed
+    # for stride in [1, 2, 4, 8]:
+    #   y_diff = y[:, :, ::stride].diff(dim=-1, n=1)
+    #   y_pred_diff = y_pred[:, :, ::stride].diff(dim=-1, n=1)
+
+    #   # Penalize if the frame-to-frame difference exceeds the threshold
+    #   deviation = torch.abs(y_pred_diff - y_diff)
+    #   penalty = torch.where(deviation > threshold,
+    #                  torch.square(deviation - threshold) * 100,  # Harsh penalty
+    #                  torch.zeros_like(deviation))
+    #   diff_loss += penalty.mean()
+
+    # 2nd order differences
+    # y_diff2 = y.diff(dim=-1, n=2)
+    # y_pred_diff2 = y_pred.diff(dim=-1, n=2)
+    # diff2_loss = mse_loss(y_pred_diff2, y_diff2)
+
+    # jitter_loss = torch.clamp(torch.var(y_diff1) - torch.var(y_pred_diff1), min=0)
+
+    loss = params_loss + 10*interframe_diff_loss + 100*intersin_diff_loss
+    return loss
 
 
   def _synthesize(self, params: torch.Tensor, sines_number_attenuation: float = 0.0, noise_amp_attenuation: float = 0.0, sines_amp_attenuation: float = 0.0) -> torch.Tensor:
@@ -472,11 +539,13 @@ class DDSP(L.LightningModule):
     for synth in self.synths:
       synth_params = params[:, params_idx:params_idx+synth.n_params, :]
       params_idx += synth.n_params
-      if isinstance(synth, SineSynth):
+      if synth.jit_name == "SineSynth":
         audio.append(synth(synth_params, sines_number_attenuation=sines_number_attenuation)*sines_amp)
-      elif isinstance(synth, NoiseBandSynth):
+      elif synth.jit_name == "SpectralSineSynth":
+        audio.append(synth(synth_params))
+      elif synth.jit_name == "NoiseBandSynth":
         audio.append(synth(synth_params)*noise_amp)
-      elif isinstance(synth, ComplexSineSynth):
+      elif synth.jit_name == "ComplexSineSynth":
         audio.append(synth(synth_params))
 
       # audio.append(synth(synth_params))
@@ -505,9 +574,11 @@ class DDSP(L.LightningModule):
     #     + w_mel * self._mr_mel_loss(y, x) \
     #   ) / (w_stft + w_mel + w_chroma)
 
-    # loss = self._mr_stft_loss(y, x)
-    loss = self._sliced_wasserstein_loss(y.squeeze(1), x.squeeze(1))
-    loss += 0.1 * self._mr_stft_loss(y, x)
+    loss = self._mr_stft_loss(y, x)
+    # loss = self._sliced_wasserstein_loss(y.squeeze(1), x.squeeze(1))
+    # loss = self._mssw_loss(y.squeeze(1), x.squeeze(1))
+    # loss += 5e-3 * self._mr_stft_loss(y, x)
+    # loss = self._scattering_loss(y.squeeze(1).contiguous(), x.squeeze(1).contiguous())
     return loss
 
   @torch.jit.ignore

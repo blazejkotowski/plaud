@@ -11,7 +11,7 @@ class SinusoidsExtractor(BaseExtractor):
                fs: int = 44100,
                win_type: str = 'hann',
                win_size: int = 512,
-               threshold: int = -80,
+               threshold: int = -60,
                min_sine_dur: float = 0.001,
                freq_dev_slope: float = 0.001,
                device: str = 'cuda'):
@@ -65,9 +65,9 @@ class SinusoidsExtractor(BaseExtractor):
       freqs.append(curr_freqs)
       amps.append(curr_amps)
 
-    freqs = np.stack(freqs, axis=0)
-    amps = np.stack(amps, axis=0)
+    freqs = np.stack(freqs, axis=0) / (self.fs / 2)  # Normalize frequencies to [0, 1]
+    amps = (np.stack(amps, axis=0) + 120) / 120
 
-    params = torch.from_numpy(np.concatenate([freqs, amps], axis=-1)).permute(0, 2, 1).to(self.device)
+    params = torch.from_numpy(np.concatenate([freqs, amps], axis=-1)).permute(0, 2, 1).to(dtype=torch.float32, device=self.device)
 
     return params

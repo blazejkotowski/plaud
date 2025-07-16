@@ -3,7 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import cached_conv as cc
 import math
-from torchaudio.transforms import MFCC, MelSpectrogram
+from torchaudio.transforms import MFCC, MelSpectrogram, Spectrogram
 import torch.jit as jit
 
 from typing import Tuple, List
@@ -85,11 +85,14 @@ class VariationalEncoder(nn.Module):
 
     self.resampling_factor = resampling_factor
     # self.mfcc = MFCC(sample_rate = sample_rate, n_mfcc = n_mfcc)
-    self.melspec = MelSpectrogram(sample_rate, n_mels=n_melbands)
+    # self.melspec = MelSpectrogram(sample_rate, n_mels=n_melbands)
+    self._fft_size = n_melbands
+    self._fft_window = torch.hann_window(self._fft_size)
+    # self.melspec = Spectrogram(n_fft=fft_size, win_length=fft_size, hop_length=fft_size//4)
 
-    self.normalization = nn.LayerNorm(n_melbands)
+    self.normalization = nn.LayerNorm(n_melbands//2+1)
 
-    self.gru = nn.GRU(n_melbands, layer_sizes[0], batch_first = True)
+    self.gru = nn.GRU(n_melbands//2+1, layer_sizes[0], batch_first = True)
     self.register_buffer('_hidden_state', torch.zeros(1, 1, layer_sizes[0]), persistent=False)
 
     self.bottleneck = _make_sequential(layer_sizes)
@@ -106,13 +109,14 @@ class VariationalEncoder(nn.Module):
       - mu, logvar: Tuple[torch.Tensor, torch.Tensor], the latent space tensor
     """
     # Calculate Mel spectrogram
-    melspec = self.melspec(audio)
+    # melspec = self.melspec(audio)[:,1:,:] # Remove DC component
+    x = torch.stft(audio, n_fft=self._fft_size, hop_length=self._fft_size//4, window=self._fft_window, return_complex=True, center=True).abs()
 
     # Expand the Mel spectrogram to match the audio length
-    melspec = F.interpolate(melspec, size = audio.shape[-1], mode = 'nearest')
+    # melspec = F.interpolate(melspec, size = audio.shape[-1], mode = 'nearest')
 
-    # Downsample the input representation
-    x = F.interpolate(melspec, scale_factor = 1/self.resampling_factor, mode = 'linear')
+    # # Downsample the input representation
+    # x = F.interpolate(melspec, size = math.ceil(audio.shape[-1]/self.resampling_factor), mode = 'linear')
 
     # Reshape to [batch_size, signal_length, n_melbands]
     x = x.permute(0, 2, 1)
@@ -229,6 +233,10 @@ class Decoder(nn.Module):
     x = self.inter_mlp(x)
 
     # Pass through the output layer
-    output = _scaled_sigmoid(self.output_params(x))
+    # output = _scaled_sigmoid(self.output_params(x))
+    # output = nn.functional.relu(self.output_params(x))
+
+    output = self.output_params(x)
+    output = 0.5 * (torch.tanh(output) + 1)
 
     return output.permute(0, 2, 1)
