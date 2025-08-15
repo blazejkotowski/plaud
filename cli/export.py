@@ -61,7 +61,7 @@ class ScriptedDDSP(nn_tilde.Module):
       out_ratio = 1,
       input_labels=[f'(signal) Latent Dimension {i}' for i in range(1, self.pretrained.num_params+1)],
       output_labels=['(signal) Audio Output'],
-      test_method=True,
+      test_method=False,
     )
 
     self.register_method(
@@ -72,7 +72,7 @@ class ScriptedDDSP(nn_tilde.Module):
       out_ratio = self.pretrained.resampling_factor,
       input_labels=['(signal) Audio Input'],
       output_labels=[f'(signal) Latent Dimension {i}' for i in range(1, self.pretrained.num_params+1)],
-      test_method=True
+      test_method=False,
     )
 
     if not isinstance(self.prior_model, FakePrior):

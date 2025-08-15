@@ -415,7 +415,7 @@ class DDSP(L.LightningModule):
     audio_pred = self._synthesize(params_pred)
 
     # Synthesise from the given parameters
-    synth_audio = self._synthesize(params)
+    # synth_audio = self._synthesize(params)
 
     # Compute the reconstruction loss
     params_loss = self._compute_params_loss(params_pred, params)
@@ -514,7 +514,7 @@ class DDSP(L.LightningModule):
 
     # jitter_loss = torch.clamp(torch.var(y_diff1) - torch.var(y_pred_diff1), min=0)
 
-    loss = params_loss + 10*interframe_diff_loss + 100*intersin_diff_loss
+    loss = params_loss + 1e3*interframe_diff_loss + 1e2*intersin_diff_loss
     return loss
 
 

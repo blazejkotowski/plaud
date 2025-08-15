@@ -3,9 +3,6 @@ import math
 import scipy.signal
 import torch.nn.functional as func
 
-from ot import wasserstein_1d
-# from geomloss import SamplesLoss
-
 from typing import List
 
 class SlicedWassersteinLoss(torch.nn.Module):
@@ -19,8 +16,7 @@ class SlicedWassersteinLoss(torch.nn.Module):
   https://doi.org/10.1109/IEEECONF60004.2024.10943074
 
   Args:
-    - win_size: int, the size of the STFT window
-    - hop_size: int, the hop size of the STFT
+    - window: torch.Tensor, the window to use for the STFT
     - n_projections: int, the number of projections to use for the sliced Wasserstein distance
     - sampling_rate: int, the sampling rate for the STFT
     - p: int, the p in the p-Wasserstein distance
@@ -31,18 +27,17 @@ class SlicedWassersteinLoss(torch.nn.Module):
   eps = 1e-8
   # k = 1e1 # regulatization constant from the paper
 
-  def __init__(self, win_size: int = 512, hop_size: int = 256, n_projections: int = 10, sampling_rate: int = 44100, p: int = 2, magnitude: str = 'lin', device: str = 'cuda'):
+  def __init__(self, window: torch.Tensor, n_projections: int = 10, sampling_rate: int = 44100, p: int = 2, magnitude: str = 'lin', device: str = 'cuda'):
     super(SlicedWassersteinLoss, self).__init__()
-    self.win_size = win_size
-    self.hop_size = hop_size
+
+    self.stft_window = window
+    self.win_size = self.stft_window.shape[0]
+    self.hop_size = self.win_size // 2
     self.n_projections = n_projections
     self.sampling_rate = sampling_rate
     self.p = p
     self.device = device
     self.magnitude = magnitude
-
-    scipy_window = scipy.signal.windows.flattop(self.win_size, sym=False)  # sym=False for FFT use
-    self.stft_window = torch.from_numpy(scipy_window).to(dtype=torch.float32, device=self.device)
 
     self._projections_precomputed = False
     self._projections = None
@@ -68,6 +63,8 @@ class SlicedWassersteinLoss(torch.nn.Module):
     # window = torch.hann_window(self.win_size)
     x_stft = torch.stft(x, n_fft=self.win_size, hop_length=self.hop_size, window=self.stft_window, return_complex=True)
     x_mag = torch.sqrt(torch.clamp(x_stft.real**2 + x_stft.imag**2, min=self.eps))
+    if self.magnitude == 'pow':
+      x_mag = x_mag * x_mag
     if self.magnitude == 'log':
       x_mag = torch.log1p(x_mag)
     return x_mag
@@ -171,16 +168,17 @@ class SlicedWassersteinLoss(torch.nn.Module):
     Returns:
       - X_prob: torch.Tensor[B, T, F], the normalized tensor
     """
-    # Option 1: Linear normalization
-    if self.magnitude == 'lin':
-      return X / (X.sum(dim=(1, 2), keepdim=True) + self.eps)  # shape: [B, T, F]
 
     # Option 2: Log normalization
     # Turn log-spectrograms into probability distributions
     # Compress amplitudes for the softmax
-    elif self.magnitude == 'log':
+    if self.magnitude == 'log':
       B, T, F = X.shape
       return torch.softmax(X.flatten(1), dim=1).reshape(B, T, F)
+
+    # Option 1: Linear normalization
+    else:
+      return X / (X.sum(dim=(1, 2), keepdim=True) + self.eps)  # shape: [B, T, F]
 
 
   def _compute_energy_loss(self, X: torch.Tensor, Y: torch.Tensor) -> torch.Tensor:

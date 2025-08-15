@@ -56,9 +56,6 @@ class AudioDataset(Dataset):
         fs=self._sampling_rate,
         win_type='hann',
         win_size=512,
-        threshold=-80,
-        min_sine_dur=0.001,
-        freq_dev_slope=0.001,
       )
       self._sine_params = self._extract_sinusoids()
     else:
@@ -117,9 +114,6 @@ class AudioDataset(Dataset):
           fs=self._sampling_rate,
           win_type='hann',
           win_size=512,
-          threshold=-80,
-          min_sine_dur=0.001,
-          freq_dev_slope=0.001,
         )
       else:
         self._sine_params = None

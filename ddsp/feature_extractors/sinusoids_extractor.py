@@ -12,8 +12,9 @@ class SinusoidsExtractor(BaseExtractor):
                win_type: str = 'hann',
                win_size: int = 512,
                threshold: int = -60,
-               min_sine_dur: float = 0.001,
-               freq_dev_slope: float = 0.001,
+               min_sine_dur: float = 0.01,
+               freq_dev_slope: float = 0.01,
+               freq_dev_offset: float = 20.0,
                device: str = 'cuda'):
     """
     Args:
@@ -34,6 +35,7 @@ class SinusoidsExtractor(BaseExtractor):
     self.threshold = threshold
     self.min_sine_dur = min_sine_dur
     self.freq_dev_slope = freq_dev_slope
+    self.freq_dev_offset = freq_dev_offset
     self.device = device
 
     self._window = getattr(torch, f'{self.win_type}_window')(self.win_size).cpu().numpy()
@@ -60,7 +62,8 @@ class SinusoidsExtractor(BaseExtractor):
           self.threshold,
           maxnSines=self.n_sines,
           minSineDur=self.min_sine_dur,
-          freqDevSlope=self.freq_dev_slope
+          freqDevOffset=self.freq_dev_offset,
+          freqDevSlope=self.freq_dev_slope,
       )
       freqs.append(curr_freqs)
       amps.append(curr_amps)
