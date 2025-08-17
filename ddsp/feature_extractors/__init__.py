@@ -1,4 +1,2 @@
 from .base_extractor import BaseExtractor
-from .loudness_extractor import LoudnessExtractor
-from .pitch_extractor import PitchExtractor
-from .spectral_centroid_extractor import SpectralCentroidExtractor
+from .librosa_feature_extractor import LibrosaFeatureExtractor
