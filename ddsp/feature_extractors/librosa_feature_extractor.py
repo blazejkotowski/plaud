@@ -38,7 +38,9 @@ class LibrosaFeatureExtractor(BaseExtractor):
       - loudness: torch.Tensor[batch_size, n_samples, 1], the extracted loudness
     """
     # Processes the batch of audio parallely
-    feat = self._feature_fn(y=audio.numpy(), center=False).squeeze(-2)
+    feat = self._feature_fn(y=audio.cpu().numpy(), center=False).squeeze(-2)
+    if feat.ndim == 1:
+      feat = feat[None, :]
     feat = torch.tensor(feat, dtype=torch.float32)
     feat = F.interpolate(feat.unsqueeze(0), size=audio.shape[-1], mode='linear').squeeze(0)
 
