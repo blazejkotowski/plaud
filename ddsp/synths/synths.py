@@ -11,6 +11,13 @@ from ddsp.sgd.sinusoidal_gradient_descent.core import complex_oscillator
 
 from typing import Type, Callable, Dict, Any
 
+_SYNTH_REGISTRY = {}
+
+def register_synth(cls):
+  _SYNTH_REGISTRY[cls.__name__] = cls
+
+  return cls
+
 class BaseSynth(nn.Module):
   """
   Base class for synthesizers.
@@ -19,6 +26,7 @@ class BaseSynth(nn.Module):
     - fs: int, the sampling rate of the input signal
     - resampling_factor: int, the internal up / down sampling factor for the signal
   """
+
   def __init__(self, fs: int = 44100, resampling_factor: int = 32):
     super().__init__()
     self._fs = fs
@@ -59,12 +67,11 @@ class BaseSynth(nn.Module):
     cls_name = config["class"]
     params = config["params"]
 
-    # Lookup in global scope (assuming classes are imported)
-    cls = globals()[cls_name]
+    cls = _SYNTH_REGISTRY[cls_name]
     return cls(**params)
 
 
-
+@register_synth
 class NoiseBandSynth(BaseSynth):
   """
   A synthesiser that generates a mixture noise bands from amplitudes.
@@ -95,6 +102,9 @@ class NoiseBandSynth(BaseSynth):
   def n_params(self):
     return len(self._filterbank.noisebands)
 
+  @property
+  def jit_name(self):
+    return "NoiseBandSynth"
 
   def forward(self, amplitudes: torch.Tensor) -> torch.Tensor:
     """
@@ -133,7 +143,7 @@ class NoiseBandSynth(BaseSynth):
     return self._filterbank.noisebands
 
 
-
+@register_synth
 class HarmonicSynth(BaseSynth):
   """
   Harmonic synthesizer that generates a signal as a sum of harmonically-related sine waves.
@@ -159,6 +169,10 @@ class HarmonicSynth(BaseSynth):
   @property
   def n_params(self):
     return self._n_harmonics + 1  # 1 fundamental + n_harmonics amplitudes
+
+  @property
+  def jit_name(self):
+    return "HarmonicSynth"
 
   def forward(self, parameters: torch.Tensor, amplitudes: torch.Tensor) -> torch.Tensor:
     """
@@ -190,7 +204,7 @@ class HarmonicSynth(BaseSynth):
 
     return signal
 
-
+@register_synth
 class SineSynth(BaseSynth):
   """
   Mixture of sinweaves synthesiser.
@@ -223,6 +237,10 @@ class SineSynth(BaseSynth):
   def n_params(self):
     return 2*self._n_sines
 
+  @property
+  def jit_name(self):
+    return "SineSynth"
+
 
   def forward(self, parameters: torch.Tensor, sines_number_attenuation: float = 0.0):
     """
@@ -234,6 +252,7 @@ class SineSynth(BaseSynth):
     """
     frequencies = parameters[:, :self._n_sines, :] # n_sines frequencies
     amplitudes = parameters[:, self._n_sines:, :] # n_sines amplitudes
+    # amplitudes = torch.ones_like(amplitudes) # workaround for now, amplitudes are not used
 
     batch_size = frequencies.shape[0]
 
@@ -246,8 +265,11 @@ class SineSynth(BaseSynth):
     frequencies = F.interpolate(frequencies, scale_factor=float(self._resampling_factor), mode='linear')
     amplitudes = F.interpolate(amplitudes, scale_factor=float(self._resampling_factor), mode='linear')
 
+    # round frequencies to the 2nd decimal place
+    # frequencies = torch.round(frequencies * 100) / 100.0
     # Scale the frequencies to the Nyquist frequency
     frequencies = frequencies * self._fs / 4 # range [0, 2] to [0, fs/2]
+    # frequencies = frequencies * self._fs / 2 # range [0, 1] to [0, fs/2]
 
     # print(f'est freq range in batch: {frequencies.min().item()} - {frequencies.max().item()}')
 
@@ -295,7 +317,7 @@ class SineSynth(BaseSynth):
     signal = torch.sum(amplitudes * torch.sin(phases), dim=1, keepdim=True)
     return signal
 
-
+@register_synth
 class SubbandSineSynth(BaseSynth):
   """
   Mixture of sinweaves synthesiser.
@@ -334,6 +356,10 @@ class SubbandSineSynth(BaseSynth):
   @property
   def n_params(self):
     return 2*self._n_sines
+
+  @property
+  def jit_name(self):
+    return "SubbandSineSynth"
 
 
   def forward(self, parameters: torch.Tensor, sines_number_attenuation: float = 0.0):
@@ -451,7 +477,7 @@ class SubbandSineSynth(BaseSynth):
     for i in range(batch_size):
       torchaudio.save(f"{i}-{audiofile}", signal[i], self._fs)
 
-
+@register_synth
 class ComplexSineSynth(BaseSynth):
   """
   Synthesizer that generates a mixture of complex sinusoids using the complex_oscillator.
@@ -484,6 +510,10 @@ class ComplexSineSynth(BaseSynth):
   def n_params(self):
     # Each sine is parameterized by a complex number z
     return 2 * self._n_sines  # real and imaginary parts per sine
+
+  @property
+  def jit_name(self):
+    return "ComplexSineSynth"
 
   def forward(self, parameters: torch.Tensor, initial_phase: torch.Tensor = None) -> torch.Tensor:
     """

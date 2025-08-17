@@ -1,6 +1,12 @@
 import torch
 import torch.nn.functional as F
 
+_FEATURE_EXTRACTOR_REGISTRY = {}
+
+def register_feature_extractor(cls):
+  _FEATURE_EXTRACTOR_REGISTRY[cls.__name__] = cls
+
+  return cls
 
 class BaseExtractor(object):
   """
