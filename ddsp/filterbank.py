@@ -3,7 +3,7 @@ import torch
 import numpy as np
 import scipy.signal as signal
 
-from typing import List, Any
+from typing import List, Any, Optional
 
 class FilterBank(nn.Module):
   """
@@ -27,7 +27,9 @@ class FilterBank(nn.Module):
                lowpass_cutoff: float = 20,
                transition_width: float = 0.2,
                stopband_attenuation: float = 50.0,
-               fs: int = 44100):
+               max_freq: Optional[float] = None,
+               fs: int = 44100,
+               device='cuda'):
     super().__init__()
     self._n_filters = n_filters - 2 # lowpass and highpass filters are added in default at the limits of the spectrum
     self._stopband_attenuation = stopband_attenuation
@@ -36,10 +38,11 @@ class FilterBank(nn.Module):
     self._lin_filters_ratio = lin_filters_ratio
     self._lin_filters_cutoff_ratio = lin_filters_cutoff_ratio
     self._lowpass_cutoff = lowpass_cutoff
+    self._max_freq = max_freq
 
     self._filters = self._build_filterbank()
 
-    self.noisebands = torch.from_numpy(np.array(self._bake_noisebands()))
+    self.register_buffer('noisebands', torch.from_numpy(np.array(self._bake_noisebands())))
 
 
   def _build_filterbank(self):
@@ -48,6 +51,8 @@ class FilterBank(nn.Module):
     """
     # Nyquist frequency
     nyqfreq = self._fs/2
+    if self._max_freq is not None:
+      nyqfreq = self._max_freq
 
     # Compute the linear filter bands
     linear_filters_number = int(self._n_filters * self._lin_filters_ratio)

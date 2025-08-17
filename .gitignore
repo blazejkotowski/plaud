@@ -3,3 +3,6 @@
 *.ts
 lightning_log/
 wandb/
+training
+models
+prior_datasets
