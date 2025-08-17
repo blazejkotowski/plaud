@@ -7,28 +7,34 @@ import lmdb
 import pickle
 import hashlib
 
-from ddsp.feature_extractors import SinusoidsExtractor
+from ddsp.feature_extractors import LibrosaFeatureExtractor
+from ddsp.feature_extractors.utils import normalize_feature, smoothen_feature
 
-from typing import Callable, Optional
+from typing import Callable
 
-class AudioDataset(Dataset):
-  def __init__(self, dataset_path: str, n_signal: int, sampling_rate: int = 44100, n_sines: Optional[int] = None, transform_fn: Callable = None, device: str = 'cuda'):
+class AudioFeatureDataset(Dataset):
+  def __init__(self, dataset_path: str, n_signal: int, sampling_rate: int = 44100, transform_fn: Callable = None, device: str = 'cuda'):
     """
     Arguments:
       - dataset_path: str, the path to the dataset
       - n_signal: int, the size of the audio chunks, in samples
       - sampling_rate: int, the sampling rate of the audio
-      - n_sines: int, the number of sine waves to extract (default: None, meaning no extraction)
       - device: str, the device to use
     """
     self._device = device
     self._n_signal = n_signal
     self._sampling_rate = sampling_rate
-    self._n_sines = n_sines
     self._transform_fn = transform_fn
 
+    self._extractors = {
+      'loudness': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_LOUDNESS, resampling_factor=1),
+      'spectral_centroid': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_SPECTRAL_CENTROID, resampling_factor=1),
+      'spectral_flatness': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_SPECTRAL_FLATNESS, resampling_factor=1),
+      'spectral_bandwidth': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_SPECTRAL_BANDWIDTH, resampling_factor=1),
+    }
+
     # Create cache key based on dataset parameters
-    cache_key = self._create_cache_key(dataset_path, n_signal, sampling_rate, n_sines)
+    cache_key = self._create_cache_key(dataset_path, n_signal, sampling_rate)
     self._db_path = os.path.join(os.path.dirname(dataset_path), f"audio_cache_{cache_key}.lmdb")
 
     # Try to load from LMDB first
@@ -39,9 +45,9 @@ class AudioDataset(Dataset):
       print(f"Creating new cache: {self._db_path}")
       self._create_cache(dataset_path)
 
-  def _create_cache_key(self, dataset_path: str, n_signal: int, sampling_rate: int, n_sines: Optional[int]) -> str:
+  def _create_cache_key(self, dataset_path: str, n_signal: int, sampling_rate: int) -> str:
     """Create a unique cache key based on dataset parameters."""
-    key_string = f"{dataset_path}_{n_signal}_{sampling_rate}_{n_sines}"
+    key_string = f"{dataset_path}_{n_signal}_{sampling_rate}"
     return hashlib.md5(key_string.encode()).hexdigest()[:8]
 
   def _create_cache(self, dataset_path: str):
@@ -50,16 +56,8 @@ class AudioDataset(Dataset):
     self._audio = self._load_dataset(dataset_path).to(self._device)
     self._dataset_length = int(len(self._audio) // self._n_signal)
 
-    if self._n_sines is not None:
-      self._extractor = SinusoidsExtractor(
-        n_sines=self._n_sines,
-        fs=self._sampling_rate,
-        win_type='hann',
-        win_size=512,
-      )
-      self._sine_params = self._extract_sinusoids()
-    else:
-      self._sine_params = None
+    # Extract features
+    self._features = self._extract_features()
 
     # Save to LMDB
     self._save_to_cache()
@@ -74,18 +72,14 @@ class AudioDataset(Dataset):
         'dataset_length': self._dataset_length,
         'n_signal': self._n_signal,
         'sampling_rate': self._sampling_rate,
-        'n_sines': self._n_sines
       }
       txn.put(b'metadata', pickle.dumps(metadata))
 
       # Save audio (move to CPU for serialization)
-      audio_cpu = self._audio.cpu()
-      txn.put(b'audio', pickle.dumps(audio_cpu))
+      txn.put(b'audio', pickle.dumps(self._audio.cpu()))
 
-      # Save sine parameters if they exist
-      if self._sine_params is not None:
-        sine_params_cpu = self._sine_params.cpu()
-        txn.put(b'sine_params', pickle.dumps(sine_params_cpu))
+      # save features
+      txn.put(b'features', pickle.dumps(self._features.cpu()))
 
     env.close()
 
@@ -102,50 +96,44 @@ class AudioDataset(Dataset):
       audio_cpu = pickle.loads(txn.get(b'audio'))
       self._audio = audio_cpu.to(self._device)
 
-      # Load sine parameters if they exist
-      sine_params_data = txn.get(b'sine_params')
-      if sine_params_data is not None:
-        sine_params_cpu = pickle.loads(sine_params_data)
-        self._sine_params = sine_params_cpu.to(self._device)
-
-        # Recreate extractor for consistency
-        self._extractor = SinusoidsExtractor(
-          n_sines=self._n_sines,
-          fs=self._sampling_rate,
-          win_type='hann',
-          win_size=512,
-        )
-      else:
-        self._sine_params = None
+      # Load features if they exist
+      features_data = txn.get(b'features')
+      if features_data is not None:
+        features_cpu = pickle.loads(features_data)
+        self._features = features_cpu.to(self._device)
 
     env.close()
+
 
   def __len__(self):
     return self._dataset_length
 
-  def get_audio(self, idx):
+
+  def get_datapoint(self, idx):
     sample_start = int(idx * self._n_signal)
     sample_end = int(sample_start + self._n_signal)
 
     if sample_end > len(self._audio):
       audio = torch.cat([self._audio[sample_start:], self._audio[:sample_end - len(self._audio)]])
+      features = torch.cat([self._features[sample_start:], self._features[:sample_end - len(self._features)]])
+
     else:
       audio = self._audio[sample_start:sample_end]
+      features = self._features[sample_start:sample_end]
 
     if self._transform_fn is not None:
       audio = self._transform_fn(audio)
 
-    return audio
+    return audio, features
+
 
   def __getitem__(self, idx):
     idx = idx % self._dataset_length
 
-    audio = self.get_audio(idx)
+    audio, features = self.get_datapoint(idx)
 
-    if self._n_sines is not None:
-      return audio, self._sine_params[idx]
-    else:
-      return audio
+    return audio, features
+
 
   def _load_dataset(self, path: str) -> torch.Tensor:
     """
@@ -162,6 +150,7 @@ class AudioDataset(Dataset):
       audio = torch.concat([audio, torch.from_numpy(x).to(self._device)], dim = 0)
     return audio
 
+
   def _load_file(self, path: str):
     """
     Load an audio file from a path.
@@ -169,16 +158,19 @@ class AudioDataset(Dataset):
     audio, _ = li.load(path, sr = self._sampling_rate, mono = True)
     return audio
 
-  def _extract_sinusoids(self):
+
+  def _extract_features(self):
     """
-    Process sine parameters from the audio dataset.
-    This is a placeholder function, as the actual processing logic is not provided.
+    Extract features from the audio dataset.
+    This is a placeholder function, as the actual feature extraction logic is not provided.
     """
     # process audio in chunks
-    sine_params = []
-    for i in range(len(self)):
-      chunk = self.get_audio(i)
-      params = self._extractor(chunk.unsqueeze(0).cpu().numpy())
-      sine_params.append(params)
+    features = []
+    for extractor in self._extractors.values():
+      feat = extractor(self._audio)
+      feat = smoothen_feature(feat, window_size=256+1)  # Smoothen the feature
+      feat = normalize_feature(feat, low=5.0, high=95.0, dim=-1)  # Normalize the feature
+      features.append(feat)
 
-    return torch.stack(sine_params, dim=1).squeeze()
+    features = torch.stack(features, dim=-1).squeeze(0)  # Stack features along the last dimension
+    return features
