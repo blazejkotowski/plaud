@@ -4,7 +4,7 @@ import subprocess
 from tqdm import tqdm
 from glob import glob
 
-def convert_to_wav(input_dir, output_dir):
+def convert_to_wav(input_dir, output_dir, sampling_rate):
     # Check if output directory exists, create it if not
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -17,11 +17,11 @@ def convert_to_wav(input_dir, output_dir):
         file_name = audio_file.split('/')[-1]
         output_file_path = os.path.join(output_dir, os.path.splitext(file_name)[0] + '.wav')
 
-        # Command to convert audio file to 44100 Hz, mono, 16-bit WAV
+        # Command to convert audio file to mono, 16-bit WAV, and specified sampling rate
         command = [
             'sox',
             audio_file,
-            '-r', '44100',             # Sample rate
+            '-r', str(sampling_rate),  # Sample rate
             '-c', '1',                 # Mono
             '-b', '16',                # 16-bit
             output_file_path
@@ -34,7 +34,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Convert audio files to 44100 Hz, mono, 16-bit WAV format.')
     parser.add_argument('--input_dir', type=str, help='Input directory containing audio files')
     parser.add_argument('--output_dir', type=str, help='Output directory for converted audio files')
+    parser.add_argument('--sampling_rate', type=int, default=44100, help='Sampling rate for the output audio files')
 
     args = parser.parse_args()
 
-    convert_to_wav(args.input_dir, args.output_dir)
+    convert_to_wav(args.input_dir, args.output_dir, args.sampling_rate)

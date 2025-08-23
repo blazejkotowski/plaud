@@ -9,7 +9,7 @@ from ddsp.filterbank import FilterBank
 from ddsp.sgd.sinusoidal_gradient_descent.core import complex_oscillator
 
 
-from typing import Type, Callable, Dict, Any
+from typing import Type, Callable, Dict, Any, List
 
 _SYNTH_REGISTRY = {}
 
@@ -102,18 +102,26 @@ class NoiseBandSynth(BaseSynth):
   def n_params(self):
     return len(self._filterbank.noisebands)
 
+
   @property
   def jit_name(self):
     return "NoiseBandSynth"
 
-  def forward(self, amplitudes: torch.Tensor) -> torch.Tensor:
+
+  def forward(self, amplitudes: torch.Tensor, limit_components: float = 0.0, waveshaping_factor: float = 0.0) -> torch.Tensor:
     """
     Synthesizes a signal from the predicted amplitudes and the baked noise bands.
     Args:
       - amplitudes: torch.Tensor[batch_size, n_bands, sig_length], the predicted amplitudes of the noise bands
+      - limit_components: float, the attenuation factor for the number of used bands
+      - waveshaping_factor: float, does nothing, it is here for the JIT compatibility with other synth classes
     Returns:
       - signal: torch.Tensor[batch_size, sig_length], the synthesized signal
     """
+    # limit_components = kwargs.get('limit_components', 0.0)
+    # Clamp the limit components
+    limit_components = max(0.0, min(limit_components, 1.0))
+
     # upsample the amplitudes
     upsampled_amplitudes = F.interpolate(amplitudes, scale_factor=float(self._resampling_factor), mode='linear')
 
@@ -134,7 +142,27 @@ class NoiseBandSynth(BaseSynth):
     self._noisebands_shift = (self._noisebands_shift + upsampled_amplitudes.shape[-1]) % self._noisebands.shape[-1]
 
     # Synthesize the signal
+    # If the limit_components is higher than 0, we need to limit the number of bands
+    # by choosing the first max_bands, in relation to their amplitudes
+    limit_components = max(0.0, min(limit_components, 1.0))
+    if limit_components > 0:
+      # Calculate the number of bands to keep (at least 1)
+      max_bands = int(self.n_params * (1 - limit_components))
+      max_bands = max(max_bands, 1)
+
+      # Get the indices of the max_bands largest amplitudes (mean over time)
+      mean_amps = upsampled_amplitudes.mean(dim=-1)
+      _, indices = torch.topk(mean_amps, max_bands, dim=1)
+      # Create a mask of the same shape as the amplitudes
+      mask = torch.zeros_like(upsampled_amplitudes)
+      mask.scatter_(1, indices.unsqueeze(-1).expand(-1, -1, upsampled_amplitudes.shape[-1]), 1)
+
+      # Apply the mask to the amplitudes and looped_bands
+      upsampled_amplitudes = upsampled_amplitudes * mask
+      looped_bands = looped_bands * mask
+
     signal = torch.sum(upsampled_amplitudes * looped_bands, dim=1, keepdim=True)
+
     return signal
 
   @property
@@ -242,14 +270,16 @@ class SineSynth(BaseSynth):
     return "SineSynth"
 
 
-  def forward(self, parameters: torch.Tensor, sines_number_attenuation: float = 0.0):
+  def forward(self, parameters: torch.Tensor, limit_components: float = 0.0):
     """
     Generates a mixture of sinewaves with the given frequencies and amplitudes per sample.
 
     Arguments:
       - parameters: torch.Tensor[batch_size, n_params, n_samples], the parameters of the synthesizer
-      - sines_number_attenuation: float, the attenuation factor for the number of sinewaves
+      - limit_components: float, the attenuation factor for the number of sinewaves
     """
+    # limit_components = kwargs.get('limit_components', 0.0)
+
     frequencies = parameters[:, :self._n_sines, :] # n_sines frequencies
     amplitudes = parameters[:, self._n_sines:, :] # n_sines amplitudes
     # amplitudes = torch.ones_like(amplitudes) # workaround for now, amplitudes are not used
@@ -292,13 +322,13 @@ class SineSynth(BaseSynth):
       self._phases.copy_(phases[: ,: , -1] % (2 * math.pi))
 
 
-    # If the sines_number_attenuation is higher than 0, we need to limit the number of sinewaves
+    # If the limit_components is higher than 0, we need to limit the number of sinewaves
     # by choosing the first max_sines, in relation to their amplitudes
-    # clamp sines_number_attenuation to [0, 1]
-    sines_number_attenuation = max(0.0, min(sines_number_attenuation, 1.0))
-    if sines_number_attenuation > 0:
+    # clamp limit_components to [0, 1]
+    limit_components = max(0.0, min(limit_components, 1.0))
+    if limit_components > 0:
       # Calculate the number of sinewaves to keep (at least 1)
-      max_sines = int(self._n_sines * (1 - sines_number_attenuation))
+      max_sines = int(self._n_sines * (1 - limit_components))
       max_sines = max(max_sines, 1)
 
       # Get the indices of the max_sines largest amplitudes
@@ -318,6 +348,88 @@ class SineSynth(BaseSynth):
     return signal
 
 @register_synth
+class BendableNoiseBandSynth(BaseSynth):
+  def __init__(self,
+               n_filters: int = 2048,
+               fs: int = 44100,
+               resampling_factor: int = 32,
+               device: str = 'cuda',
+               streaming: bool = False):
+    super().__init__()
+
+    self._streaming = streaming
+
+    self._noiseband_synth = NoiseBandSynth(
+      n_filters=n_filters,
+      fs=fs,
+      resampling_factor=resampling_factor,
+      device=device,
+    )
+
+    boundaries = self._noiseband_synth._filterbank._boundaries
+    centers = (np.array(boundaries[:-1]) + np.array(boundaries[1:])) / 2
+    # Add the lowpass and highpass frequencies
+    centers = np.concatenate(([boundaries[0]/2], centers, [(boundaries[-1] + fs//2)/2]))
+    frequencies = centers.tolist()
+
+    self._sine_synth = SubbandSineSynth(
+      fs=fs,
+      n_sines=len(frequencies),
+      resampling_factor=resampling_factor,
+      streaming=self._streaming,
+      frequencies=frequencies,
+      device=device
+    )
+
+  @property
+  def n_params(self):
+    return self._noiseband_synth.n_params
+
+  @property
+  def streaming(self):
+    return self._streaming
+
+  @streaming.setter
+  def streaming(self, value: bool):
+    self._streaming = value
+    self._sine_synth.streaming = value
+    self._noiseband_synth.streaming = value
+
+  def forward(self, parameters: torch.Tensor, limit_components: float = 0.0, waveshaping_factor: float = 0.0):
+    """
+    Waveshaping factor controls the amount of interpolation between noisebands and sinewaves when in the range [0, 0.5].
+    On the other hand, in the rangee [0.5, 1], it controls the amount of waveshaping applied to the sinewaves.
+    """
+    # waveshaping_factor = kwargs.pop('waveshaping', 0.0)
+    # Clamp waveshaping factor to [0, 1]
+    waveshaping_factor = max(0.0, min(waveshaping_factor, 1.0))
+    if waveshaping_factor < 0.5:
+      interpolation = waveshaping_factor * 2
+      waveshaping_factor = 0.0
+    else:
+      interpolation = 1.0
+      waveshaping_factor = (waveshaping_factor - 0.5) * 2
+
+    # Prepend the shift ratios to the existing parameters
+    sine_parameters = torch.cat((torch.ones_like(parameters), parameters), dim=1)
+
+    # Interpolation = 0 -> only noisebands
+    # Interpolation = 1 -> only sinewaves
+    if interpolation == 0.0:
+      noise_signal = self._noiseband_synth(parameters, limit_components=limit_components)
+      return noise_signal
+
+    elif interpolation == 1.0:
+      sine_signal = self._sine_synth(sine_parameters, limit_components=limit_components, waveshaping_factor=waveshaping_factor)
+      return sine_signal
+
+    else:
+      noise_signal = self._noiseband_synth(parameters, limit_components=limit_components)
+      sine_signal = self._sine_synth(sine_parameters, limit_components=limit_components, waveshaping_factor=waveshaping_factor)
+      return (1-interpolation)*noise_signal + interpolation*sine_signal
+
+
+@register_synth
 class SubbandSineSynth(BaseSynth):
   """
   Mixture of sinweaves synthesiser.
@@ -333,6 +445,7 @@ class SubbandSineSynth(BaseSynth):
                n_sines: int = 500,
                resampling_factor: int = 32,
                streaming: bool = False,
+               frequencies: List = None,
                device: str = 'cuda'):
     super().__init__()
     self._fs = fs
@@ -347,7 +460,13 @@ class SubbandSineSynth(BaseSynth):
 
     # self._base_freqs = torch.linspace(40, self._fs / 2, self._n_sines, device=self._device)
     # self._base_freqs =
-    self.register_buffer('_base_freqs', self._bark_freqs(self._fs, self._n_sines, device=self._device))
+    if frequencies is not None:
+      assert len(frequencies) == n_sines, "Frequencies list must have the same length as n_sines"
+      base_freqs = torch.tensor(frequencies, device=self._device)
+      self.register_buffer('_base_freqs', base_freqs)
+    else:
+      self.register_buffer('_base_freqs', self._bark_freqs(self._fs, self._n_sines, device=self._device))
+
     # shift ranges are the maximum shift according to the difference between the base frequencies
     shift_ranges = (self._base_freqs[1:] - self._base_freqs[:-1]) / 2
     shift_ranges = torch.cat((shift_ranges, shift_ranges[-1].view(1)))
@@ -362,14 +481,18 @@ class SubbandSineSynth(BaseSynth):
     return "SubbandSineSynth"
 
 
-  def forward(self, parameters: torch.Tensor, sines_number_attenuation: float = 0.0):
+  def forward(self, parameters: torch.Tensor, limit_components: float = 0.0, waveshaping_factor: float = 0.0):
     """
     Generates a mixture of sinewaves with the given frequencies and amplitudes per sample.
 
     Arguments:
       - parameters: torch.Tensor[batch_size, n_params, n_samples], the parameters of the synthesizer
-      - sines_number_attenuation: float, the attenuation factor for the number of sinewaves
+      - limit_components: float, the attenuation factor for the number of sinewaves
+      - waveshaping_factor: float, the amount of waveshaping to apply to the sinewaves (0.0 = no waveshaping, 1.0 = full waveshaping)
     """
+    # limit_components = kwargs.get('limit_components', 0.0)
+    # waveshaping_factor = kwargs.get('waveshaping_factor', 0.0)
+
     shift_ratios = parameters[:, :self._n_sines, :] # n_sines shift ratios
     amplitudes = parameters[:, self._n_sines:, :] # n_sines amplitudes
 
@@ -422,13 +545,13 @@ class SubbandSineSynth(BaseSynth):
       self._phases.copy_(phases[: ,: , -1] % (2 * math.pi))
 
 
-    # If the sines_number_attenuation is higher than 0, we need to limit the number of sinewaves
+    # If the limit_components is higher than 0, we need to limit the number of sinewaves
     # by choosing the first max_sines, in relation to their amplitudes
-    # clamp sines_number_attenuation to [0, 1]
-    sines_number_attenuation = max(0.0, min(sines_number_attenuation, 1.0))
-    if sines_number_attenuation > 0:
+    # clamp limit_components to [0, 1]
+    limit_components = max(0.0, min(limit_components, 1.0))
+    if limit_components > 0:
       # Calculate the number of sinewaves to keep (at least 1)
-      max_sines = int(self._n_sines * (1 - sines_number_attenuation))
+      max_sines = int(self._n_sines * (1 - limit_components))
       max_sines = max(max_sines, 1)
 
       # Get the indices of the max_sines largest amplitudes
@@ -444,9 +567,50 @@ class SubbandSineSynth(BaseSynth):
       phases = phases * mask
 
     # Generate and sum the sinewaves
-    signal = torch.sum(amplitudes * torch.sin(phases), dim=1, keepdim=True)
+    components = torch.sin(phases)
+    # clamp wavewshaping factor to [0, 1]
+    waveshaping_factor = max(0.0, min(waveshaping_factor, 1.0))
+    if waveshaping_factor > 0.0:
+      components = self._waveshape_tanh(components, waveshaping_factor)
+
+    signal = torch.sum(amplitudes * components, dim=1, keepdim=True)
     return signal
 
+
+  def _waveshape_tanh(self, x: torch.Tensor, factor: float, drive_max: float = 20.0) -> torch.Tensor:
+    """
+    Per-component tanh waveshaper with RMS compensation and dry/wet morph.
+
+    Args:
+      - x: torch.Tensor [B, N, T] or broadcastable; expected in ~[-1,1] (e.g., torch.sin(phases))
+      - factor: float in [0,1], 0 = bypass, 1 = strong saturation
+      - drive_max: maximum drive used when factor=1
+
+    Returns:
+      - y: torch.Tensor, same shape as x
+    """
+    if factor <= 0.0:
+      return x
+
+    m = torch.clamp(torch.as_tensor(float(factor), device=x.device, dtype=x.dtype), 0.0, 1.0)
+    # Map morph -> drive; steep near 1 for squarer corners
+    g = (m / (1.0 - m + 1e-6)) * drive_max
+
+    # Dry/wet blend around tanh saturator
+    y = (1.0 - m) * x + m * torch.tanh(g * x)
+
+    # --- RMS compensation (per component over time) ---
+    eps = 1e-12
+    # Base RMS of the input unit sine (computed from x to also handle masked/zero components)
+    x_rms = torch.sqrt(torch.mean(x * x, dim=-1, keepdim=True) + eps)
+    y_rms = torch.sqrt(torch.mean(y * y, dim=-1, keepdim=True) + eps)
+
+    # Avoid 0/0 for fully muted components
+    safe_scale = torch.where(y_rms > 1e-12, x_rms / y_rms, torch.ones_like(y_rms))
+    y = y * safe_scale
+    # --------------------------------------------------
+
+    return y
 
   @torch.jit.ignore
   @staticmethod
@@ -476,6 +640,7 @@ class SubbandSineSynth(BaseSynth):
     batch_size = signal.shape[0]
     for i in range(batch_size):
       torchaudio.save(f"{i}-{audiofile}", signal[i], self._fs)
+
 
 @register_synth
 class ComplexSineSynth(BaseSynth):
