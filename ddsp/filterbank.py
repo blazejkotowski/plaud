@@ -40,16 +40,17 @@ class FilterBank(nn.Module):
     self._lowpass_cutoff = lowpass_cutoff
     self._max_freq = max_freq
 
-    self._filters = self._build_filterbank()
+    self._boundaries = self._calculate_boundaries()
 
+    self._filters = self._build_filterbank(self._boundaries)
     self.register_buffer('noisebands', torch.from_numpy(np.array(self._bake_noisebands())))
 
 
-  def _build_filterbank(self):
+  def _calculate_boundaries(self):
     """
-    Builds the filterbank
+    Calculates the filter boundaries
     """
-    # Nyquist frequency
+     # Nyquist frequency
     nyqfreq = self._fs/2
     if self._max_freq is not None:
       nyqfreq = self._max_freq
@@ -66,6 +67,12 @@ class FilterBank(nn.Module):
 
     # Create the bands
     boundaries = np.concatenate((lin_boundaries, log_boundaries))
+    return boundaries
+
+  def _build_filterbank(self, boundaries):
+    """
+    Builds the filterbank
+    """
     bands = np.column_stack((boundaries[:-1], boundaries[1:]))
 
     # Construct the filterbank

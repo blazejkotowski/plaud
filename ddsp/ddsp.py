@@ -1,11 +1,12 @@
 import lightning as L
 import torch
+import torch.nn.functional as F
 
 import numpy as np
 import auraloss
 
 from ddsp.blocks import VariationalEncoder, Decoder
-from ddsp.synths import BaseSynth, SineSynth, SubbandSineSynth, NoiseBandSynth, ComplexSineSynth
+from ddsp.synths import BaseSynth, SineSynth, SubbandSineSynth, NoiseBandSynth, ComplexSineSynth, BendableNoiseBandSynth
 from sklearn.decomposition import PCA
 
 from typing import List, Tuple, Dict, Any
@@ -25,6 +26,7 @@ class DDSP(L.LightningModule):
     - encoder_ratios: List[int], the capacity ratios for encoder layers
     - latent_smoothing_kernel: int, the kernel size for the smoothing filter [TODO: make it optional]
     - num_params: int, the number of parameters to predict [TODO: make it optional]
+    - n_features: int, the number of control features in the dataset
     - n_melbands: int, the number of melbands to extract
     - decoder_ratios: List[int], the capacity ratios for decoder layers
     - capacity: int, the capacity of the model
@@ -39,6 +41,7 @@ class DDSP(L.LightningModule):
                synth_configs: List[Dict[Any, Any]] = [],
                latent_size: int = 4,
                num_params: int = 4,
+               n_features: int = 4,
                fs: int = 44100,
                encoder_ratios: List[int] = [8, 4, 2],
                latent_smoothing_kernel: int = 1,
@@ -61,6 +64,7 @@ class DDSP(L.LightningModule):
     self.fs = fs
     self.latent_size = latent_size
     self.num_params = num_params
+    self.n_features = n_features
     self.resampling_factor = resampling_factor
     self._latent_smoothing_kernel = latent_smoothing_kernel
 
@@ -102,6 +106,7 @@ class DDSP(L.LightningModule):
     self.decoder = Decoder(
       n_params=self._total_synth_params,
       latent_size=latent_size,
+      n_features=n_features,
       layer_sizes=(np.array(decoder_ratios)*capacity).tolist(),
       gru_layers=decoder_gru_layers,
       streaming=streaming,
@@ -113,15 +118,15 @@ class DDSP(L.LightningModule):
     # self._mr_chroma_loss = self._construct_chroma_loss() # CHROMA-scale loss
 
     # Wasserstein loss
-    self._sliced_wasserstein_loss = SlicedWassersteinLoss(
-      win_size=2048,
-      hop_size=512,
-      n_projections=100,
-      p=2,
-      device=self._device
-    )
+    # self._sliced_wasserstein_loss = SlicedWassersteinLoss(
+    #   win_size=2048,
+    #   hop_size=512,
+    #   n_projections=100,
+    #   p=2,
+    #   device=self._device
+    # )
     # Perceptual loss
-    self._m2l_loss = M2LLoss()
+    # self._m2l_loss = M2LLoss()
     self._perceptual_loss_weight = perceptual_loss_weight
     # self._recons_loss = CLAPLoss() # CLAP loss
 
@@ -133,6 +138,24 @@ class DDSP(L.LightningModule):
     self._last_validation_out = None
     self._validation_index = 1
 
+
+  @property
+  def resampling_factor(self) -> int:
+    return self._resampling_factor
+
+  @resampling_factor.setter
+  def resampling_factor(self, value: int) -> None:
+    """
+    Sets the resampling factor for the model, encoder, and decoder.
+
+    Args:
+      value: int, the new resampling factor
+    """
+    self._resampling_factor = value
+    if hasattr(self, 'encoder') and hasattr(self.encoder, 'resampling_factor'):
+      self.encoder.resampling_factor = value
+    if hasattr(self, 'decoder') and hasattr(self.decoder, 'resampling_factor'):
+      self.decoder.resampling_factor = value
 
   def streaming(self, streaming: bool) -> None:
     """Set streaming mode"""
@@ -180,6 +203,9 @@ class DDSP(L.LightningModule):
     Returns:
       z: torch.Tensor[batch_size, n, latent_size], normalized latents
     """
+    if self._latent_quantiles is None or self._latent_mean is None:
+      return z
+
     # Center the latents
     z_centered = z - self._latent_mean
 
@@ -202,6 +228,9 @@ class DDSP(L.LightningModule):
     Returns:
       z: torch.Tensor[batch_size, n, latent_size], denormalized latents
     """
+    if self._latent_quantiles is None or self._latent_mean is None:
+      return z
+
     # Ensure the latents are in the range [-1, 1]
     z_clamped = torch.clamp(z, -1.0, 1.0)
 
@@ -278,7 +307,7 @@ class DDSP(L.LightningModule):
 
 
 
-  def forward(self, audio: torch.Tensor) -> torch.Tensor:
+  def forward(self, audio: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
     """
     Forward pass of the network.
     Args:
@@ -294,13 +323,17 @@ class DDSP(L.LightningModule):
     # smooth the latent envelopes
     z = self._smooth_latents(z)
 
+    features = F.interpolate(
+      features.permute(0, 2, 1), scale_factor=1/self.resampling_factor, mode='linear'
+    ).permute(0, 2, 1)
+
     # Predict the parameters of the synthesiser and synthesize
-    synth_params = self.decoder(z)
+    synth_params = self.decoder(features, z)
     signal = self._synthesize(synth_params)
     return signal
 
 
-  def training_step(self, x_audio: torch.Tensor, batch_idx: int) -> torch.Tensor:
+  def training_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
     """
     Compute the loss for a batch of data
 
@@ -314,7 +347,9 @@ class DDSP(L.LightningModule):
     Returns:
       loss: torch.Tensor[batch_size, 1], tensor of loss
     """
-    _, losses = self._autoencode(x_audio)
+    x_audio, x_features = batch
+
+    _, losses = self._autoencode(x_audio, x_features)
 
     self.log("recons_loss", losses["recons_loss"], prog_bar=True, logger=True)
     self.log("kld", losses["kld"], prog_bar=True, logger=True)
@@ -326,10 +361,12 @@ class DDSP(L.LightningModule):
     return losses["loss"]
 
 
-  def validation_step(self, x_audio: torch.Tensor, batch_idx: int) -> torch.Tensor:
+  def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
     """Compute the loss for validation data"""
+    x_audio, x_features = batch
+
     with torch.no_grad():
-      y_audio, losses = self._autoencode(x_audio)
+      y_audio, losses = self._autoencode(x_audio, x_features)
 
     loss = losses["recons_loss"]
 
@@ -384,7 +421,7 @@ class DDSP(L.LightningModule):
     return z_smooth
 
 
-  def _autoencode(self, x_audio: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+  def _autoencode(self, x_audio: torch.Tensor, x_features: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Autoencode the audio signal
     Args:
@@ -402,8 +439,11 @@ class DDSP(L.LightningModule):
     # smooth the latent envelopes
     z = self._smooth_latents(z)
 
+    # Downsample the features
+    x_features = F.interpolate(x_features.permute(0, 2, 1), scale_factor=1/self.resampling_factor, mode='linear').permute(0, 2, 1)
+
     # Predict the parameters of the synthesiser
-    synth_params = self.decoder(z)
+    synth_params = self.decoder(x_features, z)
 
     # Synthesize the output signal
     y_audio = self._synthesize(synth_params)
@@ -452,11 +492,12 @@ class DDSP(L.LightningModule):
   #   self._validation_index += 1
 
 
-  def _synthesize(self, params: torch.Tensor, sines_number_attenuation: float = 0.0, noise_amp_attenuation: float = 0.0, sines_amp_attenuation: float = 0.0) -> torch.Tensor:
+  def _synthesize(self, params: torch.Tensor, waveshaping_factor: float=0.0, limit_components: float=0.0) -> torch.Tensor:
     """
     Synthesizes a signal from the predicted amplitudes and the baked noise bands.
     Args:
       - params: torch.Tensor[batch_size, params, sig_length], the predicted synth parameters
+      - waveshaping: float, the amount of waveshaping to apply to the signal
       - sines_number_attenuation: float, attenuation factor for the number of sines
       - noise_amp_attenuation: float, attenuation factor for the noise amplitude
       - sines_amp_attenuation: float, attenuation factor for the sines amplitude
@@ -466,21 +507,10 @@ class DDSP(L.LightningModule):
     params_idx = 0
     audio = []
 
-    # Clamping to [0, 1]
-    noise_amp = max(0.0, min(1.0 - noise_amp_attenuation, 1.0))
-    sines_amp = max(0.0, min(1.0 - sines_amp_attenuation, 1.0))
-
     for synth in self.synths:
       synth_params = params[:, params_idx:params_idx+synth.n_params, :]
       params_idx += synth.n_params
-      if isinstance(synth, SubbandSineSynth):
-        audio.append(synth(synth_params, sines_number_attenuation=sines_number_attenuation)*sines_amp)
-      elif isinstance(synth, NoiseBandSynth):
-        audio.append(synth(synth_params)*noise_amp)
-      elif isinstance(synth, ComplexSineSynth):
-        audio.append(synth(synth_params))
-
-      # audio.append(synth(synth_params))
+      audio.append(synth(synth_params, limit_components=limit_components, waveshaping_factor=waveshaping_factor))
 
     return torch.sum(torch.hstack(audio), dim=1, keepdim=True)
 
@@ -506,8 +536,8 @@ class DDSP(L.LightningModule):
     #     + w_mel * self._mr_mel_loss(y, x) \
     #   ) / (w_stft + w_mel + w_chroma)
 
-    # loss = self._mr_stft_loss(y, x)
-    loss = self._sliced_wasserstein_loss(y.squeeze(1), x.squeeze(1))
+    loss = self._mr_stft_loss(y, x)
+    # loss = self._sliced_wasserstein_loss(y.squeeze(1), x.squeeze(1))
     # loss += self._mr_stft_loss(y, x)
     return loss
 

@@ -171,6 +171,7 @@ class Decoder(nn.Module):
   def __init__(self,
                n_params: int = 500,
                latent_size: int = 16,
+               n_features: int = 4,
                layer_sizes: List[int] = [32, 64, 128],
                output_mlp_layers: int = 3,
                gru_layers: int = 1,
@@ -190,31 +191,42 @@ class Decoder(nn.Module):
     self.streaming = streaming
 
     # MLP mapping from the latent space
-    self.input_bottleneck = _make_sequential([latent_size] + layer_sizes)
+    self.input_latent_bottleneck = _make_sequential([latent_size] + layer_sizes)
 
-    hidden_size = layer_sizes[-1]
+    # MLP mapping from the input features
+    self.input_features_bottleneck = _make_sequential([n_features] + layer_sizes)
+
+    # transformed latents + transformed features + original features
+    self.hidden_size = layer_sizes[-1] * 2 + n_features
 
     # Intermediate GRU layer
-    self.gru = nn.GRU(hidden_size, hidden_size, num_layers=gru_layers, batch_first=True)
-    self.register_buffer('_hidden_state', torch.zeros(gru_layers, 1, hidden_size), persistent=False)
+    self.gru = nn.GRU(self.hidden_size, self.hidden_size, num_layers=gru_layers, batch_first=True)
+    self.register_buffer('_hidden_state', torch.zeros(gru_layers, 1, self.hidden_size), persistent=False)
 
     # Intermediary 3-layer MLP
-    self.inter_mlp = _make_mlp(hidden_size, output_mlp_layers, hidden_size)
+    self.inter_mlp = _make_mlp(self.hidden_size, output_mlp_layers, self.hidden_size)
 
     # Output layer predicting noiseband amplitudes, and sine frequencies and amplitudes
-    self.output_params = nn.Linear(hidden_size, n_params)
+    self.output_params = nn.Linear(self.hidden_size, n_params)
 
 
-  def forward(self, z: torch.Tensor) -> torch.Tensor:
+  def forward(self, features: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
     """
     Forward pass of the decoder.
     Arguments:
-      - z: torch.Tensor, the latent space tensor
+      - features: torch.Tensor, the input features tensor [batch_size, n_features, n_signal]
+      - z: torch.Tensor, the latent space tensor [batch_size, latent_size, n_signal]
     Returns:
-      - noiseband_amps: torch.Tensor, the predicted noiseband amplitudes
+      - synth_params: torch.Tensor, the predicted synthesiser parameters
     """
-    # Pass through the input MLP
-    x = self.input_bottleneck(z)
+    # Pass latents through the input MLP
+    z_transformed = self.input_latent_bottleneck(z)
+
+    # Pass features through the input MLP
+    features_transformed = self.input_features_bottleneck(features)
+
+    # Concatenate the transformed latents, transformed features and features
+    x = torch.cat((z_transformed, features_transformed, features), dim=-1)
 
     # Pass through the GRU layer
     if self.streaming and _is_batch_size_one(z):
@@ -230,3 +242,22 @@ class Decoder(nn.Module):
     output = _scaled_sigmoid(self.output_params(x))
 
     return output.permute(0, 2, 1)
+
+
+  def positional_encoding(self, d_model, length):
+    """
+    :param d_model: dimension of the model
+    :param length: length of positions
+    :return: length*d_model position matrix
+    """
+    if d_model % 2 != 0:
+        raise ValueError("Cannot use sin/cos positional encoding with "
+                         "odd dim (got dim={:d})".format(d_model))
+    pe = torch.zeros(length, d_model, requires_grad=False)
+    position = torch.arange(0, length).unsqueeze(1)
+    div_term = torch.exp((torch.arange(0, d_model, 2, dtype=torch.float) *
+                         -(math.log(10000.0) / d_model)))
+    pe[:, 0::2] = torch.sin(position.float() * div_term)
+    pe[:, 1::2] = torch.cos(position.float() * div_term)
+
+    return pe

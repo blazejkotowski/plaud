@@ -1,6 +1,7 @@
 import nn_tilde
 import argparse
 import torch
+import torch.nn.functional as F
 import lightning as L
 import cached_conv as cc
 
@@ -17,7 +18,8 @@ torch.set_printoptions(threshold=10000)
 class ScriptedDDSP(nn_tilde.Module):
   def __init__(self,
                pretrained: DDSP,
-               prior_model: Prior = None):
+               prior_model: Prior = None,
+               target_fs: float = 16000.0):
     super().__init__()
 
     self.pretrained = pretrained
@@ -29,6 +31,9 @@ class ScriptedDDSP(nn_tilde.Module):
 
     self.prior_model = prior_model
 
+
+    self.resample_ratio = target_fs / self.pretrained.fs
+    print("resample ratio:", self.resample_ratio )
     # # # Calculate the input ratio
     # x_len = 2**14
     # x = torch.zeros(1, 1, x_len) for _ in range(self.pretrained.n_control_params)
@@ -38,28 +43,32 @@ class ScriptedDDSP(nn_tilde.Module):
 
     # self.register_buffer("prior_buffer", torch.randn(1, self.prior_model._max_len, self.prior_model._num_params))
 
-    self.register_attribute("sines_number_attenuation", 0.0)
+    self.register_attribute("limit_components", 0.0)
     self.register_attribute("noise_amplitude_attenuation", 0.0)
     self.register_attribute("sines_amplitude_attenuation", 0.0)
+    self.register_attribute("waveshaping", 0.0)
 
-    self.register_method(
-      "forward",
-      in_channels = 1,
-      in_ratio = 1,
-      out_channels = 1,
-      out_ratio = 1,
-      input_labels=['(signal) Audio Input'],
-      output_labels=['(signal) Audio Output'],
-      test_method=True,
-    )
+    # self.register_method(
+    #   "forward",
+    #   in_channels = 1,
+    #   in_ratio = 1,
+    #   out_channels = 1,
+    #   out_ratio = 1,
+    #   input_labels=['(signal) Audio Input'],
+    #   output_labels=['(signal) Audio Output'],
+    #   test_method=True,
+    # )
+
+    total_params = self.pretrained.num_params + self.pretrained.n_features
 
     self.register_method(
       "decode",
-      in_channels = self.pretrained.num_params,
-      in_ratio = self.pretrained.resampling_factor,
+      in_channels = total_params,
+      in_ratio = int(self.pretrained.resampling_factor * self.resample_ratio),
       out_channels = 1, # number of output audio channels
+      # out_ratio = 1/3,
       out_ratio = 1,
-      input_labels=[f'(signal) Latent Dimension {i}' for i in range(1, self.pretrained.num_params+1)],
+      input_labels=[f'(signal) Latent Dimension {i}' for i in range(1, total_params+1)],
       output_labels=['(signal) Audio Output'],
       test_method=True,
     )
@@ -78,51 +87,81 @@ class ScriptedDDSP(nn_tilde.Module):
     if not isinstance(self.prior_model, FakePrior):
       self.register_method(
         "prior",
-        in_channels=self.pretrained.num_params + 2, # latent transposition + temperature + prediction_strength
+        in_channels=total_params + 2, # latent transposition + temperature + prediction_strength
         in_ratio=self.pretrained.resampling_factor,
-        out_channels=self.pretrained.num_params,
+        out_channels=total_params,
         out_ratio=self.pretrained.resampling_factor,
-        input_labels=[f'(signal) Transposition {i}' for i in range(1, self.pretrained.num_params+1)] + ['(signal) Temperature', '(signal) Prediction strenght'],
+        input_labels=[f'(signal) Transposition {i}' for i in range(1, total_params+1)] + ['(signal) Temperature', '(signal) Prediction strenght'],
       )
 
   @torch.jit.export
-  def decode(self, latents: torch.Tensor):
+  def decode(self, params: torch.Tensor):
     # params = params.permute(0, 2, 1)
     # print('params', params.shape)
     # print(self.pretrained.latent_size)
     # print(self.pretrained.num_params)
+    latents = params[:, self.pretrained.n_features:, :]
+    features = params[:, :self.pretrained.n_features, :]
+    # print("Params shape:", params.shape)
+
     latents = latents.permute(0, 2, 1)
-    latents = self.pretrained.params_to_latents(latents)
-    latents = self.pretrained.denormalize_latents(latents)
-    synth_params = self.pretrained.decoder(latents)
-    audio = self.pretrained._synthesize(synth_params, sines_amp_attenuation=self.sines_amplitude_attenuation[0], noise_amp_attenuation=self.noise_amplitude_attenuation[0], sines_number_attenuation=self.sines_number_attenuation[0])
+    # latents = self.pretrained.params_to_latents(latents)
+    # latents = self.pretrained.denormalize_latents(latents)
+    features = features.permute(0, 2, 1)
+
+    synth_params = self.pretrained.decoder(features, latents)
+    audio = self.pretrained._synthesize(synth_params, waveshaping_factor=self.waveshaping[0], limit_components=self.limit_components[0])
+    # print("Audio shape before interpolation:", audio.shape)
+
+    if self.resample_ratio != 1:
+      audio = F.interpolate(audio, scale_factor=self.resample_ratio, mode='linear')
+
+    # print("Audio shape after interpolation:", audio.shape)
+
     return audio.float()
+
 
   @torch.jit.export
   def encode(self, audio: torch.Tensor):
+    # if self.resampler is not None:
+      #  audio = self.resampler.to_model_sampling_rate(audio)
+
     mu, scale = self.pretrained.encoder(audio.squeeze(1))
     # latents = self.pretrained.encoder.reparametrize(mu, logvar)
     latents, _ = self.pretrained.encoder.reparametrize(mu, scale)
     latents = self.pretrained._smooth_latents(latents)
     latents = self.pretrained.normalize_latents(latents)
     latents = self.pretrained.latents_to_params(latents)
-    return latents.permute(0, 2, 1).float()
+    latents = latents.permute(0, 2, 1).float()
 
-  @torch.jit.export
-  def forward(self, audio: torch.Tensor):
-    return self.pretrained(audio.squeeze(1)).float()
+    return latents
+
+  # @torch.jit.export
+  # def forward(self, audio: torch.Tensor):
+  #   return self.pretrained(audio.squeeze(1)).float()
 
   @torch.jit.export
   def prior(self, x: torch.Tensor):
     return self.prior_model(x)
 
   @torch.jit.export
-  def get_sines_number_attenuation(self) -> float:
-    return self.sines_number_attenuation[0]
+  def get_waveshaping(self) -> float:
+    return self.waveshaping[0]
 
   @torch.jit.export
-  def set_sines_number_attenuation(self, value: float):
-    self.sines_number_attenuation = (value, )
+  def set_waveshaping(self, value: float):
+    self.waveshaping = (value, )
+    return 0
+
+
+  @torch.jit.export
+  def get_limit_components(self) -> float:
+    return self.limit_components[0]
+
+  @torch.jit.export
+  def set_limit_components(self, value: float):
+    self.limit_components = (value, )
+    return 0
 
   @torch.jit.export
   def get_noise_amplitude_attenuation(self) -> float:
@@ -131,6 +170,7 @@ class ScriptedDDSP(nn_tilde.Module):
   @torch.jit.export
   def set_noise_amplitude_attenuation(self, value: float):
     self.noise_amplitude_attenuation = (value, )
+    return 0
 
   @torch.jit.export
   def get_sines_amplitude_attenuation(self) -> float:
@@ -139,8 +179,7 @@ class ScriptedDDSP(nn_tilde.Module):
   @torch.jit.export
   def set_sines_amplitude_attenuation(self, value: float):
     self.sines_amplitude_attenuation = (value, )
-
-
+    return 0
 
 
 class FakePrior(torch.nn.Module):
@@ -254,6 +293,7 @@ if __name__ == '__main__':
   parser.add_argument('--output_path', type=str, help='Directory to save the autoencoded audio')
   parser.add_argument('--streaming', type=bool, default=True, help='Whether to use streaming mode')
   parser.add_argument('--type', default='best', help='Type of model to export', choices=['best', 'last'])
+  parser.add_argument('--target_fs', type=float, default=16000.0, help='Target sampling rate for the exported model')
   config = parser.parse_args()
 
   cc.use_cached_conv(config.streaming)
@@ -298,7 +338,7 @@ if __name__ == '__main__':
     ddsp.eval()
 
 
-    scripted = ScriptedDDSP(ddsp, prior).to('cpu')
+    scripted = ScriptedDDSP(ddsp, prior, config.target_fs).to('cpu')
     scripted.export_to_ts(config.output_path)
 
     print("Model exported to: ", config.output_path)

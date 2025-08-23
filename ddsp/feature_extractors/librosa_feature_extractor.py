@@ -3,6 +3,7 @@ import librosa
 import torch.nn.functional as F
 
 from .base_extractor import BaseExtractor, register_feature_extractor
+from .utils import normalize_feature, smoothen_feature
 
 @register_feature_extractor
 class LibrosaFeatureExtractor(BaseExtractor):
@@ -16,16 +17,19 @@ class LibrosaFeatureExtractor(BaseExtractor):
   FN_SPECTRAL_ROLLOFF = 'spectral_rolloff'
   FN_SPECTRAL_BANDWIDTH = 'spectral_bandwidth'
 
-  def __init__(self, feature_fn_name: str, *args, **kwargs):
+  def __init__(self, feature_fn_name: str, postprocess: False,  *args, **kwargs):
     """
     Args:
       - feature_fn_name: str, the name of the librosa feature extraction function to use
       - args: additional arguments for the base extractor
+      - postprocess: bool, whether to apply postprocessing:
+        > clamping between .05 and .95 percentiles,
+        > normalization between [0, 1]
+        > and smoothing to the extracted features
       - kwargs: additional keyword arguments for the base extractor
     """
     super(LibrosaFeatureExtractor, self).__init__(*args, **kwargs)
     self._feature_fn = getattr(librosa.feature, feature_fn_name)
-    librosa.feature.rms
 
   def _calculate(self, audio: torch.Tensor) -> torch.Tensor:
     """
@@ -42,6 +46,8 @@ class LibrosaFeatureExtractor(BaseExtractor):
     if feat.ndim == 1:
       feat = feat[None, :]
     feat = torch.tensor(feat, dtype=torch.float32)
+    feat = normalize_feature(feat, low=5.0, high=95.0, dim=-1)
     feat = F.interpolate(feat.unsqueeze(0), size=audio.shape[-1], mode='linear').squeeze(0)
+    feat = smoothen_feature(feat, window_size=256+1)  # Smoothen the feature
 
     return feat
