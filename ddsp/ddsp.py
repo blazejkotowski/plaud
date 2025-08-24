@@ -118,13 +118,14 @@ class DDSP(L.LightningModule):
     # self._mr_chroma_loss = self._construct_chroma_loss() # CHROMA-scale loss
 
     # Wasserstein loss
-    # self._sliced_wasserstein_loss = SlicedWassersteinLoss(
-    #   win_size=2048,
-    #   hop_size=512,
-    #   n_projections=100,
-    #   p=2,
-    #   device=self._device
-    # )
+    win = torch.hann_window(2048)
+    self._sliced_wasserstein_loss = SlicedWassersteinLoss(
+      window=win,
+      sampling_rate=self.fs,
+      n_projections=10,
+      p=2,
+      magnitude='pow',
+    )
     # Perceptual loss
     # self._m2l_loss = M2LLoss()
     self._perceptual_loss_weight = perceptual_loss_weight
@@ -395,7 +396,7 @@ class DDSP(L.LightningModule):
     return [optimizer], [scheduler]
 
 
-  def _smooth_latents(self, z: torch.Tensor) -> torch.Tensor:
+  def _smooth_latents(self, z: torch.Tensor, mode: str = 'causal') -> torch.Tensor:
     """
     smooth the latent envelopes using a low-pass filter
 
@@ -412,13 +413,21 @@ class DDSP(L.LightningModule):
     if smoothing_kernel % 2 == 0:
       smoothing_kernel += 1
 
-    # smooth the latent envelopes, individually
-    # Apply a simple moving average (low-pass filter) along the time axis for each latent dimension
-    padding = smoothing_kernel // 2
-    z_smooth = torch.nn.functional.avg_pool1d(
-      z.transpose(1, 2), kernel_size=smoothing_kernel, stride=1, padding=padding
-    ).transpose(1, 2)
-    return z_smooth
+    if mode=='causal':
+      B, T, C = z.shape
+      x = z.transpose(1, 2)  # [B, C, T] for conv/pool
+      w = torch.ones(C, 1, smoothing_kernel, device=z.device, dtype=z.dtype) / smoothing_kernel
+      y = F.conv1d(F.pad(x, (smoothing_kernel-1, 0)), w, groups=C)  # [B, C, T]
+      return y.transpose(1, 2)
+
+    else:
+      # smooth the latent envelopes, individually
+      # Apply a simple moving average (low-pass filter) along the time axis for each latent dimension
+      padding = smoothing_kernel // 2
+      z_smooth = torch.nn.functional.avg_pool1d(
+        z.transpose(1, 2), kernel_size=smoothing_kernel, stride=1, padding=padding
+      ).transpose(1, 2)
+      return z_smooth
 
 
   def _autoencode(self, x_audio: torch.Tensor, x_features: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
@@ -537,9 +546,10 @@ class DDSP(L.LightningModule):
     #   ) / (w_stft + w_mel + w_chroma)
 
     loss = self._mr_stft_loss(y, x)
-    # loss = self._sliced_wasserstein_loss(y.squeeze(1), x.squeeze(1))
+    # loss += 5e3 * self._sliced_wasserstein_loss(y.squeeze(1), x.squeeze(1))
     # loss += self._mr_stft_loss(y, x)
     return loss
+
 
   @torch.jit.ignore
   def _construct_mel_loss(self):
@@ -567,14 +577,16 @@ class DDSP(L.LightningModule):
   @torch.jit.ignore
   def _construct_mrstft_loss(self):
     """Construct the loss function for the model: a multi-resolution STFT loss"""
-    fft_sizes = np.array([2053, 1021, 509, 257])
+    fft_sizes = np.array([2053, 1021, 509, 257, 129, 65, 33])
     # Modification from log to log1p according to
     # Schwär, S., & Müller, M. (2023). Multi-Scale Spectral Loss Revisited.
     # IEEE Signal Processing Letters, 30, 1712–1716. https://doi.org/10.1109/LSP.2023.3333205
-    return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[2053, 1021, 509, 257],
+    return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[2053, 1021, 509, 257, 129, 65, 33],
                                                 hop_sizes=fft_sizes//4,
                                                 win_lengths=fft_sizes,
                                                 window='flattop_window',
                                                 mag_distance='L2',
+                                                perceptual_weighting=True,
+                                                sample_rate=self.fs,
                                                 ).to(self._device)
 
