@@ -1,4 +1,5 @@
 import torch
+import torch.nn.functional as F
 import math
 
 # def normalize_feature(feature: torch.Tensor) -> torch.Tensor:
@@ -34,9 +35,16 @@ def normalize_feature(feature: torch.Tensor, dim: int = -1, low: float = 5.0, hi
     return (clamped - lo) / (hi - lo + 1e-8)
 
 
-def smoothen_feature(feature: torch.Tensor, window_size: int = 256+1) -> torch.Tensor:
-  """Smoothens the feature using a simple moving average."""
-  return torch.nn.functional.avg_pool1d(feature, kernel_size=window_size, stride=1, padding=window_size // 2)
+# def smoothen_feature(feature: torch.Tensor, window_size: int = 256+1) -> torch.Tensor:
+#   """Smoothens the feature using a simple moving average."""
+#   return F.avg_pool1d(feature, kernel_size=window_size, stride=1, padding=window_size // 2)
+
+
+def smoothen_feature(x: torch.Tensor, window_size: int = 257) -> torch.Tensor:
+    # x: [1, T]  (causal moving average)
+    w = x.new_full((1, 1, window_size), 1.0 / window_size)
+    y = F.conv1d(F.pad(x.unsqueeze(1), (window_size - 1, 0)), w)
+    return y.squeeze(1)  # [1, T]
 
 
 def postprocess_feature(feature: torch.Tensor,) -> torch.Tensor:
