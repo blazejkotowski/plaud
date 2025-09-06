@@ -6,12 +6,13 @@ import numpy as np
 import auraloss
 
 from ddsp.blocks import VariationalEncoder, Decoder
+from ddsp.discriminator import Discriminator
 from ddsp.synths import BaseSynth, SineSynth, SubbandSineSynth, NoiseBandSynth, ComplexSineSynth, BendableNoiseBandSynth
 from sklearn.decomposition import PCA
 
 from typing import List, Tuple, Dict, Any
 
-from ddsp.losses import M2LLoss, SlicedWassersteinLoss
+from ddsp.losses import M2LLoss, MultiScaleSlicedWassersteinLoss
 
 
 class DDSP(L.LightningModule):
@@ -35,6 +36,7 @@ class DDSP(L.LightningModule):
     - streaming: bool, whether to run the model in streaming mode
     - perceptual_loss_weight: float, the weight for the perceptual loss [TODO: make it optional]
     - plateau_patience: int, the patience for the learning rate scheduler
+    - adversarial_loss: bool, whether to use adversarial loss
     - device: str, the device to run the model on
   """
   def __init__(self,
@@ -54,8 +56,12 @@ class DDSP(L.LightningModule):
                perceptual_loss_weight: float = 0.0,
                streaming: bool = False,
                plateau_patience: int = 20,
+               adversarial_loss: bool = True,
                device: str = 'cuda'):
     super().__init__()
+    # Turn of autoamtic optimization
+    self.automatic_optimization = False
+
     # Save hyperparameters in the checkpoints
     self.save_hyperparameters()
     self._synth_configs = synth_configs
@@ -67,6 +73,7 @@ class DDSP(L.LightningModule):
     self.n_features = n_features
     self.resampling_factor = resampling_factor
     self._latent_smoothing_kernel = latent_smoothing_kernel
+    self._adversarial_loss = adversarial_loss
 
     # self.synths = synths
     # self.synths = torch.nn.ModuleList([builder() for builder in self._synth_builders])
@@ -118,9 +125,9 @@ class DDSP(L.LightningModule):
     # self._mr_chroma_loss = self._construct_chroma_loss() # CHROMA-scale loss
 
     # Wasserstein loss
-    win = torch.hann_window(2048)
-    self._sliced_wasserstein_loss = SlicedWassersteinLoss(
-      window=win,
+    windows = [torch.hann_window(win_len, periodic=True) for win_len in [2048, 1024, 512, 256, 128]]
+    self._sliced_wasserstein_loss = MultiScaleSlicedWassersteinLoss(
+      windows=windows,
       sampling_rate=self.fs,
       n_projections=10,
       p=2,
@@ -130,6 +137,18 @@ class DDSP(L.LightningModule):
     # self._m2l_loss = M2LLoss()
     self._perceptual_loss_weight = perceptual_loss_weight
     # self._recons_loss = CLAPLoss() # CLAP loss
+
+    self._disc_num_D = 3 # number of discriminators at different scales
+    self._disc_ndf = 4 # number of filters in the first layer of the discriminator
+    self._disc_n_layers = 3 # number of layers in each discriminator
+    self._disc_downsample_factor = 4 # downsampling factor between discriminators
+    self._disc_feature_weight = 1.0 # weight for the feature matching loss
+    self._discriminator = Discriminator(
+      self._disc_num_D,
+      self._disc_ndf,
+      self._disc_n_layers,
+      self._disc_downsample_factor
+    )
 
     # Learning rate
     self._learning_rate = learning_rate
@@ -349,17 +368,114 @@ class DDSP(L.LightningModule):
       loss: torch.Tensor[batch_size, 1], tensor of loss
     """
     x_audio, x_features = batch
+    opt_ddsp, opt_disc = self.optimizers()
+    sched_ddsp, sched_disc = self.lr_schedulers()
 
-    _, losses = self._autoencode(x_audio, x_features)
+    # Autoencode once
+    y_audio, kld_loss = self._autoencode(x_audio, x_features)
 
-    self.log("recons_loss", losses["recons_loss"], prog_bar=True, logger=True)
-    self.log("kld", losses["kld"], prog_bar=True, logger=True)
-    self.log("m2l_loss", losses["m2l_loss"], prog_bar=True, logger=True)
-    self.log("train_loss", losses["loss"], prog_bar=True, logger=True)
+    # Match lengths if needed
+    if y_audio.shape[-1] != x_audio.shape[-1]:
+      min_length = min(x_audio.shape[-1], y_audio.shape[-1])
+      x_audio = x_audio[..., :min_length]
+      y_audio = y_audio[..., :min_length]
+
+    # Defaults (so we can log even before adversarial starts)
+    device = x_audio.device
+    adv_d = torch.tensor(0.0, device=device) # discriminator loss
+    adv_g = torch.tensor(0.0, device=device) # generator adversarial loss
+
+    # -------------------------
+    # 1) Discriminator update
+    # -------------------------
+    if self._adversarial_loss and self.current_epoch >= 150:
+      self.toggle_optimizer(opt_disc)
+
+      # D(real) and D(fake.detach()) with grads ONLY for D
+      pred_real = self._discriminator(x_audio.float())
+      pred_fake_det = self._discriminator(y_audio.float().detach())
+
+      self.log("D(real)", sum([out[-1].mean() for out in pred_real]).item(), prog_bar=True, logger=True)
+      self.log("D(fake)", sum([out[-1].mean() for out in pred_fake_det]).item(), prog_bar=True, logger=True)
+
+      # Hinge loss for D
+      ld = 0.0
+      for out in pred_fake_det:
+        ld = ld + F.relu(1 + out[-1]).mean() # for a good disceriminator, D(fake) should be negative, so the loss part here should be small
+      for out in pred_real:
+        ld = ld + F.relu(1 - out[-1]).mean() # for a good disceriminator, D(real) should be positive, so the loss part here should be small
+      adv_d = ld # the minimum of ld should be 0, the maximum is unbounded
+
+      if batch_idx % 5 == 0:
+        opt_disc.zero_grad(set_to_none=True)
+        self.manual_backward(adv_d)
+        self.clip_gradients(opt_disc, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+        opt_disc.step()
+        sched_disc.step(adv_d)
+        self.untoggle_optimizer(opt_disc)
+      else:
+        self.untoggle_optimizer(opt_disc)
+
+    # -------------------------
+    # 2) Generator/DDSP update
+    #    (freeze D BEFORE using it)
+    # -------------------------
+    # Reconstruction loss (perceptual/MRSTFT etc.)
+    recons_loss = self._reconstruction_loss(y_audio.float(), x_audio.float())
+    ddsp_loss = recons_loss + self._beta * kld_loss  # adv term added below if enabled
+
+    if self._adversarial_loss and self.current_epoch >= 100:
+      self.toggle_optimizer(opt_ddsp)                 # freezes D params for this block
+
+      pred_real = self._discriminator(x_audio.float())
+      # D(fake) WITHOUT detach, but D is frozen so grads flow to G only
+      pred_fake = self._discriminator(y_audio.float())
+
+      # Generator hinge term: -E[D(fake)]
+      for out in pred_fake:
+        adv_g = adv_g + (-out[-1].mean())
+
+      # Feature matching
+      loss_feat = torch.tensor(0.0, device=device)
+      feat_weights = 4.0 / (self._disc_n_layers + 1)
+      D_weights = 1.0 / self._disc_num_D
+      wt = D_weights * feat_weights
+
+      # Reuse pred_real stats from D step, but detach them
+      for i in range(self._disc_num_D):
+        for j in range(len(pred_fake[i]) - 1):
+          loss_feat = loss_feat + wt * F.l1_loss(pred_fake[i][j], pred_real[i][j].detach())
+
+      l_adv = 1e-1
+      adv_g = adv_g + self._disc_feature_weight * loss_feat
+      adv_g *= l_adv # weighting
+
+      ddsp_loss = ddsp_loss + adv_g
+
+      opt_ddsp.zero_grad(set_to_none=True)
+      self.manual_backward(ddsp_loss)
+      self.clip_gradients(opt_ddsp, gradient_clip_val=1.0, gradient_clip_algorithm="norm")
+      opt_ddsp.step()
+      sched_ddsp.step(ddsp_loss)
+      self.untoggle_optimizer(opt_ddsp)
+    else:
+      # No adversarial yet: do a plain DDSP step
+      self.toggle_optimizer(opt_ddsp)
+      opt_ddsp.zero_grad(set_to_none=True)
+      self.manual_backward(ddsp_loss)
+      opt_ddsp.step()
+      sched_ddsp.step(ddsp_loss)
+      self.untoggle_optimizer(opt_ddsp)
+
+    # Logging
+    self.log('lr_adv_d', self.trainer.optimizers[1].param_groups[0]['lr'], prog_bar=True)
+    self.log("adv_d", adv_d, prog_bar=True, logger=True)
+    self.log('lr_ddsp', self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=True)
+    self.log("adv_g", adv_g, prog_bar=True, logger=True)
+    self.log("kld", kld_loss, prog_bar=True, logger=True)
     self.log("beta", self._beta, prog_bar=True, logger=True)
-    self.log('lr', self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=True)
-
-    return losses["loss"]
+    self.log("recons_loss", recons_loss, prog_bar=True, logger=True)
+    self.log("ddsp_loss", ddsp_loss, prog_bar=True, logger=True)
 
 
   def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
@@ -367,11 +483,11 @@ class DDSP(L.LightningModule):
     x_audio, x_features = batch
 
     with torch.no_grad():
-      y_audio, losses = self._autoencode(x_audio, x_features)
+      y_audio, _ = self._autoencode(x_audio, x_features)
 
-    loss = losses["recons_loss"]
+    val_loss = self._reconstruction_loss(y_audio.float(), x_audio.float())
 
-    self.log("val_loss", loss, prog_bar=True, logger=True)
+    self.log("val_loss", val_loss, prog_bar=True, logger=True)
 
     # if self._last_validation_in is None:
     #   self._last_validation_in = x_audio
@@ -384,16 +500,23 @@ class DDSP(L.LightningModule):
     """Configure the optimizer for the model"""
     # return torch.optim.Adam(self.parameters(), lr=self._learning_rate)
 
-    optimizer = torch.optim.Adam(self.parameters(), lr=self._learning_rate)
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.1, patience=self._plateau_patience, verbose=False, threshold=1e-3)
+    disc_param_ids = {id(p) for p in self._discriminator.parameters()}
+    ddsp_params = [p for p in self.parameters() if id(p) not in disc_param_ids]
+    disc_params = list(self._discriminator.parameters())
 
-    scheduler = {
-      'scheduler': lr_scheduler,
-      'monitor': 'val_loss',
-      'interval': 'epoch'
-    }
+    opt_ddsp = torch.optim.Adam(ddsp_params, lr=self._learning_rate)
+    sched_ddsp = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_ddsp, mode='min', factor=0.1, patience=self._plateau_patience, verbose=False, threshold=1e-3)
 
-    return [optimizer], [scheduler]
+    opt_disc = torch.optim.Adam(disc_params, lr=self._learning_rate)
+    sched_disc = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_disc, mode='min', factor=0.1, patience=int(self._plateau_patience*10), verbose=False, threshold=1e-3)
+
+    optimizers = [opt_ddsp, opt_disc]
+    schedulers = [
+      {'scheduler': sched_ddsp, 'monitor': 'recons_loss', 'interval': 'epoch'},
+      {'scheduler': sched_disc, 'monitor': 'adv_d', 'interval': 'epoch'}
+    ]
+
+    return optimizers, schedulers
 
 
   def _smooth_latents(self, z: torch.Tensor, mode: str = 'causal') -> torch.Tensor:
@@ -437,7 +560,7 @@ class DDSP(L.LightningModule):
       - x_audio: torch.Tensor[batch_size, n_signal], the input audio signal
     Returns:
       - y_audio: torch.Tensor[batch_size, n_signal], the autoencoded audio signal
-      - losses: Dict[str, torch.Tensor], the losses computed during the autoencoding
+      - kld: torch.Tensor[], the KL divergence of the latent distribution
     """
     # Encode the audio signal
     mu, scale = self.encoder(x_audio)
@@ -457,28 +580,7 @@ class DDSP(L.LightningModule):
     # Synthesize the output signal
     y_audio = self._synthesize(synth_params)
 
-    # Compute the reconstruction loss
-    recons_loss = self._reconstruction_loss(y_audio.float(), x_audio.float())
-
-    # Compute the total loss using β parameter
-    loss = recons_loss +  self._beta * kld
-
-    m2l_loss = 0
-    # Compute the perceptual loss with music2latent
-    if self._perceptual_loss_weight > 0.0:
-      m2l_loss = self._m2l_loss(y_audio, x_audio)
-      loss += self._perceptual_loss_weight * m2l_loss
-    # loss = m2l_loss
-
-    # Construct losses dictionary
-    losses = {
-      "recons_loss": recons_loss,
-      "kld": kld,
-      "m2l_loss": m2l_loss,
-      "loss": loss
-    }
-
-    return y_audio, losses
+    return y_audio, kld
 
 
   # def on_validation_epoch_end(self):
