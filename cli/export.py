@@ -333,6 +333,7 @@ if __name__ == '__main__':
     ddsp._mr_mel_loss = None
     ddsp._mr_chroma_loss = None
     ddsp._m2l_loss = None
+    ddsp._discriminator = None
     ddsp._sliced_wasserstein_loss = None
 
     ddsp.eval()
