@@ -24,16 +24,18 @@ class ScriptedDDSP(nn_tilde.Module):
 
     self.pretrained = pretrained
 
+    self.resample_ratio = target_fs / self.pretrained.fs
+    print("resample ratio:", self.resample_ratio )
+
     if prior_model is None:
       prior_model = FakePrior()
     else:
-      prior_model = PriorWrapper(prior_model)
+      prior_model = PriorWrapper(prior_model, resample_ratio=self.resample_ratio)
 
     self.prior_model = prior_model
 
 
-    self.resample_ratio = target_fs / self.pretrained.fs
-    print("resample ratio:", self.resample_ratio )
+
     # # # Calculate the input ratio
     # x_len = 2**14
     # x = torch.zeros(1, 1, x_len) for _ in range(self.pretrained.n_control_params)
@@ -88,7 +90,7 @@ class ScriptedDDSP(nn_tilde.Module):
       self.register_method(
         "prior",
         in_channels=total_params + 2, # latent transposition + temperature + prediction_strength
-        in_ratio=self.pretrained.resampling_factor,
+        in_ratio=int(self.pretrained.resampling_factor * self.resample_ratio),
         out_channels=total_params,
         out_ratio=self.pretrained.resampling_factor,
         input_labels=[f'(signal) Transposition {i}' for i in range(1, total_params+1)] + ['(signal) Temperature', '(signal) Prediction strenght'],
@@ -188,15 +190,16 @@ class FakePrior(torch.nn.Module):
 
 
 class PriorWrapper(torch.nn.Module):
-  def __init__(self, prior: Prior):
+  def __init__(self, prior: Prior, resample_ratio: float = 1.0):
     super().__init__()
 
     self.prior = prior
+    self.resample_ratio = resample_ratio
 
     self.max_len = self.prior._max_len
     self.init_primer_len = self.max_len // 4
     self.current_buffer_len = self.init_primer_len
-    self.register_buffer("prior_buffer", torch.randn(1, self.max_len, self.prior._num_params))
+    self.register_buffer("prior_buffer", torch.zeros(1, self.max_len, self.prior._latent_size))
     # self.prior_buffer = torch.randn(1, self.max_len, self.prior._num_params)
 
 
@@ -211,9 +214,16 @@ class PriorWrapper(torch.nn.Module):
     x = x[:1, ...] # only first in batch
     seq_len = x.shape[1]
 
+    # TODO: Is this correct?
     if self.current_buffer_len + seq_len > self.max_len:
-      self.prior_buffer[:, :self.init_primer_len-seq_len, :] = self.prior_buffer[:, -self.init_primer_len+seq_len:, :].clone()
-      self.prior_buffer[:, self.init_primer_len:self.init_primer_len+seq_len, :] = x
+      if seq_len >= self.init_primer_len:
+        # If seq_len is greater than or equal to init_primer_len, just keep the last init_primer_len elements from x
+        self.prior_buffer[:, :self.init_primer_len, :] = x[:, -self.init_primer_len:, :]
+      else:
+        # Shift the last init_primer_len - seq_len elements to the beginning
+        self.prior_buffer[:, :self.init_primer_len - seq_len, :] = self.prior_buffer[:, -self.init_primer_len + seq_len:, :].clone()
+        # Place x at the end of the primer region
+        self.prior_buffer[:, self.init_primer_len - seq_len:self.init_primer_len, :] = x
       self.current_buffer_len = self.init_primer_len
     else:
       self.prior_buffer[:, self.current_buffer_len:self.current_buffer_len+seq_len, :] = x
@@ -234,7 +244,7 @@ class PriorWrapper(torch.nn.Module):
 
     steps = x.shape[-1]
 
-    output = torch.zeros(1, steps, self.prior._num_params)
+    output = torch.zeros(1, steps, self.prior._latent_size)
     local_buffer = self.prior_buffer.clone()
     current_len = self.current_buffer_len
 
@@ -261,6 +271,9 @@ class PriorWrapper(torch.nn.Module):
       output = output.repeat_interleave(x.size(0), dim=0)
 
     self.append_to_buffer(output)
+
+    if self.resample_ratio != 1:
+      output = F.interpolate(output.permute(0, 2, 1), scale_factor=self.resample_ratio, mode='linear').permute(0, 2, 1)
 
     return output.permute(0, 2, 1).float()
 
