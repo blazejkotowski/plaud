@@ -7,7 +7,7 @@ import auraloss
 
 from ddsp.blocks import VariationalEncoder, Decoder
 from ddsp.discriminator import Discriminator
-from ddsp.synths import BaseSynth, SineSynth, SubbandSineSynth, NoiseBandSynth, ComplexSineSynth, BendableNoiseBandSynth
+from ddsp.synths import BaseSynth, SineSynth, SubbandSineSynth, NoiseBandSynth, BendableNoiseBandSynth
 from sklearn.decomposition import PCA
 
 from typing import List, Tuple, Dict, Any
