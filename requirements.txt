@@ -7,4 +7,4 @@ lightning
 nn-tilde
 scipy
 librosa
-lmbd
+lmdb
