@@ -12,7 +12,7 @@ from sklearn.decomposition import PCA
 
 from typing import List, Tuple, Dict, Any
 
-from ddsp.losses import M2LLoss, MultiScaleSlicedWassersteinLoss
+from ddsp.losses import MultiScaleSlicedWassersteinLoss
 
 
 class DDSP(L.LightningModule):
