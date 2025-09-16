@@ -121,6 +121,7 @@ if __name__ == '__main__':
 
   # Define the checkpoint callback
   model_checkpoint = ModelCheckpoint(
+    dirpath=synth_training_path,
     filename='best',
     monitor='val_loss',
     mode='min',
