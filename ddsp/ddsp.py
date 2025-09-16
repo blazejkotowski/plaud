@@ -505,10 +505,10 @@ class DDSP(L.LightningModule):
     disc_params = list(self._discriminator.parameters())
 
     opt_ddsp = torch.optim.Adam(ddsp_params, lr=self._learning_rate)
-    sched_ddsp = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_ddsp, mode='min', factor=0.1, patience=self._plateau_patience, verbose=False, threshold=1e-3)
+    sched_ddsp = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_ddsp, mode='min', factor=0.1, patience=self._plateau_patience, threshold=1e-3)
 
     opt_disc = torch.optim.Adam(disc_params, lr=self._learning_rate)
-    sched_disc = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_disc, mode='min', factor=0.1, patience=int(self._plateau_patience*10), verbose=False, threshold=1e-3)
+    sched_disc = torch.optim.lr_scheduler.ReduceLROnPlateau(opt_disc, mode='min', factor=0.1, patience=int(self._plateau_patience*10), threshold=1e-3)
 
     optimizers = [opt_ddsp, opt_disc]
     schedulers = [
