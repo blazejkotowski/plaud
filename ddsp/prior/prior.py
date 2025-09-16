@@ -233,7 +233,7 @@ class Prior(L.LightningModule):
   def configure_optimizers(self):
     optimizer = torch.optim.Adam(self.parameters(), lr=self._lr)
     # optimizer = torch.optim.SGD(self.parameters(), lr=self._lr, momentum=0.9)
-    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=200, verbose=False, threshold=1e-4)
+    lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=200, threshold=1e-4)
 
     scheduler = {
       'scheduler': lr_scheduler,
