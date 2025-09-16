@@ -6,7 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 
 from ddsp.filterbank import FilterBank
-from ddsp.sgd.sinusoidal_gradient_descent.core import complex_oscillator
+# from ddsp.sgd.sinusoidal_gradient_descent.core import complex_oscillator
 
 
 from typing import Type, Callable, Dict, Any, List
@@ -642,73 +642,73 @@ class SubbandSineSynth(BaseSynth):
       torchaudio.save(f"{i}-{audiofile}", signal[i], self._fs)
 
 
-@register_synth
-class ComplexSineSynth(BaseSynth):
-  """
-  Synthesizer that generates a mixture of complex sinusoids using the complex_oscillator.
+# @register_synth
+# class ComplexSineSynth(BaseSynth):
+#   """
+#   Synthesizer that generates a mixture of complex sinusoids using the complex_oscillator.
 
-  Arguments:
-    - fs: int, the sampling rate of the output signal
-    - n_sines: int, the number of complex sinusoids to synthesize
-    - resampling_factor: int, up/down sampling factor for control signals
-    - streaming: bool, whether to run in streaming mode (maintain phase continuity)
-    - device: str, computation device
-  """
-  def __init__(
-    self,
-    fs: int = 44100,
-    n_sines: int = 500,
-    resampling_factor: int = 32,
-    streaming: bool = False,
-    device: str = 'cuda'
-  ):
-    super().__init__(fs=fs, resampling_factor=resampling_factor)
-    self._fs = fs
-    self._n_sines = n_sines
-    self._resampling_factor = resampling_factor
-    self.streaming = streaming
-    self._device = device
-    self.register_buffer("_phases", torch.empty(0))
-    self._phases_initialized = False
+#   Arguments:
+#     - fs: int, the sampling rate of the output signal
+#     - n_sines: int, the number of complex sinusoids to synthesize
+#     - resampling_factor: int, up/down sampling factor for control signals
+#     - streaming: bool, whether to run in streaming mode (maintain phase continuity)
+#     - device: str, computation device
+#   """
+#   def __init__(
+#     self,
+#     fs: int = 44100,
+#     n_sines: int = 500,
+#     resampling_factor: int = 32,
+#     streaming: bool = False,
+#     device: str = 'cuda'
+#   ):
+#     super().__init__(fs=fs, resampling_factor=resampling_factor)
+#     self._fs = fs
+#     self._n_sines = n_sines
+#     self._resampling_factor = resampling_factor
+#     self.streaming = streaming
+#     self._device = device
+#     self.register_buffer("_phases", torch.empty(0))
+#     self._phases_initialized = False
 
-  @property
-  def n_params(self):
-    # Each sine is parameterized by a complex number z
-    return 2 * self._n_sines  # real and imaginary parts per sine
+#   @property
+#   def n_params(self):
+#     # Each sine is parameterized by a complex number z
+#     return 2 * self._n_sines  # real and imaginary parts per sine
 
-  @property
-  def jit_name(self):
-    return "ComplexSineSynth"
+#   @property
+#   def jit_name(self):
+#     return "ComplexSineSynth"
 
-  def forward(self, parameters: torch.Tensor, initial_phase: torch.Tensor = None) -> torch.Tensor:
-    """
-    parameters: [batch, 2*n_sines, n_samples] (real/imag pairs)
-    """
-    batch_size, param_dim, n_samples = parameters.shape
-    assert param_dim == 2 * self._n_sines, "Expected 2*n_sines parameters (real/imag pairs)"
+#   def forward(self, parameters: torch.Tensor, initial_phase: torch.Tensor = None) -> torch.Tensor:
+#     """
+#     parameters: [batch, 2*n_sines, n_samples] (real/imag pairs)
+#     """
+#     batch_size, param_dim, n_samples = parameters.shape
+#     assert param_dim == 2 * self._n_sines, "Expected 2*n_sines parameters (real/imag pairs)"
 
-    # Split into real and imaginary parts
-    real = parameters[:, :self._n_sines, :]
-    imag = parameters[:, self._n_sines:, :]
-    z = torch.complex(real, imag)  # [batch, n_sines, n_samples]
+#     # Split into real and imaginary parts
+#     real = parameters[:, :self._n_sines, :]
+#     imag = parameters[:, self._n_sines:, :]
+#     z = torch.complex(real, imag)  # [batch, n_sines, n_samples]
 
-    # Streaming phase management (as before)
-    if self.streaming:
-      if (not self._phases_initialized) or (self._phases.shape[0] != batch_size or self._phases.shape[1] != self._n_sines):
-        self._phases = torch.ones(batch_size, self._n_sines, device=z.device, dtype=z.dtype)
-        self._phases_initialized = True
-      initial_phase = self._phases
+#     # Streaming phase management (as before)
+#     if self.streaming:
+#       if (not self._phases_initialized) or (self._phases.shape[0] != batch_size or self._phases.shape[1] != self._n_sines):
+#         self._phases = torch.ones(batch_size, self._n_sines, device=z.device, dtype=z.dtype)
+#         self._phases_initialized = True
+#       initial_phase = self._phases
 
-    signal = complex_oscillator(
-      z,
-      initial_phase=initial_phase,
-      N=n_samples,
-      constrain=True,
-      reduce=True
-    )  # [batch, n_sines, n_samples]
+#     signal = complex_oscillator(
+#       z,
+#       initial_phase=initial_phase,
+#       N=n_samples,
+#       constrain=True,
+#       reduce=True
+#     )  # [batch, n_sines, n_samples]
 
-    if self.streaming:
-      self._phases.copy_(signal[..., -1])
+#     if self.streaming:
+#       self._phases.copy_(signal[..., -1])
 
-    signal = signal.sum(dim=1, keepdim=True)  # [batch, 1, n_samples]
-    return signal
+#     signal = signal.sum(dim=1, keepdim=True)  # [batch, 1, n_samples]
+#     return signal
