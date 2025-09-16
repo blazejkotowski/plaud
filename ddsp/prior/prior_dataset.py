@@ -14,11 +14,14 @@ torch.set_default_dtype(torch.float32)
 from ddsp.audio_feature_dataset import AudioFeatureDataset
 from ddsp.feature_extractors import LibrosaFeatureExtractor
 
+from ddsp import DDSP
+
 class PriorDataset(Dataset):
   def __init__(self,
                audio_dataset: AudioFeatureDataset,
-               encoding_model_path: str,
                sequence_length: int,
+               encoding_model_path: str = None,
+               encoding_model: DDSP = None,
                sampling_rate: int = 44100,
                stride_factor: float = 1.0,
                device: Optional[str] = None):
@@ -31,10 +34,17 @@ class PriorDataset(Dataset):
     self._audio = self._audio_ds._audio
     self._features = self._audio_ds._features
 
-    vae = jit.load(encoding_model_path, map_location=device).pretrained.to(device)
-    vae.encoder.streaming = False
-    self._vae = vae
-    self._resampling_factor = vae._resampling_factor
+    if encoding_model is not None:
+      self._vae = encoding_model.to(device)
+      self._vae.encoder.streaming = False
+      self._resampling_factor = encoding_model._resampling_factor
+    elif encoding_model_path is not None:
+      vae = jit.load(encoding_model_path, map_location=device).pretrained.to(device)
+      vae.encoder.streaming = False
+      self._vae = vae
+      self._resampling_factor = vae._resampling_factor
+    else:
+      raise ValueError("Either encoding_model or encoding_model_path must be provided.")
 
     self._encodings, self.normalization_dict = self._build()
 
