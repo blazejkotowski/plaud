@@ -686,8 +686,8 @@ class DDSP(L.LightningModule):
     return auraloss.freq.MultiResolutionSTFTLoss(fft_sizes=[2053, 1021, 509, 257, 129, 65, 33],
                                                 hop_sizes=fft_sizes//4,
                                                 win_lengths=fft_sizes,
-                                                window='flattop_window',
-                                                mag_distance='L2',
+                                                # window='flattop_window',
+                                                # mag_distance='L2',
                                                 perceptual_weighting=True,
                                                 sample_rate=self.fs,
                                                 ).to(self._device)
