@@ -1,0 +1,88 @@
+import cached_conv as cc
+import numpy as np
+import torch
+import torch.nn as nn
+from scipy.signal import firwin, kaiserord
+
+def kaiser_filter(wc, atten, N=None):
+    """
+    Computes a kaiser lowpass filter
+    Parameters
+    ----------
+    wc: float
+        Angular frequency
+
+    atten: float
+        Attenuation (dB, positive)
+    """
+    N_, beta = kaiserord(atten, wc / np.pi)
+    N_ = 2 * (N_ // 2) + 1
+    N = N if N is not None else N_
+    h = firwin(N, wc, window=('kaiser', beta), scale=False, fs=2 * np.pi)
+    return h
+
+
+class Resampler(nn.Module):
+
+    def __init__(self, target_sr, model_sr):
+        super().__init__()
+        assert target_sr != model_sr, "identical source and target rates"
+
+        self.model_sr = model_sr
+        self.taget_sr = target_sr
+
+        ratio = int(target_sr // model_sr)
+        assert int(ratio) == ratio
+
+        # if ratio % 2 and cc.USE_BUFFER_CONV:
+        #     raise ValueError(
+        #         f"When using streaming mode, resampling ratio must be a power of 2, got {ratio}"
+        #     )
+
+        wc = np.pi / ratio
+        filt = kaiser_filter(wc, 140)
+        filt = torch.from_numpy(filt).float()
+
+        self.downsample = cc.Conv1d(
+            1,
+            1,
+            len(filt),
+            stride=ratio,
+            padding=cc.get_padding(len(filt), ratio),
+            bias=False,
+        )
+
+        self.downsample.weight.data.copy_(filt.reshape(1, 1, -1))
+
+        pad = int(len(filt) % ratio)
+
+        filt = nn.functional.pad(filt, (pad, 0))
+        filt = filt.reshape(-1, ratio).permute(1, 0)
+
+        pad = (filt.shape[-1] + 1) % 2
+        filt = nn.functional.pad(filt, (pad, 0)).unsqueeze(1)
+
+        self.upsample = cc.Conv1d(1,
+                                  ratio,
+                                  filt.shape[-1],
+                                  stride=1,
+                                  padding=cc.get_padding(filt.shape[-1]),
+                                  bias=False)
+
+        self.upsample.weight.data.copy_(filt)
+
+        self.ratio = ratio
+
+    def to_model_sampling_rate(self, x):
+        x = x.float()
+        x_down = x.reshape(-1, 1, x.shape[-1])
+        x_down = self.downsample(x_down)
+        return x_down.reshape(x.shape[0], x.shape[1], -1)
+
+    def from_model_sampling_rate(self, x):
+        x = x.float()
+        x_up = x.reshape(-1, 1, x.shape[-1])
+        x_up = self.upsample(x_up)  # B x 2 x T
+        x_up = x_up.permute(0, 2, 1).reshape(x_up.shape[0], -1).unsqueeze(1)
+        x_up = x_up.reshape(x.shape[0], x.shape[1], -1)
+        return x_up

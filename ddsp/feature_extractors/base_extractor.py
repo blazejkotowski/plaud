@@ -13,7 +13,7 @@ class BaseExtractor(object):
   Base class for feature extractors
   """
 
-  def __init__(self, resampling_factor: int):
+  def __init__(self, resampling_factor: int, *args, **kwargs):
     """
     Args:
       - resampling_factor: int, the factor to resample the extracted features
