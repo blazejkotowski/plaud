@@ -17,7 +17,7 @@ class LibrosaFeatureExtractor(BaseExtractor):
   FN_SPECTRAL_ROLLOFF = 'spectral_rolloff'
   FN_SPECTRAL_BANDWIDTH = 'spectral_bandwidth'
 
-  def __init__(self, feature_fn_name: str, postprocess: False,  *args, **kwargs):
+  def __init__(self, feature_fn_name: str, smoothing_kernel_size: int = 257, postprocess: bool = False,  *args, **kwargs):
     """
     Args:
       - feature_fn_name: str, the name of the librosa feature extraction function to use
@@ -30,6 +30,9 @@ class LibrosaFeatureExtractor(BaseExtractor):
     """
     super(LibrosaFeatureExtractor, self).__init__(*args, **kwargs)
     self._feature_fn = getattr(librosa.feature, feature_fn_name)
+    self._smoothing_kernel_size = smoothing_kernel_size
+    self._postprocess = postprocess
+
 
   def _calculate(self, audio: torch.Tensor) -> torch.Tensor:
     """
@@ -48,6 +51,10 @@ class LibrosaFeatureExtractor(BaseExtractor):
     feat = torch.tensor(feat, dtype=torch.float32)
     feat = normalize_feature(feat, low=5.0, high=95.0, dim=-1)
     feat = F.interpolate(feat.unsqueeze(0), size=audio.shape[-1], mode='linear').squeeze(0)
-    feat = smoothen_feature(feat, window_size=256+1)  # Smoothen the feature
+    if self._smoothing_kernel_size > 1:
+      print(f"Smoothing kernel size={self._smoothing_kernel_size}, applying smoothing to the feature")
+      feat = smoothen_feature(feat, window_size=self._smoothing_kernel_size)  # Smoothen the feature
+    else:
+      print("Smoothing kernel size <=1, skipping smoothing of the feature")
 
     return feat

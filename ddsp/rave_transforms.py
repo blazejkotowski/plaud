@@ -212,9 +212,15 @@ class RandomMute(Transform):
         self.prob = prob
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        mask = torch.bernoulli(torch.full((x.shape[0],), 1 - self.prob))
-        mask = np.random.binomial(1, 1-self.prob, size=1)
-        return x * mask
+        # print("RandomMute called with prob:", self.prob)
+        # mask = torch.bernoulli(torch.full((x.shape[0],), 1 - self.prob)).to(x.device)
+        # print("Generated mask:", mask)
+        if random() < self.prob:
+            return x*0
+        return x
+        
+        # mask = np.random.binomial(1, 1-self.prob, size=1)
+        # return x * mask
 
 
 class FrequencyMasking(Transform):

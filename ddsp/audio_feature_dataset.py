@@ -15,7 +15,7 @@ from typing import Callable
 
 
 class AudioFeatureDataset(Dataset):
-  def __init__(self, dataset_path: str, n_signal: int, sampling_rate: int = 44100, transform_fn: Callable = None, device: str = 'cuda'):
+  def __init__(self, dataset_path: str, n_signal: int, sampling_rate: int = 44100, smoothing_kernel_size: int = 257, transform_fn: Callable = None, device: str = 'cuda'):
     """
     Arguments:
       - dataset_path: str, the path to the dataset
@@ -29,14 +29,14 @@ class AudioFeatureDataset(Dataset):
     self._transform_fn = transform_fn
 
     self._extractors = {
-      'loudness': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_LOUDNESS, resampling_factor=1, postprocess=True),
-      'spectral_centroid': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_SPECTRAL_CENTROID, resampling_factor=1, postprocess=True),
+      'loudness': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_LOUDNESS, resampling_factor=1, smoothing_kernel_size=smoothing_kernel_size, postprocess=True),
+      'spectral_centroid': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_SPECTRAL_CENTROID, resampling_factor=1, smoothing_kernel_size=smoothing_kernel_size, postprocess=True),
       # 'spectral_flatness': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_SPECTRAL_FLATNESS, resampling_factor=1, postprocess=True),
       # 'spectral_bandwidth': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_SPECTRAL_BANDWIDTH, resampling_factor=1, postprocess=True),
     }
 
     # Create cache key based on dataset parameters
-    cache_key = self._create_cache_key(dataset_path, n_signal, sampling_rate)
+    cache_key = self._create_cache_key(dataset_path, n_signal, sampling_rate, smoothing_kernel_size)
     self._db_path = os.path.join(os.path.dirname(dataset_path), f"audio_cache_{cache_key}.lmdb")
 
     # Try to load from LMDB first
@@ -47,9 +47,9 @@ class AudioFeatureDataset(Dataset):
       print(f"Creating new cache: {self._db_path}")
       self._create_cache(dataset_path)
 
-  def _create_cache_key(self, dataset_path: str, n_signal: int, sampling_rate: int) -> str:
+  def _create_cache_key(self, dataset_path: str, n_signal: int, sampling_rate: int, smoothing_kernel_size: int) -> str:
     """Create a unique cache key based on dataset parameters."""
-    key_string = f"{dataset_path}_{n_signal}_{sampling_rate}"
+    key_string = f"{dataset_path}_{n_signal}_{sampling_rate}_{smoothing_kernel_size}"
     return hashlib.md5(key_string.encode()).hexdigest()[:8]
 
   def _create_cache(self, dataset_path: str):
