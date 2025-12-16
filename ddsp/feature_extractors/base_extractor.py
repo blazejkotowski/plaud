@@ -1,40 +1,27 @@
 import torch
-import torch.nn.functional as F
 
-_FEATURE_EXTRACTOR_REGISTRY = {}
-
-def register_feature_extractor(cls):
-  _FEATURE_EXTRACTOR_REGISTRY[cls.__name__] = cls
-
-  return cls
 
 class BaseExtractor(object):
-  """
-  Base class for feature extractors
+  """Base class for feature extractors.
+
+  Contract:
+    - __call__(audio, fs) must return audio-rate features aligned to the input
+      audio length (no internal downsampling in the output).
   """
 
-  def __init__(self, resampling_factor: int, *args, **kwargs):
+  def __init__(self, *args, **kwargs):
+    pass
+
+  def __call__(self, audio: torch.Tensor, fs: int, *args) -> torch.Tensor:
     """
     Args:
-      - resampling_factor: int, the factor to resample the extracted features
-    """
-    self._resampling_factor = resampling_factor
-
-
-  def __call__(self, audio: torch.Tensor, *args) -> torch.Tensor:
-    """
-    Args:
-      - audio: torch.Tensor[batch_size, n_samples], the input audio tensor
-      - args: Tuple, additional arguments
+      - audio: torch.Tensor [T_audio] or [B, T_audio]
+      - fs: int, sampling rate in Hz
     Returns:
-      - features: torch.Tensor[batch_size, n_samples, n_features], the extracted features
+      - features: torch.Tensor [T_audio, C] or [B, T_audio, C] (audio-rate)
     """
-    features = self._calculate(audio, *args)
-    return F.interpolate(features.unsqueeze(1), scale_factor=float(1/self._resampling_factor), mode='linear').squeeze(1)
+    return self._calculate(audio, fs, *args)
 
-
-  def _calculate(self, audio: torch.Tensor, *args) -> torch.Tensor:
-    """
-    Implementation of the feature extractor
-    """
+  def _calculate(self, audio: torch.Tensor, fs: int, *args) -> torch.Tensor:
+    """Implementation of the feature extractor at audio rate."""
     raise NotImplementedError

@@ -9,13 +9,21 @@ import hashlib
 import numpy as np
 import math
 
-from ddsp.feature_extractors import LibrosaFeatureExtractor
+from ddsp.interfaces import ControlSpace
+from ddsp.registry import FEATURE_EXTRACTORS
 
-from typing import Callable
+from typing import Callable, List
 
 
 class AudioFeatureDataset(Dataset):
-  def __init__(self, dataset_path: str, n_signal: int, sampling_rate: int = 44100, smoothing_kernel_size: int = 257, transform_fn: Callable = None, device: str = 'cuda'):
+  def __init__(self,
+               dataset_path: str,
+               n_signal: int,
+               sampling_rate: int,
+               resampling_factor: int,
+               control_space: ControlSpace,
+               transform_fn: Callable = None,
+               device: str = 'cuda'):
     """
     Arguments:
       - dataset_path: str, the path to the dataset
@@ -26,17 +34,21 @@ class AudioFeatureDataset(Dataset):
     self._device = device
     self._n_signal = n_signal
     self._sampling_rate = sampling_rate
+    self._resampling_factor = resampling_factor
     self._transform_fn = transform_fn
+    self._control_space = control_space
 
-    self._extractors = {
-      'loudness': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_LOUDNESS, resampling_factor=1, smoothing_kernel_size=smoothing_kernel_size, postprocess=True),
-      'spectral_centroid': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_SPECTRAL_CENTROID, resampling_factor=1, smoothing_kernel_size=smoothing_kernel_size, postprocess=True),
-      # 'spectral_flatness': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_SPECTRAL_FLATNESS, resampling_factor=1, postprocess=True),
-      # 'spectral_bandwidth': LibrosaFeatureExtractor(LibrosaFeatureExtractor.FN_SPECTRAL_BANDWIDTH, resampling_factor=1, postprocess=True),
-    }
+    # Build feature extractors from control space (feature fields only)
+    self._extractor_specs: List[tuple[str, object]] = []
+    for field in self._control_space.fields:
+      if field.source == 'feature':
+        if not field.extractor:
+          raise ValueError(f"ControlField '{field.name}' requires 'extractor' for source='feature'")
+        extractor = FEATURE_EXTRACTORS.create(field.extractor, **(field.params or {}))
+        self._extractor_specs.append((field.name, extractor))
 
     # Create cache key based on dataset parameters
-    cache_key = self._create_cache_key(dataset_path, n_signal, sampling_rate, smoothing_kernel_size)
+    cache_key = self._create_cache_key(dataset_path, n_signal, sampling_rate, resampling_factor, control_space)
     self._db_path = os.path.join(os.path.dirname(dataset_path), f"audio_cache_{cache_key}.lmdb")
 
     # Try to load from LMDB first
@@ -47,9 +59,10 @@ class AudioFeatureDataset(Dataset):
       print(f"Creating new cache: {self._db_path}")
       self._create_cache(dataset_path)
 
-  def _create_cache_key(self, dataset_path: str, n_signal: int, sampling_rate: int, smoothing_kernel_size: int) -> str:
-    """Create a unique cache key based on dataset parameters."""
-    key_string = f"{dataset_path}_{n_signal}_{sampling_rate}_{smoothing_kernel_size}"
+  def _create_cache_key(self, dataset_path: str, n_signal: int, sampling_rate: int, resampling_factor: int, control_space: ControlSpace) -> str:
+    """Create a unique cache key based on dataset parameters and control space."""
+    field_sig = ";".join([f"{f.name}:{f.source}:{f.dim}:{f.extractor}:{sorted((f.params or {}).items())}" for f in control_space.fields])
+    key_string = f"{dataset_path}_{n_signal}_{sampling_rate}_{resampling_factor}_{field_sig}"
     return hashlib.md5(key_string.encode()).hexdigest()[:8]
 
   def _create_cache(self, dataset_path: str):
@@ -89,7 +102,7 @@ class AudioFeatureDataset(Dataset):
     """
     chunk_samps = 10_000_000
     N = int(self._audio.shape[0])
-    F = int(self._features.shape[-1])  # expect 4
+    F = int(self._features.shape[-1])
 
     env = lmdb.open(
       self._db_path,
@@ -108,6 +121,7 @@ class AudioFeatureDataset(Dataset):
         "dataset_length": self._dataset_length,
         "n_signal": self._n_signal,
         "sampling_rate": self._sampling_rate,
+        "resampling_factor": self._resampling_factor,
         "total_samps": N,
         "feat_dim": F,
         "chunk_samps": chunk_samps,
@@ -151,7 +165,7 @@ class AudioFeatureDataset(Dataset):
       meta = pickle.loads(txn.get(b"metadata"))
       self._dataset_length = int(meta["dataset_length"])
       N = int(meta.get("total_samps", 0)) or (self._dataset_length * self._n_signal)
-      F = int(meta.get("feat_dim", 4))
+      F = int(meta.get("feat_dim", 0))
       cs = int(meta["chunk_samps"])
       dtype = np.float32
 
@@ -209,7 +223,19 @@ class AudioFeatureDataset(Dataset):
 
     audio, features = self.get_datapoint(idx)
 
-    return audio, features
+    # Downsample features once to control sequence length
+    # features: [T_audio, D_feat]
+    T_audio = features.shape[0]
+    T_ctl = math.ceil(T_audio / self._resampling_factor)
+    # interpolate along time to T_ctl using torch
+    feat_ds = torch.nn.functional.interpolate(
+      features.T.unsqueeze(0),  # [1, D_feat, T_audio]
+      size=T_ctl,
+      mode='linear',
+      align_corners=False,
+    ).squeeze(0).T  # [T_ctl, D_feat]
+
+    return audio, feat_ds
 
 
   def _load_dataset(self, path: str) -> torch.Tensor:
@@ -241,11 +267,13 @@ class AudioFeatureDataset(Dataset):
     Extract features from the audio dataset.
     This is a placeholder function, as the actual feature extraction logic is not provided.
     """
-    # process audio in chunks
-    features = []
-    for extractor in self._extractors.values():
-      feat = extractor(self._audio)
-      features.append(feat)
+    # Compute audio-rate features for the full concatenated audio
+    feats = []
+    for name, extractor in self._extractor_specs:
+      feat = extractor(self._audio, self._sampling_rate)  # [N, C] at audio rate
+      if feat.ndim == 1:
+        feat = feat.unsqueeze(-1)
+      feats.append(feat)
 
-    features = torch.stack(features, dim=-1).squeeze(0)  # Stack features along the last dimension
+    features = torch.cat(feats, dim=-1)  # [N, D_feat]
     return features
