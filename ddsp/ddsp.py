@@ -13,6 +13,7 @@ from sklearn.decomposition import PCA
 from typing import List, Tuple, Dict, Any
 
 from ddsp.losses import MultiScaleSlicedWassersteinLoss
+from ddsp.interfaces import ControlSpace
 
 
 class DDSP(L.LightningModule):
@@ -21,29 +22,26 @@ class DDSP(L.LightningModule):
   precalculated, loopable noise bands.
 
   Arguments:
-    - synth_builders: List[Callable[[], BaseSynth]], the differentiable synthesiser builders
-    - latent_size: int, number of latent dimensions
+    - control_space: ControlSpace (required), explicit control definition
+    - synth_configs: List[Dict], differentiable synthesiser configs (BaseSynth.from_config)
     - fs : int, the sampling rate of the input signal
-    - encoder_ratios: List[int], the capacity ratios for encoder layers
-    - latent_smoothing_kernel: int, the kernel size for the smoothing filter [TODO: make it optional]
-    - num_params: int, the number of parameters to predict [TODO: make it optional]
-    - n_features: int, the number of control features in the dataset
-    - n_melbands: int, the number of melbands to extract
-    - decoder_ratios: List[int], the capacity ratios for decoder layers
-    - capacity: int, the capacity of the model
-    - resampling_factor: int, internal up / down sampling factor for control signal and noisebands
-    - learning_rate: float, the learning rate for the optimizer
-    - streaming: bool, whether to run the model in streaming mode
-    - perceptual_loss_weight: float, the weight for the perceptual loss [TODO: make it optional]
-    - plateau_patience: int, the patience for the learning rate scheduler
-    - adversarial_loss: bool, whether to use adversarial loss
-    - device: str, the device to run the model on
+    - resampling_factor: int, internal up/down sampling factor for controls/synths
+    - encoder_ratios: List[int], capacity ratios for encoder layers
+    - decoder_ratios: List[int], capacity ratios for decoder layers
+    - latent_smoothing_kernel: int, smoothing kernel for latents
+    - n_melbands: int, mel bands for audio encoder
+    - decoder_gru_layers: int, GRU layers in decoder
+    - capacity: int, base capacity multiplier
+    - learning_rate: float, optimizer LR
+    - streaming: bool, streaming mode
+    - perceptual_loss_weight: float, weight for perceptual terms
+    - plateau_patience: int, LR scheduler patience
+    - adversarial_loss: bool, enable adversarial training
+    - device: str, device
   """
   def __init__(self,
+               control_space: ControlSpace,
                synth_configs: List[Dict[Any, Any]] = [],
-               latent_size: int = 4,
-               num_params: int = 4,
-               n_features: int = 4,
                fs: int = 44100,
                encoder_ratios: List[int] = [8, 4, 2],
                latent_smoothing_kernel: int = 1,
@@ -56,7 +54,13 @@ class DDSP(L.LightningModule):
                perceptual_loss_weight: float = 0.0,
                streaming: bool = False,
                plateau_patience: int = 20,
-               adversarial_loss: bool = True,
+                adversarial_loss: bool = True,
+                # adversarial schedule and weights
+                adv_g_start_epoch: int = 100,
+                adv_d_start_epoch: int = 150,
+                adv_gen_weight: float = 1.0,
+                adv_disc_weight: float = 1.0,
+                adv_fm_weight: float = 1.0,
                device: str = 'cuda'):
     super().__init__()
     # Turn of autoamtic optimization
@@ -68,12 +72,21 @@ class DDSP(L.LightningModule):
     self._device = device
     self._plateau_patience = plateau_patience
     self.fs = fs
-    self.latent_size = latent_size
-    self.num_params = num_params
-    self.n_features = n_features
+    # Control space is the single source of dims
+    self.control_space = control_space
+    self.latent_size = self.control_space.latent_dim
+    self.feature_dim = self.control_space.feature_dim
+    # For PCA utilities; keep num_params aligned to latent_size by default
+    self.num_params = self.latent_size
     self.resampling_factor = resampling_factor
     self._latent_smoothing_kernel = latent_smoothing_kernel
     self._adversarial_loss = adversarial_loss
+    # Adversarial config
+    self._adv_g_start_epoch = int(adv_g_start_epoch)
+    self._adv_d_start_epoch = int(adv_d_start_epoch)
+    self._adv_gen_weight = float(adv_gen_weight)
+    self._adv_disc_weight = float(adv_disc_weight)
+    self._adv_fm_weight = float(adv_fm_weight)
 
     # self.synths = synths
     # self.synths = torch.nn.ModuleList([builder() for builder in self._synth_builders])
@@ -89,6 +102,10 @@ class DDSP(L.LightningModule):
     self.register_buffer('_latent_quantiles', torch.zeros(2, self.latent_size))
 
     self._total_synth_params = sum([s.n_params for s in self.synths])
+    # Sanity checks on dims
+    assert isinstance(self.feature_dim, int) and self.feature_dim >= 0, "feature_dim must be >= 0"
+    assert isinstance(self.latent_size, int) and self.latent_size >= 0, "latent_dim must be >= 0"
+    assert self._total_synth_params > 0, "Total synth param size must be > 0"
     # self.register_buffer('_total_synth_params', torch.tensor(total_params, dtype=torch.long))
     # self._total_synth_params = sum([s.n_params for s in self.synths])
     # total_synth_params = 1000
@@ -100,20 +117,23 @@ class DDSP(L.LightningModule):
 
     # Define the neural network
     ## Encoder to extract latents from the input audio signal
-    self.encoder = VariationalEncoder(
-      layer_sizes=(np.array(encoder_ratios)*capacity).tolist(),
-      sample_rate=fs,
-      latent_size=latent_size,
-      streaming=streaming,
-      n_melbands=n_melbands,
-      resampling_factor=self.resampling_factor,
-    )
+    # Encoder maps audio -> latents if latent space is requested
+    self.encoder = None
+    if self.latent_size > 0:
+      self.encoder = VariationalEncoder(
+        layer_sizes=(np.array(encoder_ratios)*capacity).tolist(),
+        sample_rate=fs,
+        latent_size=self.latent_size,
+        streaming=streaming,
+        n_melbands=n_melbands,
+        resampling_factor=self.resampling_factor,
+      )
 
     ## Decoder to predict the amplitudes of the noise bands
     self.decoder = Decoder(
       n_params=self._total_synth_params,
-      latent_size=latent_size,
-      n_features=n_features,
+      latent_size=max(self.latent_size, 1),
+      n_features=max(self.feature_dim, 1),
       layer_sizes=(np.array(decoder_ratios)*capacity).tolist(),
       gru_layers=decoder_gru_layers,
       streaming=streaming,
@@ -335,20 +355,25 @@ class DDSP(L.LightningModule):
     Returns:
       - signal: torch.Tensor, the synthesized signal
     """
-    mu, scale = self.encoder(audio)
+    z = None
+    if self.encoder is not None:
+      mu, scale = self.encoder(audio)
+      z, _ = self.encoder.reparametrize(mu, scale)
+      z = self._smooth_latents(z)
 
-    # Reparametrization trick
-    z, _ = self.encoder.reparametrize(mu, scale)
-
-    # smooth the latent envelopes
-    z = self._smooth_latents(z)
-
-    features = F.interpolate(
-      features.permute(0, 2, 1), scale_factor=1/self.resampling_factor, mode='linear'
-    ).permute(0, 2, 1)
-
+    # features already at control rate [B, T_ctl, D_feat]
     # Predict the parameters of the synthesiser and synthesize
-    synth_params = self.decoder(features, z)
+    # Features must be control-rate sequences [B, T_ctl, D_feat]
+    assert features.dim() == 3, "features must be [B, T_ctl, D_feat]"
+    assert features.shape[-1] == self.feature_dim, "features last dim must equal feature_dim from ControlSpace"
+    # Prepare dummy features for decoder pathway when feature_dim==0 (JIT-stable interface)
+    features_for_decoder = features if self.feature_dim > 0 else torch.zeros(features.shape[0], features.shape[1], 1, device=features.device, dtype=features.dtype)
+    if z is None:
+      # Provide zero latents when latent space is disabled (keeps decoder interface stable for JIT)
+      z = torch.zeros(features.shape[0], features.shape[1], max(self.latent_size, 1), device=features.device, dtype=features.dtype)
+    synth_params = self.decoder(features_for_decoder, z)
+    # Decoder outputs [B, n_params, T_ctl]; synthesize to audio-rate
+    assert synth_params.shape[1] == self._total_synth_params, "decoder param size mismatch"
     signal = self._synthesize(synth_params)
     return signal
 
@@ -388,7 +413,7 @@ class DDSP(L.LightningModule):
     # -------------------------
     # 1) Discriminator update
     # -------------------------
-    if self._adversarial_loss and self.current_epoch >= 150:
+    if self._adversarial_loss and self.current_epoch >= self._adv_d_start_epoch:
       self.toggle_optimizer(opt_disc)
 
       # D(real) and D(fake.detach()) with grads ONLY for D
@@ -404,7 +429,7 @@ class DDSP(L.LightningModule):
         ld = ld + F.relu(1 + out[-1]).mean() # for a good disceriminator, D(fake) should be negative, so the loss part here should be small
       for out in pred_real:
         ld = ld + F.relu(1 - out[-1]).mean() # for a good disceriminator, D(real) should be positive, so the loss part here should be small
-      adv_d = ld # the minimum of ld should be 0, the maximum is unbounded
+      adv_d = ld * self._adv_disc_weight
 
       if batch_idx % 5 == 0:
         opt_disc.zero_grad(set_to_none=True)
@@ -424,7 +449,7 @@ class DDSP(L.LightningModule):
     recons_loss = self._reconstruction_loss(y_audio.float(), x_audio.float())
     ddsp_loss = recons_loss + self._beta * kld_loss  # adv term added below if enabled
 
-    if self._adversarial_loss and self.current_epoch >= 100:
+    if self._adversarial_loss and self.current_epoch >= self._adv_g_start_epoch:
       self.toggle_optimizer(opt_ddsp)                 # freezes D params for this block
 
       pred_real = self._discriminator(x_audio.float())
@@ -446,9 +471,8 @@ class DDSP(L.LightningModule):
         for j in range(len(pred_fake[i]) - 1):
           loss_feat = loss_feat + wt * F.l1_loss(pred_fake[i][j], pred_real[i][j].detach())
 
-      l_adv = 1e-1
-      adv_g = adv_g + self._disc_feature_weight * loss_feat
-      adv_g *= l_adv # weighting
+      # Weighting
+      adv_g = self._adv_gen_weight * adv_g + (self._adv_fm_weight * loss_feat)
 
       ddsp_loss = ddsp_loss + adv_g
 
@@ -562,20 +586,21 @@ class DDSP(L.LightningModule):
       - y_audio: torch.Tensor[batch_size, n_signal], the autoencoded audio signal
       - kld: torch.Tensor[], the KL divergence of the latent distribution
     """
-    # Encode the audio signal
-    mu, scale = self.encoder(x_audio)
+    # Encode the audio signal if latent space is used
+    kld = torch.tensor(0.0, device=x_audio.device)
+    if self.encoder is not None:
+      mu, scale = self.encoder(x_audio)
+      z, kld = self.encoder.reparametrize(mu, scale)
+      z = self._smooth_latents(z)
+    else:
+      # supply zeros latents for decoder interface (keeps JIT-friendly shapes)
+      z = torch.zeros(x_features.shape[0], x_features.shape[1], max(self.latent_size, 1), device=x_features.device, dtype=x_features.dtype)
 
-    # Reparametrization trick
-    z, kld = self.encoder.reparametrize(mu, scale)
-
-    # smooth the latent envelopes
-    z = self._smooth_latents(z)
-
-    # Downsample the features
-    x_features = F.interpolate(x_features.permute(0, 2, 1), scale_factor=1/self.resampling_factor, mode='linear').permute(0, 2, 1)
-
-    # Predict the parameters of the synthesiser
-    synth_params = self.decoder(x_features, z)
+    # Features are already at control rate; verify shape
+    assert x_features.dim() == 3 and x_features.shape[-1] == self.feature_dim, "x_features must be [B, T_ctl, feature_dim]"
+    # When feature_dim==0, create a dummy single-channel zero feature for decoder path
+    x_features_for_decoder = x_features if self.feature_dim > 0 else torch.zeros(x_features.shape[0], x_features.shape[1], 1, device=x_features.device, dtype=x_features.dtype)
+    synth_params = self.decoder(x_features_for_decoder, z)
 
     # Synthesize the output signal
     y_audio = self._synthesize(synth_params)
@@ -621,7 +646,19 @@ class DDSP(L.LightningModule):
     for synth in self.synths:
       synth_params = params[:, params_idx:params_idx+synth.n_params, :]
       params_idx += synth.n_params
-      audio.append(synth(synth_params, limit_components=limit_components, waveshaping_factor=waveshaping_factor))
+      # Explicit per-synth routing without introspection
+      try:
+        name = synth.jit_name if hasattr(synth, 'jit_name') else synth.__class__.__name__
+      except Exception:
+        name = synth.__class__.__name__
+
+      if name in ("NoiseBandSynth", "SubbandSineSynth", "BendableNoiseBandSynth"):
+        audio.append(synth(synth_params, limit_components=limit_components, waveshaping_factor=waveshaping_factor))
+      elif name in ("SineSynth",):
+        audio.append(synth(synth_params, limit_components=limit_components))
+      else:
+        # Default call with parameters only
+        audio.append(synth(synth_params))
 
     return torch.sum(torch.hstack(audio), dim=1, keepdim=True)
 

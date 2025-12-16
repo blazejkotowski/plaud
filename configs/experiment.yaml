@@ -1,0 +1,66 @@
+# Top-level experiment configuration (Hydra)
+
+experiment:
+  name: ddsp_experiment
+  training_dir: training
+
+audio:
+  fs: 22050
+  resampling_factor: 32
+  chunk_duration_s: 2.0
+
+data:
+  dataset_path: /path/to/dataset
+  control_space:
+    - name: loudness
+      dim: 1
+      source: feature
+      extractor: LibrosaFeatureExtractor
+      params:
+        feature_fn_name: rms
+        smoothing_kernel_size: 65
+        postprocess: true
+    - name: centroid
+      dim: 1
+      source: feature
+      extractor: LibrosaFeatureExtractor
+      params:
+        feature_fn_name: spectral_centroid
+        smoothing_kernel_size: 65
+        postprocess: true
+    # Uncomment to add latent dims
+    # - name: latents
+    #   dim: 16
+    #   source: latent
+
+model:
+  synths:
+    - type: BendableNoiseBandSynth
+      params:
+        n_filters: 512
+        fs: ${audio.fs}
+        resampling_factor: ${audio.resampling_factor}
+  latent_smoothing_kernel: 65
+  decoder_gru_layers: 2
+  learning_rate: 1e-4
+  plateau_patience: 100000
+  capacity: 32
+  # beta: 0.001  # optional beta warmup target
+
+losses: []
+
+adversarial:
+  enabled: true
+  weights:
+    gen: 1.0
+    disc: 1.0
+    fm: 1.0
+  schedule:
+    g_start_epoch: 100
+    d_start_epoch: 150
+
+trainer:
+  batch_size: 8
+  max_epochs: 5001
+  log_every_n_steps: 10
+  force_restart: false
