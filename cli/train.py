@@ -8,48 +8,133 @@ torch.set_float32_matmul_precision('medium')
 torch.set_default_tensor_type('torch.cuda.FloatTensor')
 torch.set_default_device('cuda')
 
-import argparse
 import os
+import shutil
+from typing import List
 
 from torch.utils.data import DataLoader, Subset, random_split
 from ddsp import DDSP, AudioFeatureDataset
 from ddsp.synths import BendableNoiseBandSynth
 from ddsp.callbacks import BetaWarmupCallback
+from ddsp.interfaces import ControlField, ControlSpace
+from ddsp.registry import SYNTHS
 
 from ddsp.prior import Prior, PriorDataset
-import shutil
-
 from ddsp.utils import find_checkpoint
 
+import hydra
+from omegaconf import DictConfig
+
+
+def _build_control_space(cfg) -> ControlSpace:
+  fields: List[ControlField] = []
+  for f in cfg:
+    fields.append(ControlField(
+      name=f.name,
+      dim=int(f.dim),
+      source=str(f.source),
+      extractor=str(f.extractor) if 'extractor' in f else None,
+      params=dict(f.params) if 'params' in f else {},
+      normalization=dict(f.normalization) if 'normalization' in f else None,
+    ))
+  return ControlSpace(tuple(fields))
+
+
+@hydra.main(version_base=None, config_path="../configs", config_name="experiment")
+def main(cfg: DictConfig) -> None:
+  # Shared audio params
+  fs = int(cfg.audio.fs)
+  resampling_factor = int(cfg.audio.resampling_factor)
+  chunk_duration_s = float(cfg.audio.chunk_duration_s)
+  n_signal = int(fs * chunk_duration_s)
+
+  # Paths
+  dataset_path = cfg.data.dataset_path
+  model_name = cfg.experiment.name
+  training_dir = cfg.experiment.training_dir
+  synth_training_path = os.path.join(training_dir, 'synth', model_name)
+  os.makedirs(synth_training_path, exist_ok=True)
+
+  # Control space
+  control_space = _build_control_space(cfg.data.control_space)
+
+  # Dataset
+  synth_dataset = AudioFeatureDataset(
+    dataset_path=dataset_path,
+    n_signal=n_signal,
+    sampling_rate=fs,
+    resampling_factor=resampling_factor,
+    control_space=control_space,
+  )
+
+  # Dataloaders
+  batch_size = int(cfg.trainer.batch_size)
+  generator = torch.Generator(device='cuda')
+  synth_total_len = len(synth_dataset)
+  synth_val_len = int(0.2 * synth_total_len)
+  synth_indices = torch.randperm(synth_total_len, generator=generator)
+  synth_val_indices = synth_indices[:synth_val_len]
+  train_indices = synth_indices
+  train_loader = DataLoader(Subset(synth_dataset, train_indices), batch_size=batch_size, shuffle=True, num_workers=0, generator=generator)
+  val_loader = DataLoader(Subset(synth_dataset, synth_val_indices), batch_size=batch_size, shuffle=False, num_workers=0, generator=generator)
+
+  # Synths from config
+  synth_configs = []
+  for s in cfg.model.synths:
+    synth_configs.append({"class": s.type, "params": dict(s.params)})
+
+  # Core model
+  ddsp = DDSP(
+    control_space=control_space,
+    synth_configs=synth_configs,
+    fs=fs,
+    resampling_factor=resampling_factor,
+    latent_smoothing_kernel=int(cfg.model.latent_smoothing_kernel),
+    decoder_gru_layers=int(cfg.model.decoder_gru_layers),
+    learning_rate=float(cfg.model.learning_rate),
+    perceptual_loss_weight=float(getattr(cfg.model, 'perceptual_loss_weight', 0.0)),
+    plateau_patience=int(cfg.model.plateau_patience),
+    capacity=int(cfg.model.capacity),
+    adversarial_loss=bool(cfg.adversarial.enabled),
+    adv_g_start_epoch=int(cfg.adversarial.schedule.g_start_epoch),
+    adv_d_start_epoch=int(cfg.adversarial.schedule.d_start_epoch),
+    adv_gen_weight=float(cfg.adversarial.weights.gen),
+    adv_disc_weight=float(cfg.adversarial.weights.disc),
+    adv_fm_weight=float(cfg.adversarial.weights.fm),
+  )
+
+  # Tensorboard
+  tb_logger = TensorBoardLogger(synth_training_path, name=model_name)
+
+  # Callbacks
+  callbacks = []
+  if 'beta' in cfg.model:
+    callbacks.append(BetaWarmupCallback(beta=float(cfg.model.beta), start_steps=50, end_steps=100))
+
+  callbacks.append(ModelCheckpoint(dirpath=synth_training_path, filename='best', monitor='val_loss', mode='min', save_top_k=1, save_last=True))
+
+  # Trainer
+  synth_trainer = L.Trainer(
+    callbacks=callbacks,
+    max_epochs=int(cfg.trainer.max_epochs),
+    log_every_n_steps=int(cfg.trainer.log_every_n_steps),
+    logger=tb_logger,
+  )
+
+  # Resume checkpoint
+  synth_ckpt_path = find_checkpoint(synth_training_path, return_none=True, typ='last') if not bool(cfg.trainer.force_restart) else None
+  if cfg.trainer.force_restart:
+    print("Force restart set to True")
+  elif synth_ckpt_path is not None:
+    print(f"Resuming from checkpoint: {synth_ckpt_path}")
+
+  # Train
+  synth_trainer.fit(model=ddsp, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=synth_ckpt_path)
+  print(f"Synthesizer training completed. Your checkpoints are in {synth_training_path}")
+
+
 if __name__ == '__main__':
-  parser = argparse.ArgumentParser()
-  parser.add_argument('--dataset_path', help='Directory of the training sound/sounds')
-  parser.add_argument('--model_name', type=str, help='Name of the model')
-  parser.add_argument('--training_dir', type=str, default='training', help='Directory to save the training logs')
-  parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
-  parser.add_argument('--n_bands', type=int, default=512, help='Number of bands of the filter bank')
-  parser.add_argument('--model_fs', type=int, default=22050, help='Sampling rate of the model')
-  parser.add_argument('--output_fs', type=int, default=44100, help='Sampling rate of the model')
-  parser.add_argument('--resampling_factor', type=int, default=32, help='Synth resampling factor')
-  parser.add_argument('--latent_size', type=int, default=2, help='Dimensionality of the latent space')
-  parser.add_argument('--smoothing_kernel_size', type=int, default=65, help='Size of the smoothing kernel for the latent space')
-  parser.add_argument('--gru_layers', type=int, default=2, help='Number of GRU layers in the decoder')
-  parser.add_argument('--synth_learning_rate', type=float, default=1e-4, help='Synthesiser learning rate')
-  parser.add_argument('--plateau_patience_steps', type=int, default=100000, help='Number of steps with no improvement after which learning rate will be reduced')
-  parser.add_argument('--synth_capacity', type=int, default=16, help='Capacity of the model')
-  parser.add_argument('--synth_max_epochs', type=int, default=500, help='Maximum number of epochs to train synthesiser')
-  parser.add_argument('--beta', type=float, default=0.001, help='Beta parameter for the beta-VAE loss')
-  parser.add_argument('--synth_force_restart', type=bool, default=False, help='Force restart the training. Ignore the existing checkpoint.')
-  parser.add_argument('--adversarial_loss', type=bool, default=True, help='Use adversarial loss')
-  parser.add_argument('--mixed_precision', type=bool, default=True, help='Use mixed precision training')
-  parser.add_argument('--train_prior', type=bool, default=False, help='Train prior model')
-  parser.add_argument('--prior_learning_rate', type=float, default=1e-4, help='Prior learning rate')
-  parser.add_argument('--prior_capacity', type=int, default=4, help='Capacity of the prior model')
-  parser.add_argument('--prior_max_epochs', type=int, default=1000, help='Maximum number of epochs to train prior')
-  parser.add_argument('--prior_dataset_stride_factor', type=float, default=0.2, help='Stride factor for the prior dataset')
-  parser.add_argument('--prior_force_restart', type=bool, default=False, help='Force restart the prior training. Ignore the existing checkpoint.')
-  # parser.add_argument('--warmup_cycle', type=int, default=50, help='Number of epochs for a full beta cycle')
-  config = parser.parse_args()
+  main()
 
   #### SYNTHESIZER TRAINING ###
   print("Training synthesizer...")
