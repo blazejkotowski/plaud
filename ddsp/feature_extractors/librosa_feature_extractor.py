@@ -2,10 +2,9 @@ import torch
 import librosa
 import torch.nn.functional as F
 
-from .base_extractor import BaseExtractor, register_feature_extractor
+from .base_extractor import BaseExtractor
 from .utils import normalize_feature, smoothen_feature
 
-@register_feature_extractor
 class LibrosaFeatureExtractor(BaseExtractor):
   """
   Extracts the loudness from an audio signal
@@ -34,27 +33,40 @@ class LibrosaFeatureExtractor(BaseExtractor):
     self._postprocess = postprocess
 
 
-  def _calculate(self, audio: torch.Tensor) -> torch.Tensor:
+  def _calculate(self, audio: torch.Tensor, fs: int) -> torch.Tensor:
     """
     Implementation of the loudness extractor with librosa. Extracts the loudness
     and returns and interpolated tensor with values for each audio sample.
 
     Args:
-      - audio: torch.Tensor[batch_size, n_samples], the input audio tensor
+      - audio: torch.Tensor [T_audio] or [B, T_audio], the input audio tensor
+      - fs: int, sampling rate in Hz
     Returns:
-      - loudness: torch.Tensor[batch_size, n_samples, 1], the extracted loudness
+      - features: torch.Tensor [T_audio, C] or [B, T_audio, C], the extracted features at audio rate
     """
-    # Processes the batch of audio parallely
-    feat = self._feature_fn(y=audio.cpu().numpy(), center=False).squeeze(-2)
-    if feat.ndim == 1:
-      feat = feat[None, :]
-    feat = torch.tensor(feat, dtype=torch.float32)
-    feat = normalize_feature(feat, low=5.0, high=95.0, dim=-1)
-    feat = F.interpolate(feat.unsqueeze(0), size=audio.shape[-1], mode='linear').squeeze(0)
-    if self._smoothing_kernel_size > 1:
-      print(f"Smoothing kernel size={self._smoothing_kernel_size}, applying smoothing to the feature")
-      feat = smoothen_feature(feat, window_size=self._smoothing_kernel_size)  # Smoothen the feature
-    else:
-      print("Smoothing kernel size <=1, skipping smoothing of the feature")
+    x = audio
+    squeeze_back = False
+    if x.ndim == 1:
+      x = x.unsqueeze(0)  # [1, T]
+      squeeze_back = True
 
-    return feat
+    feats = []
+    for i in range(x.shape[0]):
+      xi = x[i].detach().cpu().numpy()
+      fi = self._feature_fn(y=xi, sr=fs, center=False)
+      # fi shape usually [C, frames] or [1, frames]
+      fi = torch.tensor(fi, dtype=torch.float32)
+      if fi.ndim == 1:
+        fi = fi.unsqueeze(0)  # [1, frames]
+      # interpolate to audio length along time
+      fi = F.interpolate(fi.unsqueeze(0), size=x.shape[-1], mode='linear', align_corners=False).squeeze(0)  # [C, T]
+      # postprocess per-channel
+      fi = normalize_feature(fi, low=5.0, high=95.0, dim=-1)
+      if self._smoothing_kernel_size > 1:
+        fi = smoothen_feature(fi, window_size=self._smoothing_kernel_size)
+      feats.append(fi.transpose(0, 1))  # [T, C]
+
+    feat_batch = torch.stack(feats, dim=0)  # [B, T, C]
+    if squeeze_back:
+      feat_batch = feat_batch.squeeze(0)  # [T, C]
+    return feat_batch
