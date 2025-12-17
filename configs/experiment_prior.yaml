@@ -1,0 +1,28 @@
+seed: 42
+
+prior:
+  latent_size: 8
+  embedding_dim: 32
+  quantization_channels: 32
+  nhead: 8
+  num_layers: 4
+  dropout: 0.1
+  max_len: 256
+  lr: 1e-3
+
+# Optional normalization for latent values; if omitted, model clamps to [-1,1]
+# normalization:
+#   min: -1.0
+#   max: 1.0
+
+dataset:
+  # Provide HDF5 with dataset "latents" or use synthetic data
+  hdf5_path: null
+  num_sequences: 256
+  seq_len: 256
+  latent_size: 8
+
+training:
+  batch_size: 32
+  num_workers: 4
+  max_epochs: 2

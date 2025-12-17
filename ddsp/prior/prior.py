@@ -69,7 +69,7 @@ class Prior(L.LightningModule):
     self._fc = nn.Linear(self._d_model, latent_size * self._quantization_channels)
 
     # Cross-entropy loss
-    self._loss = nn.CrossEntropyLoss(reduce=False)
+    self._loss = nn.CrossEntropyLoss(reduction='none')
 
 
   def normalize(self, x: torch.Tensor) -> torch.Tensor:
@@ -81,8 +81,12 @@ class Prior(L.LightningModule):
     Returns:
       - x: torch.Tensor[batch_size, seq_len, latent_size], the normalized latent codes
     """
+    # If no normalization dict provided, assume inputs are already in [-1, 1]
+    if self._normalization_dict is None:
+      return x.clamp(-1.0, 1.0)
+
     min_x, max_x = self._normalization_dict['min'], self._normalization_dict['max']
-    x.clip_(min_x, max_x)
+    x = x.clamp(min_x, max_x)
     return -1 + 2 * (x - min_x) / (max_x - min_x)
     # return (x - self._normalization_dict['mean']) / self._normalization_dict['var']
 
@@ -96,6 +100,10 @@ class Prior(L.LightningModule):
     Returns:
       - x: torch.Tensor[batch_size, seq_len, latent_size], the denormalized latent codes
     """
+    # If no normalization dict provided, inputs are assumed in [-1, 1]
+    if self._normalization_dict is None:
+      return x.clamp(-1.0, 1.0)
+
     min_x, max_x = self._normalization_dict['min'], self._normalization_dict['max']
     return ((x + 1) / 2) * (max_x - min_x) + min_x
     # return x * self._normalizatisleon_dict['var'] + self._normalization_dict['mean']
@@ -139,7 +147,7 @@ class Prior(L.LightningModule):
     """
     prime_len = prime.size(0)
     # self.eval()
-    output_seq = torch.full((seq_len, self._latent_size), fill_value=0, device=self.device, dtype=torch.float32)
+    output_seq = torch.full((seq_len, self._latent_size), fill_value=0, device=self._device, dtype=torch.float32)
 
     output_seq[:prime.shape[0], :] = prime.clone()
     x = prime.clone().unsqueeze(0)
@@ -237,7 +245,7 @@ class Prior(L.LightningModule):
 
     scheduler = {
       'scheduler': lr_scheduler,
-      'monitor': 'val_loss',
+      'monitor': 'loss',
       'interval': 'epoch'
     }
 
@@ -266,7 +274,11 @@ class Prior(L.LightningModule):
     mse = mse_loss(y_hat, y, reduction='none').nanmean()
 
     # Calculate cross-entropy loss
-    ce_loss = cross_entropy(logits.permute(0, 3, 1, 2).view(batch_size, self._quantization_channels, -1), y_discrete.view(batch_size, -1), reduce=False).nanmean()
+    ce_loss = cross_entropy(
+      logits.permute(0, 3, 1, 2).view(batch_size, self._quantization_channels, -1),
+      y_discrete.view(batch_size, -1),
+      reduction='none'
+    ).nanmean()
 
     loss = {
       'mse': mse,
