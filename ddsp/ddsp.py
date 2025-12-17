@@ -139,24 +139,26 @@ class DDSP(L.LightningModule):
       streaming=streaming,
     )
 
-    # Define the loss
-    self._mr_stft_loss = self._construct_mrstft_loss() # MRSTFT loss
-    # self._mr_mel_loss = self._construct_mel_loss() # MEL-scale loss
-    # self._mr_chroma_loss = self._construct_chroma_loss() # CHROMA-scale loss
-
-    # Wasserstein loss
-    windows = [torch.hann_window(win_len, periodic=True) for win_len in [2048, 1024, 512, 256, 128]]
-    self._sliced_wasserstein_loss = MultiScaleSlicedWassersteinLoss(
-      windows=windows,
-      sampling_rate=self.fs,
-      n_projections=10,
-      p=2,
-      magnitude='pow',
-    )
-    # Perceptual loss
-    # self._m2l_loss = M2LLoss()
-    self._perceptual_loss_weight = perceptual_loss_weight
-    # self._recons_loss = CLAPLoss() # CLAP loss
+    # Flexible loss list; built from config in CLI via self.hparams.losses
+    # Supports built-in 'MRSTFT' and registry-based losses from ddsp.losses
+    from ddsp.registry import LOSSES
+    self._loss_items = []  # list of tuples (loss_fn, weight)
+    losses_cfg = getattr(self.hparams, 'losses', []) or []
+    if len(losses_cfg) == 0:
+      # Default to MRSTFT only if nothing specified
+      self._loss_items.append((self._construct_mrstft_loss(), 1.0))
+    else:
+      for entry in losses_cfg:
+        typ = entry.get('type')
+        weight = float(entry.get('weight', 1.0))
+        params = dict(entry.get('params', {}))
+        if typ == 'MRSTFT':
+          # Allow overriding fft_sizes via params
+          loss = self._construct_mrstft_loss(**params)
+        else:
+          # Instantiate from registry
+          loss = LOSSES.create(typ, **params)
+        self._loss_items.append((loss, weight))
 
     self._disc_num_D = 3 # number of discriminators at different scales
     self._disc_ndf = 4 # number of filters in the first layer of the discriminator
@@ -664,8 +666,7 @@ class DDSP(L.LightningModule):
 
 
   def _reconstruction_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Computes the reconstruction loss using weighted sum of perceptually
-    weighted multi-resolution chroma STFT and mel STFT with a regular MR-STFT"""
+    """Computes reconstruction as weighted sum of configured losses."""
     if y.dim() == 2:
       y = y.unsqueeze(1)
 
@@ -675,19 +676,15 @@ class DDSP(L.LightningModule):
       x = x[..., :min_length]
       y = y[..., :min_length]
 
-    # w_stft = 0.7
-    # w_mel = 0.3
-    # w_chroma = 0.1
-
-    # loss = (w_stft * self._mr_stft_loss(y, x) \
-    #     # + w_chroma * self._mr_chroma_loss(y, x) \
-    #     + w_mel * self._mr_mel_loss(y, x) \
-    #   ) / (w_stft + w_mel + w_chroma)
-
-    loss = self._mr_stft_loss(y, x)
-    # loss += 5e3 * self._sliced_wasserstein_loss(y.squeeze(1), x.squeeze(1))
-    # loss += self._mr_stft_loss(y, x)
-    return loss
+    total = 0.0
+    # Each loss function may expect shapes [B,1,T] or [B,T]; try both
+    for loss_fn, w in self._loss_items:
+      try:
+        val = loss_fn(y, x)
+      except Exception:
+        val = loss_fn(y.squeeze(1), x.squeeze(1))
+      total = total + (w * val)
+    return total
 
 
   @torch.jit.ignore
@@ -714,9 +711,9 @@ class DDSP(L.LightningModule):
                                                 perceptual_weighting=True).to(self._device)
 
   @torch.jit.ignore
-  def _construct_mrstft_loss(self):
+  def _construct_mrstft_loss(self, fft_sizes: np.ndarray | None = None):
     """Construct the loss function for the model: a multi-resolution STFT loss"""
-    fft_sizes = np.array([2053, 1021, 509, 257, 129, 65, 33])
+    fft_sizes = np.array(fft_sizes) if fft_sizes is not None else np.array([2053, 1021, 509, 257, 129, 65, 33])
     # Modification from log to log1p according to
     # Schwär, S., & Müller, M. (2023). Multi-Scale Spectral Loss Revisited.
     # IEEE Signal Processing Letters, 30, 1712–1716. https://doi.org/10.1109/LSP.2023.3333205

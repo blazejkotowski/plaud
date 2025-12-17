@@ -29,6 +29,12 @@ model:
   plateau_patience: 100000
   capacity: 32
 
+losses:
+  - type: MRSTFT
+    weight: 1.0
+    params:
+      fft_sizes: [2053, 1021, 509, 257, 129, 65, 33]
+
 adversarial:
   enabled: true
   weights:
