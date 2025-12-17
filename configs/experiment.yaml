@@ -47,7 +47,18 @@ model:
   capacity: 32
   # beta: 0.001  # optional beta warmup target
 
-losses: []
+losses:
+  - type: MRSTFT
+    weight: 1.0
+    params:
+      fft_sizes: [2053, 1021, 509, 257, 129, 65, 33]
+  - type: MultiScaleSlicedWassersteinLoss
+    weight: 0.0
+    params:
+      sampling_rate: ${audio.fs}
+      n_projections: 10
+      p: 2
+      magnitude: pow
 
 adversarial:
   enabled: true

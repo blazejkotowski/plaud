@@ -39,13 +39,14 @@ class AudioFeatureDataset(Dataset):
     self._control_space = control_space
 
     # Build feature extractors from control space (feature fields only)
-    self._extractor_specs: List[tuple[str, object]] = []
+    self._extractor_specs: List[tuple[str, object, dict]] = []
     for field in self._control_space.fields:
       if field.source == 'feature':
         if not field.extractor:
           raise ValueError(f"ControlField '{field.name}' requires 'extractor' for source='feature'")
         extractor = FEATURE_EXTRACTORS.create(field.extractor, **(field.params or {}))
-        self._extractor_specs.append((field.name, extractor))
+        norm = dict(field.normalization) if field.normalization is not None else {}
+        self._extractor_specs.append((field.name, extractor, norm))
 
     # Create cache key based on dataset parameters
     cache_key = self._create_cache_key(dataset_path, n_signal, sampling_rate, resampling_factor, control_space)
@@ -269,10 +270,19 @@ class AudioFeatureDataset(Dataset):
     """
     # Compute audio-rate features for the full concatenated audio
     feats = []
-    for name, extractor in self._extractor_specs:
+    for name, extractor, norm in self._extractor_specs:
       feat = extractor(self._audio, self._sampling_rate)  # [N, C] at audio rate
       if feat.ndim == 1:
         feat = feat.unsqueeze(-1)
+      # Apply optional normalization per field
+      if 'mean' in norm and 'std' in norm:
+        mean = torch.as_tensor(norm['mean'], device=feat.device, dtype=feat.dtype)
+        std = torch.as_tensor(norm['std'], device=feat.device, dtype=feat.dtype)
+        feat = (feat - mean) / (std + 1e-8)
+      elif 'min' in norm and 'max' in norm:
+        minv = torch.as_tensor(norm['min'], device=feat.device, dtype=feat.dtype)
+        maxv = torch.as_tensor(norm['max'], device=feat.device, dtype=feat.dtype)
+        feat = (feat - minv) / (maxv - minv + 1e-8)
       feats.append(feat)
 
     features = torch.cat(feats, dim=-1)  # [N, D_feat]

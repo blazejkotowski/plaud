@@ -95,6 +95,7 @@ def main(cfg: DictConfig) -> None:
     perceptual_loss_weight=float(getattr(cfg.model, 'perceptual_loss_weight', 0.0)),
     plateau_patience=int(cfg.model.plateau_patience),
     capacity=int(cfg.model.capacity),
+    losses=[dict(l) for l in getattr(cfg, 'losses', [])],
     adversarial_loss=bool(cfg.adversarial.enabled),
     adv_g_start_epoch=int(cfg.adversarial.schedule.g_start_epoch),
     adv_d_start_epoch=int(cfg.adversarial.schedule.d_start_epoch),
