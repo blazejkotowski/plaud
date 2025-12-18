@@ -4,7 +4,7 @@ import torch
 import lightning as L
 from torch.utils.data import DataLoader
 
-from ddsp.prior.exporter import export_latents
+from ddsp.prior.latents_dataset_builder import export_latents
 from ddsp.prior.dataset import PriorSequenceDataset
 from ddsp.prior.prior import Prior
 

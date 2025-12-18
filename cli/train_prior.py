@@ -31,7 +31,7 @@ def main(cfg: DictConfig):
 
   # Model
   model = Prior(
-    latent_size=cfg.prior.latent_size,
+    latent_size=ds.latent_size,
     embedding_dim=cfg.prior.embedding_dim,
     quantization_channels=cfg.prior.quantization_channels,
     nhead=cfg.prior.nhead,
@@ -56,124 +56,5 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
   main()
-import lightning as L
-from lightning.pytorch.loggers import TensorBoardLogger
-from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
-
-import argparse
-import os
-
-from torch.utils.data import DataLoader, random_split
-
-from ddsp.prior import Prior, PriorDataset
-from ddsp.prior.prior_dataset import DummyMultivariateSequenceDataset
-from ddsp.utils import find_checkpoint
-
-import torch
-torch.set_default_device('cuda')
-torch.set_float32_matmul_precision('medium')
-torch.set_default_dtype(torch.float32)
-
-if __name__ == '__main__':
-  parser = argparse.ArgumentParser()
-  parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-  parser.add_argument('--dropout', type=float, default=0.1, help='Dropout rate')
-  parser.add_argument('--max_len', type=int, default=64, help='Number of the preceding latent codes')
-  parser.add_argument('--embedding_dim', type=int, default=32, help='Embedding dimension')
-  parser.add_argument('--num_layers', type=int, default=6, help='Number of layers in the transformer')
-  parser.add_argument('--nhead', type=int, default=8, help='Number of heads in the transformer')
-  parser.add_argument('--fs', type=int, default=44100, help='Sampling rate of the audio')
-  parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
-  parser.add_argument('--training_dir', type=str, default='training/prior', help='Directory to save the training logs')
-  parser.add_argument('--force_restart', type=bool, default=False, help='Force restart the training. Ignore the existing checkpoint.')
-  parser.add_argument('--device', type=str, default='cuda', help='Device to use', choices=['cuda', 'cpu', 'mps'])
-  parser.add_argument('--model_name', type=str, help='Name of the model', required=True)
-  parser.add_argument('--model_path', type=str, help='Path to the encoding model', required=True)
-  parser.add_argument('--dataset_path', help='Directory of the training sound/sounds', required=True)
-  parser.add_argument('--dataset_stride_factor', type=float, default=0.25, help='Stride factor for the dataset')
-  parser.add_argument('--early_stopping', type=bool, default=False, help='Enable early stopping')
-  parser.add_argument('--max_epochs', type=int, default=10, help='Maximum number of epochs to train')
-  parser.add_argument('--quantization_channels', type=int, default=32, help='Number of quantization channels')
-  config = parser.parse_args()
-
-  # Create training directory
-  training_path = os.path.join(config.training_dir, config.model_name)
-  os.makedirs(training_path, exist_ok=True)
-
-  # Load Dataset
-  dataset = PriorDataset(
-    audio_dataset_path=config.dataset_path,
-    encoding_model_path=config.model_path,
-    sequence_length=config.max_len+1,
-    sampling_rate=config.fs,
-    stride_factor=config.dataset_stride_factor,
-    device=config.device,
-    # db_file=os.path.join('prior_datasets', config.model_name + '.hdf5')
-  )
-
-  # Dummy dataset
-  # dataset = DummyMultivariateSequenceDataset(num_features=16, seq_length=config.sequence_length, n_examples=10000)
-  # normalization_dict = {'mean': 0.0, 'var': 1.0}
-
-
-  # Split into training and validation
-  generator = torch.Generator(device=config.device).manual_seed(42)
-  train_set, val_set = random_split(dataset, [0.8, 0.2], generator=generator)
-  train_loader = DataLoader(train_set, batch_size=config.batch_size, shuffle=True, generator=generator)
-  val_loader = DataLoader(val_set, batch_size=config.batch_size, shuffle=False, generator=generator)
-
-  latent_size = dataset[0][0].shape[-1]
-
-  # Core model
-  prior = Prior(
-    latent_size=latent_size,
-    dropout=config.dropout,
-    lr=config.lr,
-    embedding_dim=config.embedding_dim,
-    num_layers=config.num_layers,
-    nhead=config.nhead,
-    max_len=config.max_len,
-    normalization_dict=dataset.normalization_dict,
-    quantization_channels=config.quantization_channels,
-  )
-
-  # Setup the logger
-  logger = TensorBoardLogger(training_path, name=config.model_name)
-
-  # Early stopping callback
-  callbacks = []
-  if config.early_stopping:
-    callbacks.append(EarlyStopping(monitor='val_loss', patience=10))
-
-  # Checkpoint callback
-  checkpoint_callback = ModelCheckpoint(
-    dirpath=training_path,
-    filename='best',
-    monitor='val_loss',
-    mode='min'
-  )
-  callbacks.append(checkpoint_callback)
-
-  # Configure the trainer
-  trainer = L.Trainer(
-    callbacks=callbacks,
-    accelerator=config.device,
-    log_every_n_steps=4,
-    logger=logger,
-    max_epochs = config.max_epochs
-  )
-
-  # Try to find previous checkpoint
-  ckpt_path = find_checkpoint(training_path, return_none=True) if not config.force_restart else None
-  if ckpt_path is not None:
-    print(f'Resuming training from checkpoint {ckpt_path}')
-
-  # Start training
-  trainer.fit(
-    model=prior,
-    train_dataloaders=train_loader,
-    val_dataloaders=val_loader,
-    ckpt_path=ckpt_path,
-  )
 
 

@@ -55,7 +55,7 @@ This document summarizes the architectural refactor and provides practical instr
   - Transformer encoder over token embeddings; Mu-Law quantization (`MuLawEncoding/MuLawDecoding`).
   - `normalize`/`denormalize` guards for missing normalization dict.
   - `generate` uses internal device; scheduler monitors `loss` for simple runs.
-- `ddsp/prior/exporter.py`
+- `ddsp/prior/latents_dataset_builder.py`
   - Exports concatenated `controls` and separate `latents` to HDF5.
   - Robust to encoder interfaces; disables streaming if supported.
 - `ddsp/prior/dataset.py`
@@ -67,7 +67,7 @@ This document summarizes the architectural refactor and provides practical instr
 
 ### Tests
 - `tests/test_prior_smoke.py`: Prior forward/generate shapes and finiteness.
-- `tests/test_prior_exporter.py`: Exporter HDF5 contents (`controls`, `latents`).
+- `tests/test_prior_exporter.py`: HDF5 contents (`controls`, `latents`).
 - `tests/test_prior_integration.py`: Export → load controls → train Prior one epoch and assert finite loss.
 - Existing DDSP tests remain: shapes, ControlSpace, synthesis parameter slicing, loss/gradient flow, adversarial schedule, config integration.
 
@@ -80,19 +80,31 @@ python -m cli.train
 ```
 - Select a variant (features-only, latent-only, hybrid):
 ```
-python -m cli.train +experiment=experiment_features_only
-python -m cli.train +experiment=experiment_latent_only
-python -m cli.train +experiment=experiment_hybrid
+# long form
+python -m cli.train --config-name experiment_features_only
+python -m cli.train --config-name experiment_latent_only
+python -m cli.train --config-name experiment_hybrid
+
+# short form
+python -m cli.train -cn experiment_features_only
 ```
-- Override common options:
+- Common overrides:
 ```
-python -m cli.train losses=[{name: mrstft, weight: 1.0}] adversarial.enabled=false
+# point to your dataset
+python -m cli.train -cn experiment_features_only data.dataset_path=/absolute/path/to/dataset
+
+# change run name without editing files
+python -m cli.train -cn experiment_features_only ++experiment.name=my_run
+
+# toggle/adjust losses
+python -m cli.train -cn experiment_features_only adversarial.enabled=false
 ```
+Note: If you see "Could not append to config. An item is already at 'experiment'", it means Hydra refused `+experiment=...`. Use `--config-name/-cn` to select a config file, or `++experiment.name=...` to override a field.
 
 ### 2) Export Controls for Prior
 - Export using the same experiment config (ControlSpace is the source of truth):
 ```
-python -m cli.export_prior_latents prior_export.out_path=/absolute/path/latents.h5
+python -m cli.export_prior_latents --config-name experiment_features_only +prior_export.out_path=/absolute/path/latents.h5
 ```
 - Output HDF5 contains:
   - `controls`: [num_sequences, seq_len, control_size]
@@ -124,7 +136,7 @@ python -m cli.train_prior dataset.hdf5_path=/absolute/path/latents.h5
 
 ## Tips and Troubleshooting
 
-- GPU usage: CLIs auto-select GPU if available; tests use CPU for portability.
+- GPU usage: current `cli/train.py` sets CUDA as default device and tensor type; a CUDA-capable GPU is required. For CPU-only, remove `torch.set_default_device('cuda')` and `torch.set_default_tensor_type('torch.cuda.FloatTensor')` in `cli/train.py`, and set `accelerator='cpu'` in the Lightning `Trainer`.
 - If validation metrics are not available, the Prior scheduler monitors `loss` by default to avoid misconfiguration.
 - HDF5 export requires sufficient audio length; check `sequence_length` and dataset duration.
 - To extend ControlSpace or add new features/losses, register them via `ddsp/registry.py` and reference in configs.
@@ -133,7 +145,7 @@ python -m cli.train_prior dataset.hdf5_path=/absolute/path/latents.h5
 
 - Model: `ddsp/ddsp.py`, `ddsp/prior/prior.py`
 - Datasets: `ddsp/audio_feature_dataset.py`, `ddsp/prior/dataset.py`
-- Export: `ddsp/prior/exporter.py`, `cli/export_prior_latents.py`
+- Export: `ddsp/prior/latents_dataset_builder.py`, `cli/export_prior_latents.py`
 - Training CLIs: `cli/train.py`, `cli/train_prior.py`
 - Configs: `configs/experiment*.yaml`, `configs/experiment_prior.yaml`
 - Tests: `tests/` (DDSP + Prior + exporter + integration)

@@ -248,10 +248,17 @@ class AudioFeatureDataset(Dataset):
     Returns:
       - audio: torch.Tensor, the audio tensor
     """
+    if not os.path.exists(path):
+      raise FileNotFoundError(f"Dataset path does not exist: {path}")
+
+    filepaths = glob(os.path.join(path, '**', '*.wav'), recursive=True)
+    if len(filepaths) == 0:
+      raise RuntimeError(f"No audio files found in path: {path}")
+
     audio = torch.tensor([], device=self._device)
-    for filepath in glob(os.path.join(path, '**', '*.wav'), recursive=True):
+    for filepath in filepaths:
       x = self._load_file(filepath)
-      audio = torch.concat([audio, torch.from_numpy(x).to(self._device)], dim = 0)
+      audio = torch.concat([audio, torch.from_numpy(x).to(self._device)], dim=0)
     return audio
 
 

@@ -10,6 +10,8 @@ import time
 from ddsp.utils import find_checkpoint
 
 from ddsp import DDSP
+from ddsp.interfaces import ControlField, ControlSpace
+import torch
 from ddsp.prior import Prior
 
 torch.enable_grad(False)
@@ -329,7 +331,19 @@ if __name__ == '__main__':
 
     prior._trainer = L.Trainer()
 
-  ddsp = DDSP.load_from_checkpoint(checkpoint_path, strict=False, streaming=True, device='cpu').to('cpu')
+  # Reconstruct minimal ControlSpace from checkpoint hyperparameters
+  ckpt = torch.load(checkpoint_path, map_location='cpu')
+  hparams = ckpt.get('hyper_parameters', {})
+  feature_dim = int(hparams.get('feature_dim', 0))
+  latent_size = int(hparams.get('latent_size', 0))
+  fields = []
+  if feature_dim > 0:
+    fields.append(ControlField(name='features', dim=feature_dim, source='feature', extractor=None))
+  if latent_size > 0:
+    fields.append(ControlField(name='latents', dim=latent_size, source='latent', extractor=None))
+  control_space = ControlSpace(tuple(fields))
+
+  ddsp = DDSP.load_from_checkpoint(checkpoint_path, strict=False, streaming=True, device='cpu', control_space=control_space).to('cpu')
   ddsp.streaming(True)
   if format == 'onnx':
     ddsp.eval()
