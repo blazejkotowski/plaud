@@ -33,14 +33,13 @@ class LibrosaFeatureExtractor(BaseExtractor):
     self._postprocess = postprocess
 
 
-  def _calculate(self, audio: torch.Tensor, fs: int) -> torch.Tensor:
+  def _calculate(self, audio: torch.Tensor) -> torch.Tensor:
     """
     Implementation of the loudness extractor with librosa. Extracts the loudness
     and returns and interpolated tensor with values for each audio sample.
 
     Args:
       - audio: torch.Tensor [T_audio] or [B, T_audio], the input audio tensor
-      - fs: int, sampling rate in Hz
     Returns:
       - features: torch.Tensor [T_audio, C] or [B, T_audio, C], the extracted features at audio rate
     """
@@ -53,7 +52,7 @@ class LibrosaFeatureExtractor(BaseExtractor):
     feats = []
     for i in range(x.shape[0]):
       xi = x[i].detach().cpu().numpy()
-      fi = self._feature_fn(y=xi, sr=fs, center=False)
+      fi = self._feature_fn(y=xi, center=False)
       # fi shape usually [C, frames] or [1, frames]
       fi = torch.tensor(fi, dtype=torch.float32)
       if fi.ndim == 1:

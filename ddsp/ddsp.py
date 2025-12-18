@@ -33,6 +33,7 @@ class DDSP(L.LightningModule):
     - decoder_gru_layers: int, GRU layers in decoder
     - capacity: int, base capacity multiplier
     - learning_rate: float, optimizer LR
+    - losses: List[Dict], configurable reconstruction loss entries (e.g., MRSTFT)
     - streaming: bool, streaming mode
     - perceptual_loss_weight: float, weight for perceptual terms
     - plateau_patience: int, LR scheduler patience
@@ -51,6 +52,7 @@ class DDSP(L.LightningModule):
                capacity: int = 64,
                resampling_factor: int = 32,
                learning_rate: float = 1e-3,
+               losses: List[Dict[Any, Any]] = [],
                perceptual_loss_weight: float = 0.0,
                streaming: bool = False,
                plateau_patience: int = 20,
@@ -61,13 +63,15 @@ class DDSP(L.LightningModule):
                 adv_gen_weight: float = 1.0,
                 adv_disc_weight: float = 1.0,
                 adv_fm_weight: float = 1.0,
+                config_name: str | None = None,
                device: str = 'cuda'):
     super().__init__()
     # Turn of autoamtic optimization
     self.automatic_optimization = False
 
     # Save hyperparameters in the checkpoints
-    self.save_hyperparameters()
+    # Avoid serializing frozen dataclasses like ControlSpace in hparams
+    self.save_hyperparameters(ignore=['control_space'])
     self._synth_configs = synth_configs
     self._device = device
     self._plateau_patience = plateau_patience
@@ -76,6 +80,14 @@ class DDSP(L.LightningModule):
     self.control_space = control_space
     self.latent_size = self.control_space.latent_dim
     self.feature_dim = self.control_space.feature_dim
+    # Store dims for convenience in hparams (safe to mutate)
+    try:
+      self.hparams.feature_dim = int(self.feature_dim)
+      self.hparams.latent_size = int(self.latent_size)
+      if config_name is not None:
+        self.hparams.config_name = str(config_name)
+    except Exception:
+      pass
     # For PCA utilities; keep num_params aligned to latent_size by default
     self.num_params = self.latent_size
     self.resampling_factor = resampling_factor
@@ -138,6 +150,8 @@ class DDSP(L.LightningModule):
       gru_layers=decoder_gru_layers,
       streaming=streaming,
     )
+
+    # (hyperparameters already saved above)
 
     # Flexible loss list; built from config in CLI via self.hparams.losses
     # Supports built-in 'MRSTFT' and registry-based losses from ddsp.losses
@@ -206,6 +220,11 @@ class DDSP(L.LightningModule):
       synth.streaming = streaming
 
     self.decoder.streaming = streaming
+
+  @property
+  def n_features(self) -> int:
+    """Backward-compat alias for exporter script."""
+    return int(self.feature_dim)
 
 
   def analyze_latent_space(self, z: torch.Tensor) -> None:
@@ -449,6 +468,8 @@ class DDSP(L.LightningModule):
     # -------------------------
     # Reconstruction loss (perceptual/MRSTFT etc.)
     recons_loss = self._reconstruction_loss(y_audio.float(), x_audio.float())
+    # Log individual loss components for visibility
+    self._log_loss_components(y_audio.float(), x_audio.float(), split='train')
     ddsp_loss = recons_loss + self._beta * kld_loss  # adv term added below if enabled
 
     if self._adversarial_loss and self.current_epoch >= self._adv_g_start_epoch:
@@ -502,6 +523,8 @@ class DDSP(L.LightningModule):
     self.log("beta", self._beta, prog_bar=True, logger=True)
     self.log("recons_loss", recons_loss, prog_bar=True, logger=True)
     self.log("ddsp_loss", ddsp_loss, prog_bar=True, logger=True)
+    # Also expose a canonical 'loss' for dashboards/alerting
+    self.log("loss", ddsp_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
 
 
   def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
@@ -512,6 +535,8 @@ class DDSP(L.LightningModule):
       y_audio, _ = self._autoencode(x_audio, x_features)
 
     val_loss = self._reconstruction_loss(y_audio.float(), x_audio.float())
+    # Log validation loss components (epoch-level)
+    self._log_loss_components(y_audio.float(), x_audio.float(), split='val')
 
     self.log("val_loss", val_loss, prog_bar=True, logger=True)
 
@@ -667,11 +692,12 @@ class DDSP(L.LightningModule):
 
   def _reconstruction_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     """Computes reconstruction as weighted sum of configured losses."""
+    # Ensure [B,1,T] and aligned lengths
     if y.dim() == 2:
       y = y.unsqueeze(1)
-
+    if x.dim() == 2:
+      x = x.unsqueeze(1)
     if x.shape[-1] != y.shape[-1]:
-      # Fit the signals to the same length
       min_length = min(x.shape[-1], y.shape[-1])
       x = x[..., :min_length]
       y = y[..., :min_length]
@@ -685,6 +711,38 @@ class DDSP(L.LightningModule):
         val = loss_fn(y.squeeze(1), x.squeeze(1))
       total = total + (w * val)
     return total
+
+  def _loss_component_values(self, y: torch.Tensor, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    """Compute individual reconstruction loss component values without weighting.
+    Returns a dict mapping component name -> value.
+    """
+    # Ensure [B,1,T] and aligned lengths
+    if y.dim() == 2:
+      y = y.unsqueeze(1)
+    if x.dim() == 2:
+      x = x.unsqueeze(1)
+    if x.shape[-1] != y.shape[-1]:
+      min_length = min(x.shape[-1], y.shape[-1])
+      x = x[..., :min_length]
+      y = y[..., :min_length]
+
+    comps: Dict[str, torch.Tensor] = {}
+    for loss_fn, _w in self._loss_items:
+      name = loss_fn.__class__.__name__
+      val = loss_fn(y, x)
+      comps[name] = val
+    return comps
+
+  def _log_loss_components(self, y: torch.Tensor, x: torch.Tensor, split: str = 'train') -> None:
+    """Log individual reconstruction loss components for better visibility.
+    split: 'train' logs on_step+on_epoch; 'val' logs on_epoch only.
+    """
+    comps = self._loss_component_values(y, x)
+    for name, val in comps.items():
+      if split == 'train':
+        self.log(f"{split}/{name}", val, prog_bar=False, logger=True, on_step=True, on_epoch=True)
+      else:
+        self.log(f"{split}/{name}", val, prog_bar=False, logger=True, on_step=False, on_epoch=True)
 
 
   @torch.jit.ignore

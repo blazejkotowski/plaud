@@ -347,5 +347,7 @@ class FixedPositionalEncoding(nn.Module):
         x: [sequence length, batch size, latent_size, embed dim]
         output: [sequence length, batch size, latent_size, embed dim]
     """
-    x = (x.permute(1, 0, 2, 3) + self.pe[:x.size(0), :]).permute(1, 0, 2, 3)
+    # Ensure buffer device matches input device
+    pe_slice = self.pe[:x.size(0), :].to(x.device)
+    x = (x.permute(1, 0, 2, 3) + pe_slice).permute(1, 0, 2, 3)
     return self.dropout(x)

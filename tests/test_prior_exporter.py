@@ -5,7 +5,7 @@ import h5py
 
 import pytest
 
-from ddsp.prior.exporter import export_latents
+from ddsp.prior.latents_dataset_builder import export_latents
 
 class TinyAudioDS:
     def __init__(self, T=44100*2, sampling_rate=44100, sequence_length=64, stride_factor=1.0):
