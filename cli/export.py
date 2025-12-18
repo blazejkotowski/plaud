@@ -341,6 +341,8 @@ if __name__ == '__main__':
     fields.append(ControlField(name='features', dim=feature_dim, source='feature', extractor=None))
   if latent_size > 0:
     fields.append(ControlField(name='latents', dim=latent_size, source='latent', extractor=None))
+  if len(fields) == 0:
+    raise RuntimeError("Checkpoint missing feature_dim/latent_size hparams; cannot reconstruct ControlSpace for export.")
   control_space = ControlSpace(tuple(fields))
 
   ddsp = DDSP.load_from_checkpoint(checkpoint_path, strict=False, streaming=True, device='cpu', control_space=control_space).to('cpu')
