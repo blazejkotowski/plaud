@@ -389,6 +389,10 @@ class BendableNoiseBandSynth(BaseSynth):
   def streaming(self):
     return self._streaming
 
+  @property
+  def jit_name(self):
+    return "BendableNoiseBandSynth"
+
   @streaming.setter
   def streaming(self, value: bool):
     self._streaming = value

@@ -208,10 +208,8 @@ class DDSP(L.LightningModule):
       value: int, the new resampling factor
     """
     self._resampling_factor = value
-    if hasattr(self, 'encoder') and hasattr(self.encoder, 'resampling_factor'):
+    if hasattr(self, 'encoder') and self.encoder is not None:
       self.encoder.resampling_factor = value
-    if hasattr(self, 'decoder') and hasattr(self.decoder, 'resampling_factor'):
-      self.decoder.resampling_factor = value
 
   def streaming(self, streaming: bool) -> None:
     """Set streaming mode"""
@@ -674,10 +672,7 @@ class DDSP(L.LightningModule):
       synth_params = params[:, params_idx:params_idx+synth.n_params, :]
       params_idx += synth.n_params
       # Explicit per-synth routing without introspection
-      try:
-        name = synth.jit_name if hasattr(synth, 'jit_name') else synth.__class__.__name__
-      except Exception:
-        name = synth.__class__.__name__
+      name = synth.jit_name
 
       if name in ("NoiseBandSynth", "SubbandSineSynth", "BendableNoiseBandSynth"):
         audio.append(synth(synth_params, limit_components=limit_components, waveshaping_factor=waveshaping_factor))

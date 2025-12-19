@@ -1,5 +1,6 @@
 import nn_tilde
 import argparse
+import math
 import torch
 import torch.nn.functional as F
 import lightning as L
@@ -29,13 +30,25 @@ class ScriptedDDSP(nn_tilde.Module):
     self.resample_ratio = target_fs / self.pretrained.fs
     print("resample ratio:", self.resample_ratio )
 
+    numerator = self.pretrained.resampling_factor * target_fs
+    denominator = int(self.pretrained.fs)
+
+    if numerator % denominator != 0:
+      gcd = math.gcd(self.pretrained.resampling_factor, denominator)
+      compatible_step = denominator // gcd
+      raise ValueError(
+        "target_fs={} is incompatible with nn~ export. "
+        "Choose a multiple of {} to keep decode buffers aligned.".format(target_fs, compatible_step)
+      )
+
+    self._nn_decode_ratio = int(numerator // denominator)
+
     if prior_model is None:
       prior_model = FakePrior()
     else:
       prior_model = PriorWrapper(prior_model, resample_ratio=self.resample_ratio)
 
     self.prior_model = prior_model
-
 
 
     # # # Calculate the input ratio
@@ -68,7 +81,7 @@ class ScriptedDDSP(nn_tilde.Module):
     self.register_method(
       "decode",
       in_channels = total_params,
-      in_ratio = int(self.pretrained.resampling_factor * self.resample_ratio),
+      in_ratio = self._nn_decode_ratio,
       out_channels = 1, # number of output audio channels
       # out_ratio = 1/3,
       out_ratio = 1,
@@ -77,22 +90,23 @@ class ScriptedDDSP(nn_tilde.Module):
       test_method=True,
     )
 
-    self.register_method(
-      "encode",
-      in_channels = 1,
-      in_ratio = 1,
-      out_channels = self.pretrained.num_params,
-      out_ratio = self.pretrained.resampling_factor,
-      input_labels=['(signal) Audio Input'],
-      output_labels=[f'(signal) Latent Dimension {i}' for i in range(1, self.pretrained.num_params+1)],
-      test_method=True
-    )
+    if self.pretrained.latent_size > 0:
+      self.register_method(
+        "encode",
+        in_channels = 1,
+        in_ratio = 1,
+        out_channels = self.pretrained.num_params,
+        out_ratio = self.pretrained.resampling_factor,
+        input_labels=['(signal) Audio Input'],
+        output_labels=[f'(signal) Latent Dimension {i}' for i in range(1, self.pretrained.num_params+1)],
+        test_method=True
+      )
 
     if not isinstance(self.prior_model, FakePrior):
       self.register_method(
         "prior",
         in_channels=total_params + 2, # latent transposition + temperature + prediction_strength
-        in_ratio=int(self.pretrained.resampling_factor * self.resample_ratio),
+        in_ratio=self._nn_decode_ratio,
         out_channels=total_params,
         out_ratio=self.pretrained.resampling_factor,
         input_labels=[f'(signal) Transposition {i}' for i in range(1, total_params+1)] + ['(signal) Temperature', '(signal) Prediction strenght'],
@@ -113,6 +127,9 @@ class ScriptedDDSP(nn_tilde.Module):
     # latents = self.pretrained.denormalize_latents(latents)
     features = features.permute(0, 2, 1)
 
+    if self.pretrained.latent_size == 0:
+      latents = torch.zeros(latents.size(0), latents.size(1), 1, device=latents.device)
+
     synth_params = self.pretrained.decoder(features, latents)
     audio = self.pretrained._synthesize(synth_params, waveshaping_factor=self.waveshaping[0], limit_components=self.limit_components[0])
     # print("Audio shape before interpolation:", audio.shape)
@@ -127,11 +144,9 @@ class ScriptedDDSP(nn_tilde.Module):
 
   @torch.jit.export
   def encode(self, audio: torch.Tensor):
-    # if self.resampler is not None:
-      #  audio = self.resampler.to_model_sampling_rate(audio)
-
+    if self.pretrained.encoder is None:
+      raise RuntimeError("encode() requested but the pretrained model has no encoder (latent_size=0)")
     mu, scale = self.pretrained.encoder(audio.squeeze(1))
-    # latents = self.pretrained.encoder.reparametrize(mu, logvar)
     latents, _ = self.pretrained.encoder.reparametrize(mu, scale)
     latents = self.pretrained._smooth_latents(latents)
     latents = self.pretrained.normalize_latents(latents)
@@ -292,6 +307,8 @@ class ONNXDDSP(torch.nn.Module):
     return audio
 
   def encode(self, audio: torch.Tensor):
+    if self.pretrained.encoder is None:
+      raise RuntimeError("encode() requested but the pretrained model has no encoder (latent_size=0)")
     mu, scale = self.pretrained.encoder(audio.squeeze(1))
     latents, _ = self.pretrained.encoder.reparametrize(mu, scale)
     return latents.permute(0, 2, 1)
@@ -326,8 +343,10 @@ if __name__ == '__main__':
     print("exporting prior model from checkpoint: ", prior_checkpoint_path)
     prior = Prior.load_from_checkpoint(prior_checkpoint_path, strict=False).to('cpu')
     prior.eval()
-    for k in prior._normalization_dict.keys():
-      prior._normalization_dict[k] = prior._normalization_dict[k].to('cpu')
+    if prior._normalization_dict is not None:
+      for k, v in prior._normalization_dict.items():
+        if torch.is_tensor(v):
+          prior._normalization_dict[k] = v.to('cpu')
 
     prior._trainer = L.Trainer()
 
