@@ -16,7 +16,7 @@ def test_config_hybrid_builds_model_and_forward():
     cfg = OmegaConf.load("configs/experiment_hybrid.yaml")
 
     fs = int(cfg.audio.fs)
-    resampling = int(cfg.audio.resampling_factor)
+    resampling = int(cfg.model.resampling_factor)
     n_signal = int(fs * float(cfg.audio.chunk_duration_s))
     T_ctl = n_signal // resampling
 

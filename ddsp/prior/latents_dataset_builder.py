@@ -124,6 +124,8 @@ def build_controls_hdf5(
     audio_ds: AudioFeatureDataset,
     model: DDSP,
     out_path: str,
+    seq_len: int = 128,
+    stride_factor: float = 0.2,
     device: Optional[str] = None,
 ):
     """
@@ -131,4 +133,11 @@ def build_controls_hdf5(
 
     Returns a stats dict with counts and path.
     """
-    return export_latents(audio_ds=audio_ds, model=model, out_path=out_path, device=device)
+    return export_latents(
+        audio_ds=audio_ds,
+        model=model,
+        out_path=out_path,
+        seq_len=seq_len,
+        stride_factor=stride_factor,
+        device=device,
+    )

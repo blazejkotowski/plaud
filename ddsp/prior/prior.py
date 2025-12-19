@@ -13,7 +13,7 @@ from typing import Optional
 
 class Prior(L.LightningModule):
   def __init__(self,
-               latent_size: int = 8,
+               num_controls: int = 8,
                embedding_dim: int = 32,
                quantization_channels: int = 32,
                nhead: int = 8,
@@ -25,7 +25,7 @@ class Prior(L.LightningModule):
                device='cuda'):
     """
     Arguments:
-      - latent_size: int, the size of the latent code
+      - num_controls int, the number of control features
       - embedding_dim: int, the embedding dimensionality
       - quantization_channels: int, the number of quantization channels
       - nhead: int, the number of heads in the multiheadattention models
@@ -46,10 +46,10 @@ class Prior(L.LightningModule):
 
     self._normalization_dict = normalization_dict
 
-    self._d_model = embedding_dim * latent_size
+    self._d_model = embedding_dim * num_controls
     self._embedding_dim = embedding_dim
     self._lr = lr
-    self._latent_size = latent_size
+    self._num_controls = num_controls
     self._max_len = max_len
 
     self._quantization_channels = quantization_channels
@@ -66,7 +66,7 @@ class Prior(L.LightningModule):
     self._activation = nn.ReLU()
     self._dropout = nn.Dropout(dropout)
 
-    self._fc = nn.Linear(self._d_model, latent_size * self._quantization_channels)
+    self._fc = nn.Linear(self._d_model, num_controls * self._quantization_channels)
 
     # Cross-entropy loss
     self._loss = nn.CrossEntropyLoss(reduction='none')
@@ -74,12 +74,12 @@ class Prior(L.LightningModule):
 
   def normalize(self, x: torch.Tensor) -> torch.Tensor:
     """
-    Normalize the latent codes.
+    Normalize the controls codes.
 
     Arguments:
-      - x: torch.Tensor[batch_size, seq_len, latent_size], the sequences of latent codes
+      - x: torch.Tensor[batch_size, seq_len, num_controls], the sequences of control codes
     Returns:
-      - x: torch.Tensor[batch_size, seq_len, latent_size], the normalized latent codes
+      - x: torch.Tensor[batch_size, seq_len, num_controls], the normalized controls codes
     """
     # If no normalization dict provided, assume inputs are already in [-1, 1]
     if self._normalization_dict is None:
@@ -93,12 +93,12 @@ class Prior(L.LightningModule):
 
   def denormalize(self, x: torch.Tensor) -> torch.Tensor:
     """
-    Denormalize the latent codes.
+    Denormalize the control codes.
 
     Arguments:
-      - x: torch.Tensor[batch_size, seq_len, latent_size], the sequences of normalized latent codes
+      - x: torch.Tensor[batch_size, seq_len, num_controls], the sequences of normalized control codes
     Returns:
-      - x: torch.Tensor[batch_size, seq_len, latent_size], the denormalized latent codes
+      - x: torch.Tensor[batch_size, seq_len, num_controls], the denormalized control codes
     """
     # If no normalization dict provided, inputs are assumed in [-1, 1]
     if self._normalization_dict is None:
@@ -114,10 +114,10 @@ class Prior(L.LightningModule):
     Sample from the logits.
 
     Arguments:
-      - logits: torch.Tensor[batch_size, seq_len, latent_size, quantization_channels], the logits
+      - logits: torch.Tensor[batch_size, seq_len, num_controls, quantization_channels], the logits
       - temperature: float, the temperature (how much should softmax smooth the distribution)
     Returns:
-      - x: torch.Tensor[batch_size, seq_len, latent_size], the sampled latent codes
+      - x: torch.Tensor[batch_size, seq_len, num_controls], the sampled control codes
     """
     temperature = max(1e-4, temperature) # avoid <= 0 temperature values
     logits /= temperature
@@ -139,15 +139,15 @@ class Prior(L.LightningModule):
   def generate(self, prime: torch.Tensor, seq_len: int, temperature: float = 0.0) -> torch.Tensor:
     """
     Arguments:
-      - prime: torch.Tensor[prime_len, latent_size], the preceding latent code sequence
+      - prime: torch.Tensor[prime_len, num_controls], the preceding control code sequence
       - seq_len: int, the length of the generated sequence
       - temperature: float, the temperature for sampling
     Returns
-      - torch.Tensor[seq_len, latent_size], the generated latent code sequence
+      - torch.Tensor[seq_len, num_controls], the generated control code sequence
     """
     prime_len = prime.size(0)
     # self.eval()
-    output_seq = torch.full((seq_len, self._latent_size), fill_value=0, device=self._device, dtype=torch.float32)
+    output_seq = torch.full((seq_len, self._num_controls), fill_value=0, device=self._device, dtype=torch.float32)
 
     output_seq[:prime.shape[0], :] = prime.clone()
     x = prime.clone().unsqueeze(0)
@@ -167,24 +167,24 @@ class Prior(L.LightningModule):
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     """
-    x: torch.Tensor[batch_size, seq_len, latent_size], the preceding latent code sequence
+    x: torch.Tensor[batch_size, seq_len, num_controls], the preceding control code sequence
     """
     # permute to comply with transformer shape
-    x = x.permute(1, 0, 2) # => [seq_len, batch_size, latent_size]
-    seq_len, batch_size, latent_size = x.shape
+    x = x.permute(1, 0, 2) # => [seq_len, batch_size, num_controls]
+    seq_len, batch_size, num_controls = x.shape
 
     x = self.normalize(x)
     x = self._quantizer(x)
 
-    # flattent latent codes
-    # embed the latent codes
-    indices = x.long() # + self._quantization_channels * torch.arange(self._latent_size, device=self._device).reshape(1, 1, -1)
+    # flattent control codes
+    # embed the control codes
+    indices = x.long() # + self._quantization_channels * torch.arange(self._num_controls, device=self._device).reshape(1, 1, -1)
     embed = self._embedding(indices) # * math.sqrt(self._embedding_dim) # => [seq_len, batch_size, embedding_dim]
 
     # add positional encoding
     pos = self._positional_encoding(embed)
 
-    # so far each latent variable was embedded separately
+    # so far each control feature was embedded separately
     # now we stack them together, preparing for the transformer
     pos = pos.view(seq_len, batch_size, self._d_model) # => [seq_len, batch_size, d_model]
 
@@ -213,10 +213,10 @@ class Prior(L.LightningModule):
     # dropout
     # enc = self._dropout(enc) # => [batch_size, seq_len, d_model]
 
-    # project back to latent space
-    fc = self._fc(enc) # [batch_size, seq_len, latent_size * quantization_channels]
+    # project back to control space
+    fc = self._fc(enc) # [batch_size, seq_len, num_controls * quantization_channels]
 
-    logits = fc.view(batch_size, seq_len, latent_size, self._quantization_channels) # => [batch_size, seq_len, latent_size, quantization_channels]
+    logits = fc.view(batch_size, seq_len, num_controls, self._quantization_channels) # => [batch_size, seq_len, num_controls, quantization_channels]
 
     return logits
 
@@ -255,22 +255,22 @@ class Prior(L.LightningModule):
   def _step(self, batch):
     """
     Arguments:
-      - batch: torch.Tensor[batch_size, seq_len, latent_size], the batch of latent codes sequences
+      - batch: torch.Tensor[batch_size, seq_len, num_controls], the batch of control codes sequences
     """
     x = batch[:, :-1, :]
     y = batch[:, 1:, :]
     y_discrete = self._quantizer(self.normalize(y))
 
-    logits = self(x) # [batch_size, seq_len, latent_size, quantization_channels]
+    logits = self(x) # [batch_size, seq_len, num_controls, quantization_channels]
 
     batch_size = batch.size(0)
 
     # Calcualate class accuracy
-    y_hat_discrete = torch.argmax(logits, dim=-1) # [batch_size, seq_len, latent_size]
+    y_hat_discrete = torch.argmax(logits, dim=-1) # [batch_size, seq_len, num_controls]
     acc = (y_hat_discrete == y_discrete).float().sum() / y_hat_discrete.numel()
 
     # Calcualte mean square error on real values
-    y_hat = self.denormalize(self._dequantizer(y_hat_discrete)) # [batch_size, seq_len, latent_size]
+    y_hat = self.denormalize(self._dequantizer(y_hat_discrete)) # [batch_size, seq_len, num_controls]
     mse = mse_loss(y_hat, y, reduction='none').nanmean()
 
     # Calculate cross-entropy loss
@@ -344,8 +344,8 @@ class FixedPositionalEncoding(nn.Module):
     Args:
         x: the sequence fed to the positional encoder model (required).
     Shape:
-        x: [sequence length, batch size, latent_size, embed dim]
-        output: [sequence length, batch size, latent_size, embed dim]
+        x: [sequence length, batch size, num_controls, embed dim]
+        output: [sequence length, batch size, num_controls, embed dim]
     """
     # Ensure buffer device matches input device
     pe_slice = self.pe[:x.size(0), :].to(x.device)

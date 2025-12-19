@@ -216,7 +216,7 @@ class PriorWrapper(torch.nn.Module):
     self.max_len = self.prior._max_len
     self.init_primer_len = self.max_len // 4
     self.current_buffer_len = self.init_primer_len
-    self.register_buffer("prior_buffer", torch.zeros(1, self.max_len, self.prior._latent_size))
+    self.register_buffer("prior_buffer", torch.zeros(1, self.max_len, self.prior._num_controls))
     # self.prior_buffer = torch.randn(1, self.max_len, self.prior._num_params)
 
 
@@ -261,7 +261,7 @@ class PriorWrapper(torch.nn.Module):
 
     steps = x.shape[-1]
 
-    output = torch.zeros(1, steps, self.prior._latent_size)
+    output = torch.zeros(1, steps, self.prior._num_controls)
     local_buffer = self.prior_buffer.clone()
     current_len = self.current_buffer_len
 

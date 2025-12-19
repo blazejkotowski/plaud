@@ -9,48 +9,39 @@ class PriorSequenceDataset(Dataset):
     def __init__(
         self,
         hdf5_path: Optional[str] = None,
-        num_sequences: int = 128,
-        seq_len: int = 256,
-        latent_size: int = 8,
         in_memory: bool = True,
     ):
         self.hdf5_path = hdf5_path
-        self.synthetic = hdf5_path is None
-        self.latent_size = latent_size
         self.in_memory = in_memory
         self._dataset_name: Optional[str] = None
         self._h5 = None
         self._dataset = None
         self._data: Optional[torch.Tensor] = None
 
-        if self.synthetic:
-            self.num_sequences = num_sequences
-            self.seq_len = seq_len
-        else:
-            with h5py.File(self.hdf5_path, 'r') as f:
-                if 'controls' in f:
-                    ds = f['controls']
-                    self._dataset_name = 'controls'
-                else:
-                    ds = f['latents']
-                    self._dataset_name = 'latents'
-                self.num_sequences = ds.shape[0]
-                self.seq_len = ds.shape[1]
-                self.latent_size = ds.shape[2]
-                if self.in_memory:
-                    np_data = ds[:]
-                    if np_data.dtype != 'float32':
-                        np_data = np_data.astype('float32')
-                    self._data = torch.from_numpy(np_data)
-                    try:
-                        self._data.share_memory_()
-                    except RuntimeError:
-                        pass
+        with h5py.File(self.hdf5_path, 'r') as f:
+            if 'controls' in f:
+                ds = f['controls']
+                self._dataset_name = 'controls'
+            else:
+                ds = f['latents']
+                self._dataset_name = 'latents'
+            self.num_sequences = ds.shape[0]
+            self.seq_len = ds.shape[1]
+            if self.in_memory:
+                np_data = ds[:]
+                if np_data.dtype != 'float32':
+                    np_data = np_data.astype('float32')
+                self._data = torch.from_numpy(np_data)
+                try:
+                    self._data.share_memory_()
+                except RuntimeError:
+                    pass
 
     def _ensure_dataset(self):
-        if self.synthetic or self._dataset is not None or self._data is not None:
+        if self._dataset is not None and self._data is not None:
             return
         self._h5 = h5py.File(self.hdf5_path, 'r')
+        print(f"Loaded dataset at {self.hdf5_path}")
         dataset_name = self._dataset_name or ('controls' if 'controls' in self._h5 else 'latents')
         self._dataset_name = dataset_name
         self._dataset = self._h5[dataset_name]
@@ -64,6 +55,14 @@ class PriorSequenceDataset(Dataset):
             finally:
                 self._h5 = None
                 self._dataset = None
+
+    @property
+    def num_controls(self):
+        print("ensuring dataset for num_controls")
+        self._ensure_dataset()
+
+        print(f"dataset: {self._dataset}")
+        return self._dataset.shape[2]
 
     def __del__(self):
         self.close()
@@ -79,9 +78,6 @@ class PriorSequenceDataset(Dataset):
         return self.num_sequences
 
     def __getitem__(self, idx):
-        if self.synthetic:
-            x = torch.randn(self.seq_len, self.latent_size).tanh()
-            return x
         if self._data is not None:
             return self._data[idx]
         self._ensure_dataset()

@@ -30,7 +30,7 @@ def main(cfg: DictConfig):
 
     # Shared audio params
     fs = int(cfg.audio.fs)
-    resampling_factor = int(cfg.audio.resampling_factor)
+    resampling_factor = int(cfg.model.resampling_factor)
     chunk_duration_s = float(cfg.audio.chunk_duration_s)
     n_signal = int(fs * chunk_duration_s)
 
@@ -80,7 +80,7 @@ def main(cfg: DictConfig):
         if 'prior_export' in cfg else 'latents.h5'
     )
 
-    stats = build_controls_hdf5(ds, model, out_path=out_path, device=device)
+    stats = build_controls_hdf5(ds, model, out_path=out_path, seq_len=cfg.prior.model.max_len, stride_factor=cfg.prior.dataset.stride_factor, device=device)
     print(f"Exported latents to {stats['path']} with {stats['num_sequences']} sequences")
 
 if __name__ == "__main__":
