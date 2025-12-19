@@ -357,7 +357,10 @@ class BendableNoiseBandSynth(BaseSynth):
                streaming: bool = False):
     super().__init__()
 
+    print(f"Initializing BendableNoiseBandSynth with resampling_factor {resampling_factor}...")
+
     self._streaming = streaming
+    self._resampling_factor = resampling_factor
 
     self._noiseband_synth = NoiseBandSynth(
       n_filters=n_filters,

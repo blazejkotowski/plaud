@@ -28,7 +28,6 @@ class ScriptedDDSP(nn_tilde.Module):
     self.pretrained = pretrained
 
     self.resample_ratio = target_fs / self.pretrained.fs
-    print("resample ratio:", self.resample_ratio )
 
     numerator = self.pretrained.resampling_factor * target_fs
     denominator = int(self.pretrained.fs)
