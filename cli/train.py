@@ -50,7 +50,7 @@ def main(cfg: DictConfig) -> None:
       pass
   # Shared audio params
   fs = int(cfg.audio.fs)
-  resampling_factor = int(cfg.audio.resampling_factor)
+  resampling_factor = int(cfg.model.resampling_factor)
   chunk_duration_s = float(cfg.audio.chunk_duration_s)
   n_signal = int(fs * chunk_duration_s)
 
