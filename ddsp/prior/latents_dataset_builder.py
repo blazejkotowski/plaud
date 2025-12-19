@@ -12,6 +12,8 @@ def export_latents(
     audio_ds: AudioFeatureDataset,
     model: DDSP,
     out_path: str,
+    seq_len: int = 128,
+    stride_factor: float = 0.2,
     device: Optional[str] = None,
 ):
     """
@@ -36,11 +38,9 @@ def export_latents(
 
     # Encode in manageable chunks (e.g., 40s)
     sr = audio_ds._sampling_rate if hasattr(audio_ds, "_sampling_rate") else 44100
-    resampling_factor = getattr(model, "_resampling_factor", 256)
+    resampling_factor = model.resampling_factor
 
     # Sequence/windowing params (fallback defaults)
-    seq_len = getattr(audio_ds, "_sequence_length", 256)
-    stride_factor = getattr(audio_ds, "_stride_factor", 1.0)
     stride = max(1, int(seq_len * stride_factor))
 
     windows_lat = []

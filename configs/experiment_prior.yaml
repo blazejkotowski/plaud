@@ -8,7 +8,7 @@ prior:
   num_layers: 4
   dropout: 0.1
   max_len: 256
-  lr: 1e-3
+  lr: 1e-4
 
 # Optional normalization for latent values; if omitted, model clamps to [-1,1]
 # normalization:
@@ -19,10 +19,15 @@ dataset:
   # Provide HDF5 with dataset "latents" or use synthetic data
   hdf5_path: null
   num_sequences: 256
-  seq_len: 256
+  seq_len: 128
   latent_size: 8
+  stride_factor: 0.2
+  in_memory: true  # cache entire HDF5 into RAM to keep GPU fed; disable if dataset is too large
 
 training:
-  batch_size: 32
+  batch_size: 256
   num_workers: 4
-  max_epochs: 2
+  max_epochs: 10000
+  output_dir: training/prior/prior
+  resume: true
+  force_restart: false
