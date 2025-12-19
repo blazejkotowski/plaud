@@ -102,9 +102,14 @@ class DDSP(L.LightningModule):
 
     # self.synths = synths
     # self.synths = torch.nn.ModuleList([builder() for builder in self._synth_builders])
-    self.synths = torch.nn.ModuleList([
-      BaseSynth.from_config(cfg | {resampling_factor: resampling_factor}).to(self._device) for cfg in self._synth_configs
-    ])
+    print(f"Building synthesizers..., resampling_factor: {resampling_factor}")
+    # Build the synthesizers from config
+    synths: List[BaseSynth] = []
+    for cfg in self._synth_configs:
+      cfg['params']['resampling_factor'] = resampling_factor
+      synth = BaseSynth.from_config(cfg).to(self._device)
+      synths.append(synth)
+    self.synths = torch.nn.ModuleList(synths)
 
     # Latent space analyzis buffers
 
