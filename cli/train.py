@@ -14,6 +14,7 @@ from ddsp import DDSP, AudioFeatureDataset
 from ddsp.synths import BendableNoiseBandSynth
 from ddsp.callbacks import BetaWarmupCallback
 from ddsp.interfaces import build_control_space
+from ddsp.augmentations import build_audio_augmentation_pipeline
 from ddsp.registry import SYNTHS
 
 from ddsp.prior import Prior, PriorDataset
@@ -47,7 +48,14 @@ def main(cfg: DictConfig) -> None:
   os.makedirs(synth_training_path, exist_ok=True)
 
   # Control space
-  control_space = build_control_space(cfg.data.control_space)
+  control_space = build_control_space(cfg.model.control_space)
+
+  # Optional audio augmentations
+  transform_fn = build_audio_augmentation_pipeline(
+    getattr(cfg.data, 'augmentations', None),
+    n_signal=n_signal,
+    sampling_rate=fs,
+  )
 
   # Dataset
   synth_dataset = AudioFeatureDataset(
@@ -56,6 +64,7 @@ def main(cfg: DictConfig) -> None:
     sampling_rate=fs,
     resampling_factor=resampling_factor,
     control_space=control_space,
+    transform_fn=transform_fn,
   )
 
   # Dataloaders

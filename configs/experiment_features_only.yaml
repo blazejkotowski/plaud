@@ -10,6 +10,13 @@ audio:
 
 data:
   dataset_path: /path/to/dataset
+  augmentations:
+    - type: RandomMute
+      params:
+        prob: 0.1
+
+model:
+  resampling_factor: 256
   control_space:
     - name: loudness
       dim: 1
@@ -28,9 +35,6 @@ data:
         smoothing_kernel_size: 65
         postprocess: true
     # No latent field (dim=0 implied)
-
-model:
-  resampling_factor: 256
   synths:
     - type: BendableNoiseBandSynth
       params:
@@ -75,7 +79,6 @@ prior:
     max_len: 64
 
   dataset:
-    hdf5_path: null
     stride_factor: 0.2
     in_memory: true
 
@@ -85,11 +88,11 @@ prior:
       # max: 1.0
 
   training:
-     batch_size: 256
-     max_epochs: 10000
-     num_workers: 4
-     lr: 1e-4
-     force_restart: false
+    batch_size: 256
+    max_epochs: 10000
+    num_workers: 4
+    lr: 1e-4
+    force_restart: false
 
 
 
