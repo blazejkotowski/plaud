@@ -1,10 +1,9 @@
 import os
-import tempfile
 import torch
 import lightning as L
 from torch.utils.data import DataLoader
 
-from ddsp.prior.latents_dataset_builder import export_latents
+from ddsp.prior.lmdb_cache import ensure_prior_controls_lmdb
 from ddsp.prior.dataset import PriorSequenceDataset
 from ddsp.prior.prior import Prior
 
@@ -22,6 +21,8 @@ class TinyAudioDS:
 class DummyDDSP:
     def __init__(self, latent_size=4, resampling_factor=256):
         self._resampling_factor = resampling_factor
+        self.latent_size = latent_size
+        self.resampling_factor = resampling_factor
     def to(self, dev):
         return self
     def reparametrize(self, mu, scale):
@@ -40,21 +41,28 @@ class DummyDDSP:
 
 
 def test_export_load_train_prior(tmp_path):
-    # Export controls + latents
+    # Build LMDB cache
     ds = TinyAudioDS(T=44100, sequence_length=64)
     ddsp_model = DummyDDSP()
 
-    out_file = tmp_path / 'controls_latents.h5'
-    stats = export_latents(ds, ddsp_model, str(out_file), device='cpu')
-    assert os.path.exists(out_file)
+    out_dir = tmp_path / 'controls_latents.lmdb'
+    stats = ensure_prior_controls_lmdb(
+        audio_ds=ds,
+        ddsp=ddsp_model,
+        out_path=str(out_dir),
+        seq_len=ds._sequence_length,
+        stride_factor=1.0,
+        device='cpu',
+    )
+    assert os.path.exists(out_dir)
+    assert int(stats["num_sequences"]) > 0
 
     # Load controls for training
-    train_ds = PriorSequenceDataset(hdf5_path=str(out_file))
+    train_ds = PriorSequenceDataset(path=str(out_dir))
     assert train_ds.seq_len == ds._sequence_length
 
-    # Build Prior model with control_size as latent_size
-    control_size = train_ds.latent_size
-    model = Prior(latent_size=control_size, embedding_dim=16, quantization_channels=32, nhead=4, num_layers=2, dropout=0.0, max_len=128, lr=1e-3, normalization_dict=None, device='cpu')
+    # Build Prior model
+    model = Prior(num_controls=train_ds.num_controls, embedding_dim=16, quantization_channels=32, nhead=4, num_layers=2, dropout=0.0, max_len=128, lr=1e-3, normalization_dict=None, device='cpu')
 
     # Train for 1 epoch
     dl = DataLoader(train_ds, batch_size=8, shuffle=True)

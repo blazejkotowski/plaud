@@ -1,11 +1,8 @@
 import os
-import tempfile
 import torch
-import h5py
 
-import pytest
-
-from ddsp.prior.latents_dataset_builder import export_latents
+from ddsp.prior.dataset import PriorSequenceDataset
+from ddsp.prior.lmdb_cache import ensure_prior_controls_lmdb
 
 class TinyAudioDS:
     def __init__(self, T=44100*2, sampling_rate=44100, sequence_length=64, stride_factor=1.0):
@@ -22,6 +19,8 @@ class TinyAudioDS:
 class DummyDDSP:
     def __init__(self, latent_size=4, resampling_factor=256):
         self._resampling_factor = resampling_factor
+        self.latent_size = latent_size
+        self.resampling_factor = resampling_factor
     def to(self, dev):
         return self
     def reparametrize(self, mu, scale):
@@ -46,21 +45,24 @@ class DummyDDSP:
         return self.__call_encoder__(audio_batch)
 
 
-def test_exporter_creates_hdf5_with_latents(tmp_path):
+def test_exporter_creates_lmdb_with_controls(tmp_path):
     ds = TinyAudioDS(T=44100, sequence_length=64)
     model = DummyDDSP()
 
-    out_file = tmp_path / 'latents.h5'
-    stats = export_latents(ds, model, str(out_file), device='cpu')
+    out_dir = tmp_path / 'prior_cache_test.lmdb'
+    stats = ensure_prior_controls_lmdb(
+        audio_ds=ds,
+        ddsp=model,
+        out_path=str(out_dir),
+        seq_len=ds._sequence_length,
+        stride_factor=1.0,
+        device='cpu',
+    )
 
-    assert os.path.exists(out_file)
-    with h5py.File(out_file, 'r') as h:
-        assert 'latents' in h
-        latents = h['latents']
-        assert latents.ndim == 3
-        assert latents.shape[1] == ds._sequence_length
-        # exporter does not store separate features; concatenated controls exist
-        assert 'controls' in h
-        controls = h['controls']
-        assert controls.ndim == 3
-        assert controls.shape[1] == ds._sequence_length
+    assert os.path.exists(out_dir)
+    assert int(stats["seq_len"]) == ds._sequence_length
+    assert int(stats["num_sequences"]) > 0
+
+    train_ds = PriorSequenceDataset(path=str(out_dir), in_memory=True)
+    assert train_ds.seq_len == ds._sequence_length
+    assert train_ds.num_controls > 0

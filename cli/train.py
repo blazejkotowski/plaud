@@ -8,13 +8,12 @@ torch.set_float32_matmul_precision('medium')
 
 import os
 import shutil
-from typing import List
 
 from torch.utils.data import DataLoader, Subset, random_split
 from ddsp import DDSP, AudioFeatureDataset
 from ddsp.synths import BendableNoiseBandSynth
 from ddsp.callbacks import BetaWarmupCallback
-from ddsp.interfaces import ControlField, ControlSpace
+from ddsp.interfaces import build_control_space
 from ddsp.registry import SYNTHS
 
 from ddsp.prior import Prior, PriorDataset
@@ -23,20 +22,6 @@ from ddsp.utils import find_checkpoint
 import hydra
 from omegaconf import DictConfig
 from hydra.core.hydra_config import HydraConfig
-
-
-def _build_control_space(cfg) -> ControlSpace:
-  fields: List[ControlField] = []
-  for f in cfg:
-    fields.append(ControlField(
-      name=f.name,
-      dim=int(f.dim),
-      source=str(f.source),
-      extractor=str(f.extractor) if 'extractor' in f else None,
-      params=dict(f.params) if 'params' in f else {},
-      normalization=dict(f.normalization) if 'normalization' in f else None,
-    ))
-  return ControlSpace(tuple(fields))
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="experiment")
@@ -62,7 +47,7 @@ def main(cfg: DictConfig) -> None:
   os.makedirs(synth_training_path, exist_ok=True)
 
   # Control space
-  control_space = _build_control_space(cfg.data.control_space)
+  control_space = build_control_space(cfg.data.control_space)
 
   # Dataset
   synth_dataset = AudioFeatureDataset(

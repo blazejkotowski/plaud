@@ -7,7 +7,7 @@ hydra_spec = importlib.util.find_spec("hydra")
 
 from ddsp.ddsp import DDSP
 if hydra_spec is not None:
-    from cli.train import _build_control_space
+    from ddsp.interfaces import build_control_space
 
 
 @pytest.mark.skipif(omegaconf_spec is None or hydra_spec is None, reason="OmegaConf/Hydra not installed in env")
@@ -16,11 +16,11 @@ def test_config_hybrid_builds_model_and_forward():
     cfg = OmegaConf.load("configs/experiment_hybrid.yaml")
 
     fs = int(cfg.audio.fs)
-    resampling = int(cfg.model.resampling_factor)
+    resampling = int(cfg.audio.resampling_factor)
     n_signal = int(fs * float(cfg.audio.chunk_duration_s))
     T_ctl = n_signal // resampling
 
-    control_space = _build_control_space(cfg.data.control_space)
+    control_space = build_control_space(cfg.data.control_space)
 
     synth_configs = []
     for s in cfg.model.synths:

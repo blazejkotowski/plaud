@@ -107,6 +107,7 @@ class DDSP(L.LightningModule):
     synths: List[BaseSynth] = []
     for cfg in self._synth_configs:
       cfg['params']['resampling_factor'] = resampling_factor
+      cfg['params']['fs'] = fs
       synth = BaseSynth.from_config(cfg).to(self._device)
       synths.append(synth)
     self.synths = torch.nn.ModuleList(synths)

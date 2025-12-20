@@ -69,6 +69,53 @@ class ControlSpace:
         return tuple(f.name for f in self.fields)
 
 
+def build_control_space(fields_cfg: Iterable[Any]) -> ControlSpace:
+    """Build a :class:`ControlSpace` from config-like field specs.
+
+    Supports Hydra/OmegaConf nodes, plain dicts, or simple objects with attributes.
+    Expected keys/attrs per field: name, dim, source, optional extractor, params, normalization.
+    """
+
+    def _get(obj: Any, key: str, default: Any = None) -> Any:
+        if isinstance(obj, Mapping):
+            return obj.get(key, default)
+        get_fn = getattr(obj, "get", None)
+        if callable(get_fn):
+            try:
+                return get_fn(key, default)
+            except TypeError:
+                # Some config objects have a different get() signature
+                pass
+        return getattr(obj, key, default)
+
+    fields: List[ControlField] = []
+    for f in fields_cfg:
+        name = str(_get(f, "name"))
+        dim = int(_get(f, "dim"))
+        source = str(_get(f, "source"))
+        extractor = _get(f, "extractor", None)
+        extractor = str(extractor) if extractor is not None else None
+
+        params = _get(f, "params", None)
+        params_dict = dict(params) if params is not None else {}
+
+        normalization = _get(f, "normalization", None)
+        normalization_dict = dict(normalization) if normalization is not None else None
+
+        fields.append(
+            ControlField(
+                name=name,
+                dim=dim,
+                source=source,
+                extractor=extractor,
+                params=params_dict,
+                normalization=normalization_dict,
+            )
+        )
+
+    return ControlSpace(tuple(fields))
+
+
 # ---------------------------
 # Component Protocols
 # ---------------------------
@@ -223,6 +270,7 @@ class Exporter(Protocol):
 __all__ = [
     "ControlField",
     "ControlSpace",
+    "build_control_space",
     "FeatureExtractor",
     "Encoder",
     "Decoder",
