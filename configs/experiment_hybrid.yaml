@@ -6,11 +6,17 @@ experiment:
 
 audio:
   fs: 22050
-  resampling_factor: 32
   chunk_duration_s: 2.0
 
 data:
   dataset_path: /path/to/dataset
+  augmentations:
+    - type: RandomMute
+      params:
+        prob: 0.1
+
+model:
+  resampling_factor: 32
   control_space:
     - name: loudness
       dim: 1
@@ -31,14 +37,10 @@ data:
     - name: latents
       dim: 2
       source: latent
-
-model:
   synths:
     - type: BendableNoiseBandSynth
       params:
         n_filters: 512
-        fs: ${audio.fs}
-        resampling_factor: ${audio.resampling_factor}
   latent_smoothing_kernel: 65
   decoder_gru_layers: 2
   learning_rate: 1e-4
@@ -66,3 +68,25 @@ trainer:
   max_epochs: 5001
   log_every_n_steps: 10
   force_restart: false
+
+prior:
+  enabled: false
+
+  model:
+    embedding_dim: 32
+    quantization_channels: 32
+    nhead: 8
+    num_layers: 4
+    dropout: 0.1
+    max_len: 64
+
+  dataset:
+    stride_factor: 0.2
+    in_memory: true
+
+  training:
+    batch_size: 256
+    max_epochs: 10000
+    num_workers: 4
+    lr: 1e-4
+    force_restart: false

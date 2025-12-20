@@ -25,11 +25,15 @@ def main(cfg: DictConfig):
   """
   L.seed_everything(cfg.get('seed', 42))
 
+  if not bool(cfg.prior.get('enabled', True)):
+    print("cfg.prior.enabled is False; skipping prior training.")
+    return
+
   # Dataset (auto-cache controls/latents for prior)
   in_memory = cfg.prior.dataset.get('in_memory', True)
 
   # Infer control_space and synth configs from experiment config (same as DDSP training)
-  control_space = build_control_space(cfg.data.control_space)
+  control_space = build_control_space(cfg.model.control_space)
   synth_configs = []
   for s in cfg.model.synths:
     synth_configs.append({"class": s.type, "params": dict(s.params)})
