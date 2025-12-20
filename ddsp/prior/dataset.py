@@ -1,77 +1,96 @@
-import h5py
-import torch
-from torch.utils.data import Dataset
+from __future__ import annotations
+
+import pickle
 from typing import Optional
 
+import lmdb
+import torch
+from torch.utils.data import Dataset
+
 class PriorSequenceDataset(Dataset):
-    """Loads control sequences for Prior training."""
+    """Loads control sequences for Prior training.
+
+    Preferred format is LMDB (directory ending with .lmdb).
+    """
 
     def __init__(
         self,
-        hdf5_path: Optional[str] = None,
+        path: Optional[str] = None,
         in_memory: bool = True,
     ):
-        self.hdf5_path = hdf5_path
-        self.in_memory = in_memory
-        self._dataset_name: Optional[str] = None
-        self._h5 = None
-        self._dataset = None
+        if path is None:
+            raise ValueError("PriorSequenceDataset requires 'path'")
+
+        self.path = str(path)
+        self.in_memory = bool(in_memory)
+
         self._data: Optional[torch.Tensor] = None
 
-        with h5py.File(self.hdf5_path, 'r') as f:
-            if 'controls' in f:
-                ds = f['controls']
-                self._dataset_name = 'controls'
-            else:
-                ds = f['latents']
-                self._dataset_name = 'latents'
-            self.num_sequences = ds.shape[0]
-            self.seq_len = ds.shape[1]
-            if self.in_memory:
-                np_data = ds[:]
-                if np_data.dtype != 'float32':
-                    np_data = np_data.astype('float32')
-                self._data = torch.from_numpy(np_data)
-                try:
-                    self._data.share_memory_()
-                except RuntimeError:
-                    pass
+        # LMDB state
+        self._env = None
+        self._meta: Optional[dict] = None
 
-    def _ensure_dataset(self):
-        if self._dataset is not None and self._data is not None:
-            return
-        self._h5 = h5py.File(self.hdf5_path, 'r')
-        print(f"Loaded dataset at {self.hdf5_path}")
-        dataset_name = self._dataset_name or ('controls' if 'controls' in self._h5 else 'latents')
-        self._dataset_name = dataset_name
-        self._dataset = self._h5[dataset_name]
+        self._init_lmdb()
+
+    def _init_lmdb(self) -> None:
+        env = lmdb.open(self.path, readonly=True, lock=False, readahead=True, subdir=True)
+        with env.begin() as txn:
+            meta_buf = txn.get(b"metadata")
+            if meta_buf is None:
+                raise RuntimeError(f"LMDB prior cache missing metadata: {self.path}")
+            meta = pickle.loads(meta_buf)
+
+        self._meta = meta
+        self.num_sequences = int(meta["num_sequences"])
+        self.seq_len = int(meta["seq_len"])
+        self._num_controls = int(meta["num_controls"])
+
+        if self.in_memory:
+            # materialize to a single tensor (fastest training);
+            # format is float32 bytes, shape [seq_len, D]
+            data = torch.empty((self.num_sequences, self.seq_len, self._num_controls), dtype=torch.float32)
+            with env.begin() as txn:
+                for i in range(self.num_sequences):
+                    buf = txn.get(f"controls:{i:08d}".encode())
+                    if buf is None:
+                        raise RuntimeError(f"Missing key controls:{i:08d} in {self.path}")
+                    arr = torch.frombuffer(buf, dtype=torch.float32)
+                    data[i] = arr.view(self.seq_len, self._num_controls)
+            self._data = data
+            try:
+                self._data.share_memory_()
+            except RuntimeError:
+                pass
+            env.close()
+        else:
+            self._env = env
 
     def close(self):
-        if self._h5 is not None:
+        if self._env is not None:
             try:
-                self._h5.close()
+                self._env.close()
             except Exception:
                 pass
             finally:
-                self._h5 = None
-                self._dataset = None
+                self._env = None
+
+        # no HDF5 resources
 
     @property
     def num_controls(self):
-        print("ensuring dataset for num_controls")
-        self._ensure_dataset()
-
-        print(f"dataset: {self._dataset}")
-        return self._dataset.shape[2]
+        if self._data is not None:
+            return int(self._data.shape[2])
+        if self._meta is not None:
+            return int(self._meta["num_controls"])
+        raise RuntimeError("PriorSequenceDataset internal state invalid")
 
     def __del__(self):
         self.close()
 
     def __getstate__(self):
         state = self.__dict__.copy()
-        # h5py objects cannot be pickled; recreate per worker
-        state['_h5'] = None
-        state['_dataset'] = None
+        # lmdb/h5py objects cannot be pickled; recreate per worker
+        state['_env'] = None
         return state
 
     def __len__(self):
@@ -80,6 +99,14 @@ class PriorSequenceDataset(Dataset):
     def __getitem__(self, idx):
         if self._data is not None:
             return self._data[idx]
-        self._ensure_dataset()
-        x = torch.as_tensor(self._dataset[idx], dtype=torch.float32)
-        return x
+        if self._meta is not None:
+            if self._env is None:
+                self._env = lmdb.open(self.path, readonly=True, lock=False, readahead=True, subdir=True)
+            with self._env.begin() as txn:
+                buf = txn.get(f"controls:{idx:08d}".encode())
+                if buf is None:
+                    raise IndexError(idx)
+                x = torch.frombuffer(buf, dtype=torch.float32).view(self.seq_len, self.num_controls)
+            return x
+
+        raise RuntimeError("PriorSequenceDataset internal state invalid")

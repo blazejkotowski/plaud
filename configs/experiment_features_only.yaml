@@ -35,7 +35,6 @@ model:
     - type: BendableNoiseBandSynth
       params:
         n_filters: 512
-        fs: ${audio.fs}
   latent_smoothing_kernel: 65
   decoder_gru_layers: 2
   learning_rate: 1e-4

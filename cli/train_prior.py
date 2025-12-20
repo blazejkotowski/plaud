@@ -1,5 +1,4 @@
 import os
-import os
 import torch
 import lightning as L
 from torch.utils.data import DataLoader
@@ -10,6 +9,8 @@ from omegaconf import DictConfig
 
 from ddsp.prior.prior import Prior
 from ddsp.prior.dataset import PriorSequenceDataset
+from ddsp.prior.lmdb_cache import build_or_load_prior_cache_from_cfg
+from ddsp.interfaces import build_control_space
 from ddsp.utils import find_checkpoint
 
 
@@ -24,11 +25,23 @@ def main(cfg: DictConfig):
   """
   L.seed_everything(cfg.get('seed', 42))
 
-  # Dataset
-  ds = PriorSequenceDataset(
-    hdf5_path=cfg.prior.dataset.get('hdf5_path', None),
-    in_memory=cfg.prior.dataset.get('in_memory', True),
+  # Dataset (auto-cache controls/latents for prior)
+  in_memory = cfg.prior.dataset.get('in_memory', True)
+
+  # Infer control_space and synth configs from experiment config (same as DDSP training)
+  control_space = build_control_space(cfg.data.control_space)
+  synth_configs = []
+  for s in cfg.model.synths:
+    synth_configs.append({"class": s.type, "params": dict(s.params)})
+
+  lmdb_path, stats = build_or_load_prior_cache_from_cfg(
+    cfg,
+    control_space=control_space,
+    synth_configs=synth_configs,
+    device='cuda' if torch.cuda.is_available() else 'cpu',
   )
+  print(f"Prior cache: {lmdb_path} (rebuilt={stats.get('rebuilt', False)})")
+  ds = PriorSequenceDataset(path=lmdb_path, in_memory=in_memory)
   num_workers = cfg.prior.training.get('num_workers', 4)
   pin_memory = torch.cuda.is_available()
   prefetch_factor = cfg.prior.training.get('prefetch_factor', 2)

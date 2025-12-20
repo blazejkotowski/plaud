@@ -7,16 +7,16 @@ from ddsp.prior.prior import Prior
 def test_prior_forward_shapes_and_loss():
     batch_size = 2
     seq_len = 16
-    latent_size = 8
+    num_controls = 8
 
-    model = Prior(latent_size=latent_size, embedding_dim=16, quantization_channels=32, nhead=8, num_layers=2, dropout=0.0, max_len=64, lr=1e-3, normalization_dict=None, device='cpu')
+    model = Prior(num_controls=num_controls, embedding_dim=16, quantization_channels=32, nhead=8, num_layers=2, dropout=0.0, max_len=64, lr=1e-3, normalization_dict=None, device='cpu')
 
     # random continuous latents in [-1, 1]
-    x = torch.randn(batch_size, seq_len, latent_size).tanh()
+    x = torch.randn(batch_size, seq_len, num_controls).tanh()
 
     # logits shape
     logits = model(x)
-    assert logits.shape == (batch_size, seq_len, latent_size, model._quantization_channels)
+    assert logits.shape == (batch_size, seq_len, num_controls, model._quantization_channels)
 
     # step computes loss dict
     loss = model._step(x)
@@ -28,9 +28,9 @@ def test_prior_forward_shapes_and_loss():
 
 
 def test_prior_generate_length():
-    latent_size = 8
-    model = Prior(latent_size=latent_size, embedding_dim=16, quantization_channels=32, nhead=8, num_layers=2, dropout=0.0, max_len=32, lr=1e-3, normalization_dict=None, device='cpu')
+    num_controls = 8
+    model = Prior(num_controls=num_controls, embedding_dim=16, quantization_channels=32, nhead=8, num_layers=2, dropout=0.0, max_len=32, lr=1e-3, normalization_dict=None, device='cpu')
 
-    prime = torch.zeros(4, latent_size)
+    prime = torch.zeros(4, num_controls)
     out = model.generate(prime=prime, seq_len=20, temperature=0.5)
-    assert out.shape == (20, latent_size)
+    assert out.shape == (20, num_controls)
