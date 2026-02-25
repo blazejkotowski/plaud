@@ -3,6 +3,7 @@
 from .attribute_regularization_loss import AttributeRegularizationLoss
 from .sliced_wasserstein_loss import SlicedWassersteinLoss
 from .multi_scale_sliced_wasserstein_loss import MultiScaleSlicedWassersteinLoss
+from .mse_loss import MSELoss
 
 # Local registration of losses into the global registry
 from ddsp.registry import LOSSES
@@ -10,3 +11,4 @@ from ddsp.registry import LOSSES
 LOSSES.add("AttributeRegularizationLoss", AttributeRegularizationLoss)
 LOSSES.add("SlicedWassersteinLoss", SlicedWassersteinLoss)
 LOSSES.add("MultiScaleSlicedWassersteinLoss", MultiScaleSlicedWassersteinLoss)
+LOSSES.add("MSELoss", MSELoss)

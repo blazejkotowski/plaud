@@ -33,7 +33,7 @@ class LibrosaFeatureExtractor(BaseExtractor):
     self._postprocess = postprocess
 
 
-  def _calculate(self, audio: torch.Tensor) -> torch.Tensor:
+  def _calculate(self, audio: torch.Tensor, *args) -> torch.Tensor:
     """
     Implementation of the loudness extractor with librosa. Extracts the loudness
     and returns and interpolated tensor with values for each audio sample.

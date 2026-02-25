@@ -26,14 +26,20 @@ model:
         feature_fn_name: rms
         smoothing_kernel_size: 65
         postprocess: true
-    - name: centroid
+    # - name: centroid
+    #   dim: 1
+    #   source: feature
+    #   extractor: LibrosaFeatureExtractor
+    #   params:
+    #     feature_fn_name: spectral_centroid
+    #     smoothing_kernel_size: 65
+    #     postprocess: true
+    - name: pitch
       dim: 1
       source: feature
-      extractor: LibrosaFeatureExtractor
+      extractor: CrepePitchExtractor
       params:
-        feature_fn_name: spectral_centroid
-        smoothing_kernel_size: 65
-        postprocess: true
+        postprocess: True
     # No latent field (dim=0 implied)
   synths:
     - type: BendableNoiseBandSynth
@@ -54,9 +60,9 @@ losses:
 adversarial:
   enabled: true
   weights:
-    gen: 1.0
+    gen: 0.1
+    fm: 0.1
     disc: 1.0
-    fm: 1.0
   schedule:
     g_start_epoch: 100
     d_start_epoch: 150
@@ -72,7 +78,7 @@ prior:
 
   model:
     embedding_dim: 32
-    quantization_channels: 32
+    quantization_channels: 16
     nhead: 8
     num_layers: 4
     dropout: 0.1
