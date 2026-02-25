@@ -1,0 +1,95 @@
+# ComplexSineSynth experiment — complex-surrogate frequency estimation
+# Uses ONLY the ComplexSineSynth (no noise bands / other synths).
+#
+# Run:
+#   python -m cli.train -cn experiment_complex_sine \
+#     data.dataset_path=/path/to/dataset \
+#     ++experiment.name=my_experiment \
+#     trainer.force_restart=true
+
+experiment:
+  name: ddsp_complex_sine
+  training_dir: training
+
+audio:
+  fs: 22050
+  chunk_duration_s: 2.0
+
+data:
+  dataset_path: /path/to/dataset
+  augmentations:
+    - type: RandomMute
+      params:
+        prob: 0.1
+
+model:
+  resampling_factor: 32
+  control_space:
+    - name: loudness
+      dim: 1
+      source: feature
+      extractor: LibrosaFeatureExtractor
+      params:
+        feature_fn_name: rms
+        smoothing_kernel_size: 65
+        postprocess: true
+    - name: pitch
+      dim: 1
+      source: feature
+      extractor: CrepePitchExtractor
+      params:
+        postprocess: true
+    # - name: latents
+    #   dim: 8
+    #   source: latent
+  synths:
+    - type: ComplexSineSynth
+      params:
+        n_sines: 64
+  latent_smoothing_kernel: 65
+  decoder_gru_layers: 2
+  learning_rate: 1e-4
+  plateau_patience: 100000
+  capacity: 32
+
+losses:
+  - type: MSELoss
+    weight: 1.0
+
+adversarial:
+  enabled: true
+  weights:
+    gen: 1.0
+    fm: 1.0
+    disc: 1.0
+  schedule:
+    g_start_epoch: 100
+    d_start_epoch: 150
+
+trainer:
+  batch_size: 8
+  max_epochs: 5001
+  log_every_n_steps: 10
+  force_restart: false
+
+prior:
+  enabled: false
+
+  model:
+    embedding_dim: 32
+    quantization_channels: 16
+    nhead: 8
+    num_layers: 4
+    dropout: 0.1
+    max_len: 64
+
+  dataset:
+    stride_factor: 0.2
+    in_memory: true
+
+  training:
+    batch_size: 256
+    max_epochs: 10000
+    num_workers: 4
+    lr: 1e-4
+    force_restart: false
