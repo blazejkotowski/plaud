@@ -19,8 +19,8 @@ class BaseExtractor(object):
     Returns:
       - features: torch.Tensor [T_audio, C] or [B, T_audio, C] (audio-rate)
     """
-    return self._calculate(audio, *args)
+    return self._calculate(audio, fs, *args)
 
-  def _calculate(self, audio: torch.Tensor, *args) -> torch.Tensor:
+  def _calculate(self, audio: torch.Tensor, fs: int, *args) -> torch.Tensor:
     """Implementation of the feature extractor at audio rate."""
     raise NotImplementedError

@@ -49,26 +49,38 @@ python -m cli.train -cn experiment_hybrid \
 ```
 
 Notes:
-- New keys require a leading `+` (struct mode): e.g., `+prior_export.out_path=...`.
+- New keys require a leading `+` (struct mode).
 - GPU is used when available. For CPU-only runs, set the Trainer `accelerator='cpu'` in the config or script, and ensure CUDA defaults are disabled.
 
-### 2) Export controls for Prior
+### 2) Train the Prior
 
-Build an HDF5 with concatenated `controls` (and `latents` when present). Use the same experiment config to keep ControlSpace consistent.
+Train the transformer Prior on control sequences derived from your dataset and a trained DDSP model.
 
-```zsh
-python -m cli.export_prior_latents --config-name experiment_features_only \
-  +prior_export.out_path=/absolute/path/controls_latents.h5
-```
+On the first run, `cli.train_prior` automatically builds an LMDB cache next to the dataset directory (named like `prior_cache_<key>.lmdb`). It then trains the Prior on that cache, and subsequent runs reuse it.
 
-### 3) Train the Prior
-
-Train the transformer Prior from exported HDF5 controls.
+Run it with the *same* config + overrides you used for DDSP training:
 
 ```zsh
-python -m cli.train_prior dataset.hdf5_path=/absolute/path/controls_latents.h5 \
-  training.max_epochs=10 training.batch_size=32
+python -m cli.train_prior -cn experiment_features_only \
+  data.dataset_path=/absolute/path/to/dataset \
+  ++experiment.name=my_run
 ```
+
+Common overrides:
+
+```zsh
+python -m cli.train_prior -cn experiment_features_only \
+  data.dataset_path=/absolute/path/to/dataset \
+  ++experiment.name=my_run \
+  prior.model.max_len=64 \
+  prior.dataset.stride_factor=0.2 \
+  prior.training.max_epochs=10 \
+  prior.training.batch_size=256
+```
+
+Notes:
+- If `prior.enabled=false` in the chosen config, the script will print a message and exit.
+- To force rebuilding the cache, delete the `prior_cache_*.lmdb` directory (or change cache-relevant settings like `prior.model.max_len` / `prior.dataset.stride_factor`).
 
 ### 4) Export models (nn~ / TorchScript or ONNX)
 
@@ -85,7 +97,7 @@ python -m cli.export \
 # With Prior
 python -m cli.export \
   --model_directory /path/to/synth/training/dir \
-  --prior_directory /path/to/prior/training/dir \
+  --prior_directory /path/to/training/prior/my_run \
   --output_path /path/to/output/model.ts \
   --type last \
   --target_fs 16000
@@ -118,9 +130,10 @@ python -m pytest -q
 
 ## Troubleshooting
 
-- HDF5 export requires enough audio for the window length; adjust `sequence_length` in dataset or use longer audio.
+- If the prior cache build fails with “No control windows produced”, your dataset chunks are too short for `prior.model.max_len`; reduce `prior.model.max_len`, increase dataset duration, or adjust `audio.chunk_duration_s`.
 - If you see Hydra struct mode errors when adding keys, prefix overrides with `+`.
 - For CPU-only environments, ensure CUDA defaults are disabled and set Trainer `accelerator='cpu'`.
+
 
 ## Max/MSP and PureData
 

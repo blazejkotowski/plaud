@@ -396,6 +396,15 @@ class DDSP(L.LightningModule):
     if z is None:
       # Provide zero latents when latent space is disabled (keeps decoder interface stable for JIT)
       z = torch.zeros(features.shape[0], features.shape[1], max(self.latent_size, 1), device=features.device, dtype=features.dtype)
+
+    # Align time dimensions: encoder downsampling may differ from dataset's T_ctl by ±1
+    T_feat = features_for_decoder.shape[1]
+    T_z = z.shape[1]
+    if T_feat != T_z:
+      T_min = min(T_feat, T_z)
+      features_for_decoder = features_for_decoder[:, :T_min, :]
+      z = z[:, :T_min, :]
+
     synth_params = self.decoder(features_for_decoder, z)
     # Decoder outputs [B, n_params, T_ctl]; synthesize to audio-rate
     assert synth_params.shape[1] == self._total_synth_params, "decoder param size mismatch"
@@ -629,6 +638,16 @@ class DDSP(L.LightningModule):
 
     # Features are already at control rate; verify shape
     assert x_features.dim() == 3 and x_features.shape[-1] == self.feature_dim, "x_features must be [B, T_ctl, feature_dim]"
+
+    # Align time dimensions: the encoder's scale_factor downsampling may
+    # produce a slightly different T than the dataset's ceil-based T_ctl.
+    T_feat = x_features.shape[1]
+    T_z = z.shape[1]
+    if T_feat != T_z:
+      T_min = min(T_feat, T_z)
+      x_features = x_features[:, :T_min, :]
+      z = z[:, :T_min, :]
+
     # When feature_dim==0, create a dummy single-channel zero feature for decoder path
     x_features_for_decoder = x_features if self.feature_dim > 0 else torch.zeros(x_features.shape[0], x_features.shape[1], 1, device=x_features.device, dtype=x_features.dtype)
     synth_params = self.decoder(x_features_for_decoder, z)
@@ -680,7 +699,7 @@ class DDSP(L.LightningModule):
       # Explicit per-synth routing without introspection
       name = synth.jit_name
 
-      if name in ("NoiseBandSynth", "SubbandSineSynth", "BendableNoiseBandSynth"):
+      if name in ("NoiseBandSynth", "SubbandSineSynth", "BendableNoiseBandSynth", "ComplexSineSynth"):
         audio.append(synth(synth_params, limit_components=limit_components, waveshaping_factor=waveshaping_factor))
       elif name in ("SineSynth",):
         audio.append(synth(synth_params, limit_components=limit_components))
