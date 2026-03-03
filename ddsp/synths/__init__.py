@@ -1,4 +1,4 @@
-from .synths import BaseSynth, SubbandSineSynth, SineSynth, NoiseBandSynth, HarmonicSynth, BendableNoiseBandSynth
+from .synths import BaseSynth, SubbandSineSynth, SineSynth, NoiseBandSynth, HarmonicSynth, BendableNoiseBandSynth, FilteredNoiseSynth, Reverb
 from .spectral_sine_synth import SpectralSineSynth
 from .complex_sine_synth import ComplexSineSynth
 
@@ -10,5 +10,6 @@ SYNTHS.add("NoiseBandSynth", NoiseBandSynth)
 SYNTHS.add("BendableNoiseBandSynth", BendableNoiseBandSynth)
 SYNTHS.add("SubbandSineSynth", SubbandSineSynth)
 SYNTHS.add("HarmonicSynth", HarmonicSynth)
+SYNTHS.add("FilteredNoiseSynth", FilteredNoiseSynth)
 SYNTHS.add("SpectralSineSynth", SpectralSineSynth)
 SYNTHS.add("ComplexSineSynth", ComplexSineSynth)

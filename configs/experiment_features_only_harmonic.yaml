@@ -42,9 +42,14 @@ model:
         postprocess: True
     # No latent field (dim=0 implied)
   synths:
-    - type: BendableNoiseBandSynth
+    - type: HarmonicSynth
       params:
-        n_filters: 512
+        n_harmonics: 100
+    - type: FilteredNoiseSynth
+      params:
+        n_bands: 65
+  reverb: true
+  reverb_length: 44100
   latent_smoothing_kernel: 65
   decoder_gru_layers: 2
   learning_rate: 1e-4

@@ -108,6 +108,8 @@ def main(cfg: DictConfig) -> None:
     adv_gen_weight=float(cfg.adversarial.weights.gen),
     adv_disc_weight=float(cfg.adversarial.weights.disc),
     adv_fm_weight=float(cfg.adversarial.weights.fm),
+    reverb=bool(getattr(cfg.model, 'reverb', False)),
+    reverb_length=int(getattr(cfg.model, 'reverb_length', fs)),
     config_name=active_config_name,
   )
 

@@ -52,7 +52,7 @@ def examine_model(model, batch, sampling_rate, path):
 
     # Decode -> synthesize (no waveshaping)
     synth_params = model.decoder(x_features_res, z).squeeze(1)
-    y_audio = model._synthesize(synth_params)  # [B, 1, T_gen]
+    y_audio = model._synthesize(synth_params, features=x_features_res)  # [B, 1, T_gen]
 
     print("x_audio shape:", tuple(x_audio.shape), "y_audio shape:", tuple(y_audio.shape))
 

@@ -11,7 +11,7 @@ import time
 from ddsp.utils import find_checkpoint
 
 from ddsp import DDSP
-from ddsp.interfaces import ControlField, ControlSpace
+from ddsp.interfaces import ControlField, ControlSpace, build_control_space
 import torch
 from ddsp.prior import Prior
 
@@ -130,7 +130,7 @@ class ScriptedDDSP(nn_tilde.Module):
       latents = torch.zeros(latents.size(0), latents.size(1), 1, device=latents.device)
 
     synth_params = self.pretrained.decoder(features, latents)
-    audio = self.pretrained._synthesize(synth_params, waveshaping_factor=self.waveshaping[0], limit_components=self.limit_components[0])
+    audio = self.pretrained._synthesize(synth_params, features=features, waveshaping_factor=self.waveshaping[0], limit_components=self.limit_components[0])
     # print("Audio shape before interpolation:", audio.shape)
 
     if self.resample_ratio != 1:
@@ -300,9 +300,9 @@ class ONNXDDSP(torch.nn.Module):
 
     self.pretrained = pretrained
 
-  def decode(self, latents: torch.Tensor):
+  def decode(self, latents: torch.Tensor, features: torch.Tensor = None):
     synth_params = self.pretrained.decoder(latents.permute(0, 2, 1))
-    audio = self.pretrained._synthesize(synth_params)
+    audio = self.pretrained._synthesize(synth_params, features=features)
     return audio
 
   def encode(self, audio: torch.Tensor):
@@ -349,19 +349,41 @@ if __name__ == '__main__':
 
     prior._trainer = L.Trainer()
 
-  # Reconstruct minimal ControlSpace from checkpoint hyperparameters
+  # Reconstruct ControlSpace from checkpoint hyperparameters.
+  # Prefer loading from the training config YAML (config_name hparam) so that
+  # HarmonicSynth gets individually-named feature fields (pitch, loudness).
   ckpt = torch.load(checkpoint_path, map_location='cpu')
   hparams = ckpt.get('hyper_parameters', {})
   feature_dim = int(hparams.get('feature_dim', 0))
   latent_size = int(hparams.get('latent_size', 0))
-  fields = []
-  if feature_dim > 0:
-    fields.append(ControlField(name='features', dim=feature_dim, source='feature', extractor=None))
-  if latent_size > 0:
-    fields.append(ControlField(name='latents', dim=latent_size, source='latent', extractor=None))
-  if len(fields) == 0:
-    raise RuntimeError("Checkpoint missing feature_dim/latent_size hparams; cannot reconstruct ControlSpace for export.")
-  control_space = ControlSpace(tuple(fields))
+  config_name = hparams.get('config_name', None)
+
+  control_space = None
+
+  # Try to build from YAML config (needed for HarmonicSynth)
+  if config_name:
+    import os, yaml
+    for candidate in [
+        os.path.join('configs', f'{config_name}.yaml'),
+        os.path.join(os.path.dirname(checkpoint_path), '..', f'{config_name}.yaml'),
+    ]:
+      if os.path.exists(candidate):
+        print(f"Building ControlSpace from config: {candidate}")
+        with open(candidate) as f:
+          cfg = yaml.safe_load(f)
+        control_space = build_control_space(cfg['model']['control_space'])
+        break
+
+  # Fallback: generic blob fields
+  if control_space is None:
+    fields = []
+    if feature_dim > 0:
+      fields.append(ControlField(name='features', dim=feature_dim, source='feature', extractor=None))
+    if latent_size > 0:
+      fields.append(ControlField(name='latents', dim=latent_size, source='latent', extractor=None))
+    if len(fields) == 0:
+      raise RuntimeError("Checkpoint missing feature_dim/latent_size hparams; cannot reconstruct ControlSpace for export.")
+    control_space = ControlSpace(tuple(fields))
 
   ddsp = DDSP.load_from_checkpoint(checkpoint_path, strict=False, streaming=True, device='cpu', control_space=control_space).to('cpu')
   ddsp.streaming(True)

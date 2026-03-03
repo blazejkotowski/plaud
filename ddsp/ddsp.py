@@ -7,10 +7,10 @@ import auraloss
 
 from ddsp.blocks import VariationalEncoder, Decoder
 from ddsp.discriminator import Discriminator
-from ddsp.synths import BaseSynth, SineSynth, SubbandSineSynth, NoiseBandSynth, BendableNoiseBandSynth
+from ddsp.synths import BaseSynth, SineSynth, SubbandSineSynth, NoiseBandSynth, BendableNoiseBandSynth, HarmonicSynth, FilteredNoiseSynth, Reverb
 from sklearn.decomposition import PCA
 
-from typing import List, Tuple, Dict, Any
+from typing import List, Tuple, Dict, Any, Optional
 
 from ddsp.losses import MultiScaleSlicedWassersteinLoss
 from ddsp.interfaces import ControlSpace
@@ -63,6 +63,8 @@ class DDSP(L.LightningModule):
                 adv_gen_weight: float = 1.0,
                 adv_disc_weight: float = 1.0,
                 adv_fm_weight: float = 1.0,
+                reverb: bool = False,
+                reverb_length: int = 44100,
                 config_name: str | None = None,
                device: str = 'cuda'):
     super().__init__()
@@ -112,6 +114,51 @@ class DDSP(L.LightningModule):
       synths.append(synth)
     self.synths = torch.nn.ModuleList(synths)
 
+    # Resolve pitch and loudness feature indices for HarmonicSynth instances.
+    # Each HarmonicSynth declares pitch_feature and loudness_feature names
+    # that must correspond to feature fields in the ControlSpace.
+    self._pitch_feature_slices: Dict[int, Tuple[int, int]] = {}     # synth_idx -> (start, end) in feature dim
+    self._loudness_feature_slices: Dict[int, Tuple[int, int]] = {}  # synth_idx -> (start, end) in feature dim
+    for i, synth in enumerate(self.synths):
+      if isinstance(synth, HarmonicSynth):
+        # Resolve pitch feature
+        pf_name = synth.pitch_feature
+        offset = 0
+        found = False
+        for fld in self.control_space.fields:
+          if fld.source != "feature":
+            continue
+          if fld.name == pf_name:
+            assert fld.dim == 1, f"Pitch feature '{pf_name}' must have dim=1, got {fld.dim}"
+            self._pitch_feature_slices[i] = (offset, offset + fld.dim)
+            found = True
+            break
+          offset += fld.dim
+        if not found:
+          raise ValueError(
+            f"HarmonicSynth requires feature '{pf_name}' in ControlSpace, "
+            f"but available feature fields are: {[f.name for f in self.control_space.fields if f.source == 'feature']}"
+          )
+
+        # Resolve loudness feature
+        lf_name = synth.loudness_feature
+        offset = 0
+        found = False
+        for fld in self.control_space.fields:
+          if fld.source != "feature":
+            continue
+          if fld.name == lf_name:
+            assert fld.dim == 1, f"Loudness feature '{lf_name}' must have dim=1, got {fld.dim}"
+            self._loudness_feature_slices[i] = (offset, offset + fld.dim)
+            found = True
+            break
+          offset += fld.dim
+        if not found:
+          raise ValueError(
+            f"HarmonicSynth requires feature '{lf_name}' in ControlSpace, "
+            f"but available feature fields are: {[f.name for f in self.control_space.fields if f.source == 'feature']}"
+          )
+
     # Latent space analyzis buffers
 
     self.register_buffer('_latent_pca', torch.eye(self.latent_size))
@@ -156,6 +203,9 @@ class DDSP(L.LightningModule):
       gru_layers=decoder_gru_layers,
       streaming=streaming,
     )
+
+    # Optional trainable reverb (learnable IR convolution applied post-synthesis)
+    self.reverb = Reverb(length=reverb_length, fs=fs).to(self._device) if reverb else None
 
     # (hyperparameters already saved above)
 
@@ -403,12 +453,13 @@ class DDSP(L.LightningModule):
     if T_feat != T_z:
       T_min = min(T_feat, T_z)
       features_for_decoder = features_for_decoder[:, :T_min, :]
+      features = features[:, :T_min, :]
       z = z[:, :T_min, :]
 
     synth_params = self.decoder(features_for_decoder, z)
     # Decoder outputs [B, n_params, T_ctl]; synthesize to audio-rate
     assert synth_params.shape[1] == self._total_synth_params, "decoder param size mismatch"
-    signal = self._synthesize(synth_params)
+    signal = self._synthesize(synth_params, features=features)
     return signal
 
 
@@ -653,7 +704,7 @@ class DDSP(L.LightningModule):
     synth_params = self.decoder(x_features_for_decoder, z)
 
     # Synthesize the output signal
-    y_audio = self._synthesize(synth_params)
+    y_audio = self._synthesize(synth_params, features=x_features)
 
     return y_audio, kld
 
@@ -678,36 +729,50 @@ class DDSP(L.LightningModule):
   #   self._validation_index += 1
 
 
-  def _synthesize(self, params: torch.Tensor, waveshaping_factor: float=0.0, limit_components: float=0.0) -> torch.Tensor:
+  def _synthesize(self, params: torch.Tensor, features: torch.Tensor = None,
+                  waveshaping_factor: float=0.0, limit_components: float=0.0) -> torch.Tensor:
     """
     Synthesizes a signal from the predicted amplitudes and the baked noise bands.
     Args:
       - params: torch.Tensor[batch_size, params, sig_length], the predicted synth parameters
-      - waveshaping: float, the amount of waveshaping to apply to the signal
-      - sines_number_attenuation: float, attenuation factor for the number of sines
-      - noise_amp_attenuation: float, attenuation factor for the noise amplitude
-      - sines_amp_attenuation: float, attenuation factor for the sines amplitude
+      - features: torch.Tensor[batch_size, T_ctl, D_feat] or None, raw features at control rate
+        (required when HarmonicSynth is present, to supply pitch and loudness)
+      - waveshaping_factor: float, the amount of waveshaping to apply to the signal
+      - limit_components: float, attenuation factor for the number of components
     Returns:
       - signal: torch.Tensor[batch_size, sig_length], the synthesized signal
     """
     params_idx = 0
     audio = []
 
-    for synth in self.synths:
+    for i, synth in enumerate(self.synths):
       synth_params = params[:, params_idx:params_idx+synth.n_params, :]
       params_idx += synth.n_params
       # Explicit per-synth routing without introspection
       name = synth.jit_name
 
-      if name in ("NoiseBandSynth", "SubbandSineSynth", "BendableNoiseBandSynth", "ComplexSineSynth"):
-        audio.append(synth(synth_params, limit_components=limit_components, waveshaping_factor=waveshaping_factor))
-      elif name in ("SineSynth",):
-        audio.append(synth(synth_params, limit_components=limit_components))
-      else:
-        # Default call with parameters only
-        audio.append(synth(synth_params))
+      # Extract pitch/loudness for HarmonicSynth; other synths ignore these
+      pitch: Optional[torch.Tensor] = None
+      loudness: Optional[torch.Tensor] = None
+      if name == "HarmonicSynth":
+        # Extract pitch and loudness from raw features: features is [B, T_ctl, D_feat]
+        assert features is not None, "HarmonicSynth requires features (with pitch and loudness) to be passed to _synthesize"
+        p_start, p_end = self._pitch_feature_slices[i]
+        l_start, l_end = self._loudness_feature_slices[i]
+        # pitch: [B, T_ctl, 1] -> [B, 1, T_ctl]
+        pitch = features[:, :, p_start:p_end].permute(0, 2, 1)
+        # loudness: [B, T_ctl, 1] -> [B, 1, T_ctl]
+        loudness = features[:, :, l_start:l_end].permute(0, 2, 1)
 
-    return torch.sum(torch.hstack(audio), dim=1, keepdim=True)
+      audio.append(synth(synth_params, pitch, loudness, limit_components=limit_components, waveshaping_factor=waveshaping_factor))
+
+    signal = torch.sum(torch.hstack(audio), dim=1, keepdim=True)
+
+    # Apply trainable reverb if present
+    if self.reverb is not None:
+      signal = self.reverb(signal)
+
+    return signal
 
 
   def _reconstruction_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:

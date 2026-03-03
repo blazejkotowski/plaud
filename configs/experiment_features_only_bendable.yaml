@@ -1,14 +1,7 @@
-# ComplexSineSynth experiment — complex-surrogate frequency estimation
-# Uses ONLY the ComplexSineSynth (no noise bands / other synths).
-#
-# Run:
-#   python -m cli.train -cn experiment_complex_sine \
-#     data.dataset_path=/path/to/dataset \
-#     ++experiment.name=my_experiment \
-#     trainer.force_restart=true
+# Features-only ControlSpace
 
 experiment:
-  name: ddsp_complex_sine
+  name: ddsp_features_only
   training_dir: training
 
 audio:
@@ -23,7 +16,7 @@ data:
         prob: 0.1
 
 model:
-  resampling_factor: 32
+  resampling_factor: 256
   control_space:
     - name: loudness
       dim: 1
@@ -33,24 +26,30 @@ model:
         feature_fn_name: rms
         smoothing_kernel_size: 65
         postprocess: true
+    # - name: centroid
+    #   dim: 1
+    #   source: feature
+    #   extractor: LibrosaFeatureExtractor
+    #   params:
+    #     feature_fn_name: spectral_centroid
+    #     smoothing_kernel_size: 65
+    #     postprocess: true
     - name: pitch
       dim: 1
       source: feature
       extractor: PYINPitchExtractor
       params:
-        postprocess: true
+        postprocess: True
         smoothing_kernel_size: 257
         fmin: 55.0
         fmax: 1760.0
         hop_length: 256
         fill_strategy: interpolate
-    # - name: latents
-    #   dim: 8
-    #   source: latent
+    # No latent field (dim=0 implied)
   synths:
-    - type: ComplexSineSynth
+    - type: BendableNoiseBandSynth
       params:
-        n_sines: 64
+        n_filters: 512
   latent_smoothing_kernel: 65
   decoder_gru_layers: 2
   learning_rate: 1e-4
@@ -58,14 +57,16 @@ model:
   capacity: 32
 
 losses:
-  - type: MSELoss
+  - type: MRSTFT
     weight: 1.0
+    params:
+      fft_sizes: [2053, 1021, 509, 257, 129, 65, 33]
 
 adversarial:
   enabled: true
   weights:
-    gen: 1.0
-    fm: 1.0
+    gen: 0.1
+    fm: 0.1
     disc: 1.0
   schedule:
     g_start_epoch: 100
@@ -78,7 +79,7 @@ trainer:
   force_restart: false
 
 prior:
-  enabled: false
+  enabled: true
 
   model:
     embedding_dim: 32
@@ -92,9 +93,17 @@ prior:
     stride_factor: 0.2
     in_memory: true
 
+    # Optional normalization for latent values; if omitted, model clamps to [-1,1]
+    # normalization:
+      # min: -1.0
+      # max: 1.0
+
   training:
     batch_size: 256
     max_epochs: 10000
     num_workers: 4
     lr: 1e-4
     force_restart: false
+
+
+

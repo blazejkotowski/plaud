@@ -1,14 +1,7 @@
-# ComplexSineSynth experiment — complex-surrogate frequency estimation
-# Uses ONLY the ComplexSineSynth (no noise bands / other synths).
-#
-# Run:
-#   python -m cli.train -cn experiment_complex_sine \
-#     data.dataset_path=/path/to/dataset \
-#     ++experiment.name=my_experiment \
-#     trainer.force_restart=true
+# Hybrid ControlSpace: features + latents
 
 experiment:
-  name: ddsp_complex_sine
+  name: ddsp_hybrid
   training_dir: training
 
 audio:
@@ -36,37 +29,39 @@ model:
     - name: pitch
       dim: 1
       source: feature
-      extractor: PYINPitchExtractor
+      extractor: CrepePitchExtractor
       params:
-        postprocess: true
-        smoothing_kernel_size: 257
-        fmin: 55.0
-        fmax: 1760.0
-        hop_length: 256
-        fill_strategy: interpolate
-    # - name: latents
-    #   dim: 8
-    #   source: latent
+        postprocess: True
+    - name: latents
+      dim: 2
+      source: latent
   synths:
-    - type: ComplexSineSynth
+    - type: HarmonicSynth
       params:
-        n_sines: 64
-  latent_smoothing_kernel: 65
-  decoder_gru_layers: 2
+        n_harmonics: 100
+    - type: FilteredNoiseSynth
+      params:
+        n_bands: 65
+  reverb: true
+  reverb_length: 44100
+  latent_smoothing_kernel: 1
+  decoder_gru_layers: 1
   learning_rate: 1e-4
   plateau_patience: 100000
   capacity: 32
 
 losses:
-  - type: MSELoss
+  - type: MRSTFT
     weight: 1.0
+    params:
+      fft_sizes: [2053, 1021, 509, 257, 129, 65, 33]
 
 adversarial:
   enabled: true
   weights:
     gen: 1.0
-    fm: 1.0
     disc: 1.0
+    fm: 1.0
   schedule:
     g_start_epoch: 100
     d_start_epoch: 150
@@ -82,7 +77,7 @@ prior:
 
   model:
     embedding_dim: 32
-    quantization_channels: 16
+    quantization_channels: 32
     nhead: 8
     num_layers: 4
     dropout: 0.1

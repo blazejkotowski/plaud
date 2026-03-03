@@ -6,10 +6,11 @@ import torch.nn.functional as F
 import numpy as np
 
 from ddsp.filterbank import FilterBank
+from ddsp.synths.dsp import scale_function, remove_above_nyquist, upsample, amp_to_impulse_response, fft_convolve
 # from ddsp.sgd.sinusoidal_gradient_descent.core import complex_oscillator
 
 
-from typing import Type, Callable, Dict, Any, List
+from typing import Type, Callable, Dict, Any, List, Optional
 
 _SYNTH_REGISTRY = {}
 
@@ -108,7 +109,7 @@ class NoiseBandSynth(BaseSynth):
     return "NoiseBandSynth"
 
 
-  def forward(self, amplitudes: torch.Tensor, limit_components: float = 0.0, waveshaping_factor: float = 0.0) -> torch.Tensor:
+  def forward(self, amplitudes: torch.Tensor, pitch: Optional[torch.Tensor] = None, loudness: Optional[torch.Tensor] = None, limit_components: float = 0.0, waveshaping_factor: float = 0.0) -> torch.Tensor:
     """
     Synthesizes a signal from the predicted amplitudes and the baked noise bands.
     Args:
@@ -174,63 +175,247 @@ class NoiseBandSynth(BaseSynth):
 @register_synth
 class HarmonicSynth(BaseSynth):
   """
-  Harmonic synthesizer that generates a signal as a sum of harmonically-related sine waves.
+  Additive harmonic synthesizer following the DDSP reference implementation.
 
-  Arguments:
-    - n_harmonics: int, the maximum number of harmonics to synthesize
-    - fs: int, sampling rate
-    - resampling_factor: int, upsampling factor for control parameters
-    - streaming: bool, whether to use continuous phase (not implemented here yet)
-    - device: str, computation device
+  Pitch (f0 in Hz) and loudness come from feature extractors — they are NOT
+  predicted by the decoder.  The decoder predicts per-harmonic amplitude
+  envelopes which are passed through a `scale_function` (modified sigmoid),
+  Nyquist-filtered, self-normalized (divided by their sum), and then scaled
+  by the external loudness.
+
+  Parameters from decoder:
+    amplitudes: [B, n_harmonics, T_ctrl]
+
+  Features from extractors:
+    pitch:    [B, 1, T_ctrl]  — fundamental frequency in Hz
+    loudness: [B, 1, T_ctrl]  — overall amplitude envelope
+
+  The synth cannot work in latent-only mode.
   """
+
   def __init__(self,
               n_harmonics: int = 100,
               fs: int = 44100,
               resampling_factor: int = 32,
               streaming: bool = False,
-              device: str = 'cuda'):
+              pitch_feature: str = "pitch",
+              loudness_feature: str = "loudness",
+              device: str = "cuda"):
     super().__init__(fs=fs, resampling_factor=resampling_factor)
-    self._n_harmonics = n_harmonics
-    self.streaming = streaming
+    self._n_harmonics = int(n_harmonics)
+    self.streaming = bool(streaming)
     self._device = device
+    self.pitch_feature = pitch_feature
+    self.loudness_feature = loudness_feature
+
+    self.register_buffer("_phase", torch.empty(0))
+    self._phase_initialized = False
 
   @property
   def n_params(self):
-    return self._n_harmonics + 1  # 1 fundamental + n_harmonics amplitudes
+    return self._n_harmonics
 
   @property
   def jit_name(self):
     return "HarmonicSynth"
 
-  def forward(self, parameters: torch.Tensor, amplitudes: torch.Tensor) -> torch.Tensor:
+  def forward(
+      self,
+      amplitudes: torch.Tensor,
+      pitch: Optional[torch.Tensor] = None,
+      loudness: Optional[torch.Tensor] = None,
+      limit_components: float = 0.0,
+      waveshaping_factor: float = 0.0,
+  ) -> torch.Tensor:
     """
-    Synthesizes a harmonic signal.
+    Args:
+      amplitudes: [B, n_harmonics, T_ctrl] — raw amplitude params from decoder
+      pitch:      [B, 1, T_ctrl]           — f0 in Hz (from feature extractor)
+      loudness:   [B, 1, T_ctrl]           — amplitude envelope (from feature extractor)
 
-    Arguments:
-      - parameters: [batch_size, 1+n_harmonics, time], fundamental frequency in Hz and amplitudes per harmonic
     Returns:
-      - signal: [batch_size, 1, time], synthesized signal
+      signal: [B, 1, T_audio]
     """
-    pitch = parameters[:, :1, :]
-    amplitudes = parameters[:, 1:, :]
 
-    # Upsample inputs to match the target sample rate
-    pitch = F.interpolate(pitch, scale_factor=float(self._resampling_factor), mode='linear')
-    amplitudes = F.interpolate(amplitudes, scale_factor=float(self._resampling_factor), mode='linear')
+    assert amplitudes.dim() == 3, "amplitudes must be [B, n_harmonics, T]"
+    assert pitch is not None, "HarmonicSynth requires pitch"
+    assert loudness is not None, "HarmonicSynth requires loudness"
+    assert pitch.dim() == 3 and pitch.shape[1] == 1, "pitch must be [B, 1, T]"
+    assert loudness.dim() == 3 and loudness.shape[1] == 1, "loudness must be [B, 1, T]"
+    B, H, T_ctrl = amplitudes.shape
+    assert H == self._n_harmonics, f"Expected {self._n_harmonics} harmonics, got {H}"
 
-    # Compute angular frequency (omega) by integrating pitch over time
-    omega = torch.cumsum(2 * math.pi * pitch / self._fs, dim=-1)  # [B, 1, T]
+    # Transpose to [B, T, H] / [B, T, 1] for the reference-style pipeline
+    amplitudes = amplitudes.permute(0, 2, 1)  # [B, T, H]
+    pitch = pitch.permute(0, 2, 1)            # [B, T, 1]
+    loudness = loudness.permute(0, 2, 1)      # [B, T, 1]
 
-    # Generate harmonic numbers [1, 2, ..., n]
-    harmonics = torch.arange(1, self._n_harmonics + 1, device=omega.device).view(1, -1, 1)  # [1, n, 1]
+    # Scale function: modified sigmoid -> positive amplitudes
+    amplitudes = scale_function(amplitudes)  # [B, T, H]
 
-    # Multiply each harmonic index with base omega
-    omegas = omega * harmonics  # [B, n_harmonics, T]
+    # Zero out harmonics above Nyquist
+    amplitudes = remove_above_nyquist(amplitudes, pitch, self._fs)
 
-    # Compute signal as weighted sum of harmonic sines
-    signal = (torch.sin(omegas) * amplitudes).sum(dim=1, keepdim=True)  # [B, 1, T]
+    # Normalize distribution and scale by loudness
+    amplitudes = amplitudes / (amplitudes.sum(-1, keepdim=True) + 1e-8)
+    amplitudes = amplitudes * loudness  # [B, T, H]
 
+    # Upsample to audio rate
+    amplitudes = upsample(amplitudes, self._resampling_factor)  # [B, T_audio, H]
+    pitch = upsample(pitch, self._resampling_factor)            # [B, T_audio, 1]
+
+    # Phase integration
+    omega = torch.cumsum(2.0 * math.pi * pitch / float(self._fs), dim=1)  # [B, T_audio, 1]
+
+    # Streaming continuity
+    if self.streaming:
+      if (not self._phase_initialized) or (self._phase.shape[0] != B):
+        self._phase = torch.zeros(B, 1, device=omega.device, dtype=omega.dtype)
+        self._phase_initialized = True
+      omega = omega + self._phase.unsqueeze(1)  # [B, T_audio, 1]
+      self._phase.copy_(omega[:, -1, :].detach())
+
+    # Harmonic overtones
+    n_harm = amplitudes.shape[-1]
+    omegas = omega * torch.arange(1, n_harm + 1, device=omega.device, dtype=omega.dtype)  # [B, T_audio, H]
+
+    # Synthesize
+    signal = (torch.sin(omegas) * amplitudes).sum(-1, keepdim=True)  # [B, T_audio, 1]
+
+    # Back to [B, 1, T_audio] (channel-first)
+    signal = signal.permute(0, 2, 1)
     return signal
+
+
+@register_synth
+class FilteredNoiseSynth(BaseSynth):
+  """
+  Filtered noise synthesizer following the DDSP reference.
+
+  The decoder predicts n_bands filter magnitudes at control rate.
+  These are converted to impulse responses via inverse FFT and convolved
+  with uniform white noise to produce the noise component.
+
+  Parameters from decoder:
+    noise_params: [B, n_bands, T_ctrl] — filter magnitudes (pre scale_function)
+  """
+
+  def __init__(self,
+               n_bands: int = 65,
+               fs: int = 44100,
+               resampling_factor: int = 32,
+               device: str = "cuda"):
+    super().__init__(fs=fs, resampling_factor=resampling_factor)
+    self._n_bands = int(n_bands)
+    self._device = device
+
+  @property
+  def n_params(self):
+    return self._n_bands
+
+  @property
+  def jit_name(self):
+    return "FilteredNoiseSynth"
+
+  def forward(self, noise_params: torch.Tensor,
+              pitch: Optional[torch.Tensor] = None,
+              loudness: Optional[torch.Tensor] = None,
+              limit_components: float = 0.0,
+              waveshaping_factor: float = 0.0) -> torch.Tensor:
+    """
+    Args:
+      noise_params: [B, n_bands, T_ctrl]
+
+    Returns:
+      signal: [B, 1, T_audio]
+    """
+
+    B, C, T_ctrl = noise_params.shape
+    assert C == self._n_bands
+
+    # Transpose to [B, T, C]
+    noise_params = noise_params.permute(0, 2, 1)
+
+    # Apply scale function with a bias shift (start quiet)
+    param = scale_function(noise_params - 5.0)  # [B, T, n_bands]
+
+    # filter_size from irfft = 2 * (n_bands - 1); target must be >= filter_size
+    filter_size = 2 * (self._n_bands - 1)
+    block_size = max(self._resampling_factor, filter_size)
+
+    # Convert to impulse response
+    impulse = amp_to_impulse_response(param, block_size)  # [B, T, block_size]
+
+    # Generate white noise
+    noise = torch.rand(
+        impulse.shape[0],
+        impulse.shape[1],
+        block_size,
+        device=impulse.device,
+        dtype=impulse.dtype,
+    ) * 2.0 - 1.0
+
+    # Convolve
+    signal = fft_convolve(noise, impulse).contiguous()  # [B, T, block_size]
+
+    # Reshape to [B, T*block_size] then trim to expected audio length
+    signal = signal.reshape(B, -1)  # [B, T_ctrl * block_size]
+    expected_len = T_ctrl * self._resampling_factor
+    signal = signal[:, :expected_len]
+
+    # To [B, 1, T_audio]
+    signal = signal.unsqueeze(1)
+    return signal
+
+
+class Reverb(nn.Module):
+  """
+  Trainable reverb via a learnable impulse response, following DDSP reference.
+
+  Applied as a post-processing step after all synths are summed.
+  The dry/wet mix is learnable.
+  """
+
+  def __init__(self, length: int = 44100, fs: int = 44100):
+    super().__init__()
+    self._length = length
+    self._fs = fs
+
+    # Learnable impulse response (initialized to decaying noise)
+    ir_init = torch.randn(1, 1, length) * torch.linspace(1, 0, length).unsqueeze(0).unsqueeze(0)
+    self.ir = nn.Parameter(ir_init * 0.001)
+
+    # Learnable dry/wet mix (initialized to mostly dry)
+    self.dry_wet = nn.Parameter(torch.tensor([3.0]))  # sigmoid(3) ≈ 0.95 dry
+
+  def forward(self, signal: torch.Tensor) -> torch.Tensor:
+    """
+    Args:
+      signal: [B, 1, T_audio]
+
+    Returns:
+      signal: [B, 1, T_audio]
+    """
+    # Normalize IR
+    ir = self.ir
+    # Pad signal for linear convolution
+    T = signal.shape[-1]
+    n_fft = T + self._length - 1
+    # Round up to next power-of-2 (TorchScript-compatible)
+    power = 1
+    while power < n_fft:
+      power *= 2
+    n_fft = power
+
+    signal_fr = torch.fft.rfft(signal, n=n_fft)
+    ir_fr = torch.fft.rfft(ir, n=n_fft)
+
+    wet = torch.fft.irfft(signal_fr * ir_fr, n=n_fft)
+    wet = wet[..., :T]  # trim to original length
+
+    # Dry/wet mix
+    mix = torch.sigmoid(self.dry_wet)  # 1 = fully dry, 0 = fully wet
+    return mix * signal + (1.0 - mix) * wet
 
 @register_synth
 class SineSynth(BaseSynth):
@@ -270,7 +455,7 @@ class SineSynth(BaseSynth):
     return "SineSynth"
 
 
-  def forward(self, parameters: torch.Tensor, limit_components: float = 0.0):
+  def forward(self, parameters: torch.Tensor, pitch: Optional[torch.Tensor] = None, loudness: Optional[torch.Tensor] = None, limit_components: float = 0.0, waveshaping_factor: float = 0.0):
     """
     Generates a mixture of sinewaves with the given frequencies and amplitudes per sample.
 
@@ -402,7 +587,7 @@ class BendableNoiseBandSynth(BaseSynth):
     self._sine_synth.streaming = value
     self._noiseband_synth.streaming = value
 
-  def forward(self, parameters: torch.Tensor, limit_components: float = 0.0, waveshaping_factor: float = 0.0):
+  def forward(self, parameters: torch.Tensor, pitch: Optional[torch.Tensor] = None, loudness: Optional[torch.Tensor] = None, limit_components: float = 0.0, waveshaping_factor: float = 0.0):
     """
     Waveshaping factor controls the amount of interpolation between noisebands and sinewaves when in the range [0, 0.5].
     On the other hand, in the rangee [0.5, 1], it controls the amount of waveshaping applied to the sinewaves.
@@ -488,7 +673,7 @@ class SubbandSineSynth(BaseSynth):
     return "SubbandSineSynth"
 
 
-  def forward(self, parameters: torch.Tensor, limit_components: float = 0.0, waveshaping_factor: float = 0.0):
+  def forward(self, parameters: torch.Tensor, pitch: Optional[torch.Tensor] = None, loudness: Optional[torch.Tensor] = None, limit_components: float = 0.0, waveshaping_factor: float = 0.0):
     """
     Generates a mixture of sinewaves with the given frequencies and amplitudes per sample.
 
