@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import auraloss
 
-from ddsp.blocks import VariationalEncoder, Decoder
+from ddsp.blocks import VariationalEncoder, WaveformEncoder, Decoder
 from ddsp.discriminator import Discriminator
 from ddsp.synths import BaseSynth, SineSynth, SubbandSineSynth, NoiseBandSynth, BendableNoiseBandSynth
 from sklearn.decomposition import PCA
@@ -64,6 +64,10 @@ class DDSP(L.LightningModule):
                 adv_disc_weight: float = 1.0,
                 adv_fm_weight: float = 1.0,
                 config_name: str | None = None,
+                # Encoder type: 'melspec' (default) or 'waveform'
+                encoder_type: str = 'melspec',
+                encoder_hidden_channels: List[int] = [32, 64, 128],
+                encoder_strides: List[int] = [4, 4, 2],
                device: str = 'cuda'):
     super().__init__()
     # Turn of autoamtic optimization
@@ -137,15 +141,27 @@ class DDSP(L.LightningModule):
     ## Encoder to extract latents from the input audio signal
     # Encoder maps audio -> latents if latent space is requested
     self.encoder = None
+    self._encoder_type = encoder_type
     if self.latent_size > 0:
-      self.encoder = VariationalEncoder(
-        layer_sizes=(np.array(encoder_ratios)*capacity).tolist(),
-        sample_rate=fs,
-        latent_size=self.latent_size,
-        streaming=streaming,
-        n_melbands=n_melbands,
-        resampling_factor=self.resampling_factor,
-      )
+      if encoder_type == 'waveform':
+        self.encoder = WaveformEncoder(
+          layer_sizes=(np.array(encoder_ratios)*capacity).tolist(),
+          sample_rate=fs,
+          latent_size=self.latent_size,
+          streaming=streaming,
+          resampling_factor=self.resampling_factor,
+          hidden_channels=encoder_hidden_channels,
+          strides=encoder_strides,
+        )
+      else:  # 'melspec' (default)
+        self.encoder = VariationalEncoder(
+          layer_sizes=(np.array(encoder_ratios)*capacity).tolist(),
+          sample_rate=fs,
+          latent_size=self.latent_size,
+          streaming=streaming,
+          n_melbands=n_melbands,
+          resampling_factor=self.resampling_factor,
+        )
 
     ## Decoder to predict the amplitudes of the noise bands
     self.decoder = Decoder(
@@ -528,10 +544,10 @@ class DDSP(L.LightningModule):
       self.untoggle_optimizer(opt_ddsp)
 
     # Logging
-    self.log('lr_adv_d', self.trainer.optimizers[1].param_groups[0]['lr'], prog_bar=True)
-    self.log("adv_d", adv_d, prog_bar=True, logger=True)
+    # self.log('lr_adv_d', self.trainer.optimizers[1].param_groups[0]['lr'], prog_bar=True)
+    # self.log("adv_d", adv_d, prog_bar=True, logger=True)
     self.log('lr_ddsp', self.trainer.optimizers[0].param_groups[0]['lr'], prog_bar=True)
-    self.log("adv_g", adv_g, prog_bar=True, logger=True)
+    # self.log("adv_g", adv_g, prog_bar=True, logger=True)
     self.log("kld", kld_loss, prog_bar=True, logger=True)
     self.log("beta", self._beta, prog_bar=True, logger=True)
     self.log("recons_loss", recons_loss, prog_bar=True, logger=True)
@@ -699,7 +715,7 @@ class DDSP(L.LightningModule):
       # Explicit per-synth routing without introspection
       name = synth.jit_name
 
-      if name in ("NoiseBandSynth", "SubbandSineSynth", "BendableNoiseBandSynth", "ComplexSineSynth"):
+      if name in ("NoiseBandSynth", "SubbandSineSynth", "BendableNoiseBandSynth"):
         audio.append(synth(synth_params, limit_components=limit_components, waveshaping_factor=waveshaping_factor))
       elif name in ("SineSynth",):
         audio.append(synth(synth_params, limit_components=limit_components))

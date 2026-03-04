@@ -70,6 +70,7 @@ class AudioFeatureDataset(Dataset):
     """Load audio, process it, and save to LMDB."""
     # Load and process audio
     self._audio = self._load_dataset(dataset_path).to(self._device)
+    print(f"Loaded audio with {self._audio.shape[0]} samples at {self._sampling_rate} Hz")
     self._dataset_length = int(len(self._audio) // self._n_signal)
 
     # Extract features
@@ -228,13 +229,18 @@ class AudioFeatureDataset(Dataset):
     # features: [T_audio, D_feat]
     T_audio = features.shape[0]
     T_ctl = math.ceil(T_audio / self._resampling_factor)
-    # interpolate along time to T_ctl using torch
-    feat_ds = torch.nn.functional.interpolate(
-      features.T.unsqueeze(0),  # [1, D_feat, T_audio]
-      size=T_ctl,
-      mode='linear',
-      align_corners=False,
-    ).squeeze(0).T  # [T_ctl, D_feat]
+
+    # Handle latent-only mode (no features, D_feat=0)
+    if features.shape[1] == 0:
+      feat_ds = torch.zeros(T_ctl, 0, device=features.device)
+    else:
+      # interpolate along time to T_ctl using torch
+      feat_ds = torch.nn.functional.interpolate(
+        features.T.unsqueeze(0),  # [1, D_feat, T_audio]
+        size=T_ctl,
+        mode='linear',
+        align_corners=False,
+      ).squeeze(0).T  # [T_ctl, D_feat]
 
     return audio, feat_ds
 
@@ -291,6 +297,11 @@ class AudioFeatureDataset(Dataset):
         maxv = torch.as_tensor(norm['max'], device=feat.device, dtype=feat.dtype)
         feat = (feat - minv) / (maxv - minv + 1e-8)
       feats.append(feat)
+
+    # Handle latent-only mode (no feature extractors)
+    if len(feats) == 0:
+      # Return empty tensor with correct shape [N, 0]
+      return torch.zeros(self._audio.shape[0], 0)
 
     features = torch.cat(feats, dim=-1)  # [N, D_feat]
     return features

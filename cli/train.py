@@ -109,6 +109,10 @@ def main(cfg: DictConfig) -> None:
     adv_disc_weight=float(cfg.adversarial.weights.disc),
     adv_fm_weight=float(cfg.adversarial.weights.fm),
     config_name=active_config_name,
+    # Encoder type selection
+    encoder_type=str(getattr(cfg.model, 'encoder_type', 'melspec')),
+    encoder_hidden_channels=list(getattr(cfg.model, 'encoder_hidden_channels', [32, 64, 128])),
+    encoder_strides=list(getattr(cfg.model, 'encoder_strides', [4, 4, 2])),
   )
 
   # Tensorboard

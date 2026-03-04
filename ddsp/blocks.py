@@ -62,6 +62,136 @@ def _is_batch_size_one(x: torch.Tensor):
   return x.shape[0] == 1
 
 
+class WaveformEncoder(nn.Module):
+  """
+  Variational encoder that operates directly on raw waveforms using
+  strided 1D convolutions for progressive downsampling.
+  """
+  def __init__(self,
+               sample_rate: int = 44100,
+               layer_sizes: List[int] = [128, 64, 32],
+               latent_size: int = 16,
+               resampling_factor: int = 32,
+               hidden_channels: List[int] = [32, 64, 128],
+               strides: List[int] = [4, 4, 2],
+               kernel_multiplier: int = 4,
+               streaming: bool = False):
+    """
+    Arguments:
+      - sample_rate: int, the sample rate of the input audio
+      - layer_sizes: List[int], the sizes of the layers in the bottleneck (after conv)
+      - latent_size: int, the size of the output latent space
+      - resampling_factor: int, total downsampling factor (product of strides)
+      - hidden_channels: List[int], channel sizes for each conv layer
+      - strides: List[int], stride for each conv layer (must multiply to resampling_factor)
+      - kernel_multiplier: int, kernel_size = stride * kernel_multiplier
+      - streaming: bool, streaming mode (realtime)
+    """
+    super().__init__()
+
+    self.streaming = streaming
+    self.resampling_factor = resampling_factor
+    self.sample_rate = sample_rate
+
+    # Validate strides
+    stride_product = 1
+    for s in strides:
+      stride_product *= s
+    if stride_product != resampling_factor:
+      raise ValueError(
+        f"Product of strides {strides} = {stride_product} must equal "
+        f"resampling_factor = {resampling_factor}"
+      )
+
+    # Build strided convolutional layers
+    conv_layers = []
+    in_ch = 1  # mono audio input
+    for i, (out_ch, stride) in enumerate(zip(hidden_channels, strides)):
+      kernel_size = stride * kernel_multiplier
+      # Use cached_conv for streaming compatibility
+      padding = cc.get_padding(kernel_size, stride)
+      conv_layers.append(
+        cc.Conv1d(in_ch, out_ch, kernel_size, stride=stride, padding=padding)
+      )
+      conv_layers.append(nn.GroupNorm(min(8, out_ch), out_ch))
+      conv_layers.append(nn.LeakyReLU(0.2))
+      in_ch = out_ch
+
+    self.conv_encoder = nn.Sequential(*conv_layers)
+    self.conv_out_channels = hidden_channels[-1]
+
+    # Normalization before GRU
+    self.normalization = nn.LayerNorm(self.conv_out_channels)
+
+    # GRU for temporal modeling
+    self.gru = nn.GRU(self.conv_out_channels, layer_sizes[0], batch_first=True)
+    self.register_buffer('_hidden_state', torch.zeros(1, 1, layer_sizes[0]), persistent=False)
+
+    # Bottleneck MLP
+    self.bottleneck = _make_sequential(layer_sizes)
+
+    # Output projection to mu and logvar
+    self.mu_logvar_out = nn.Linear(layer_sizes[-1], 2 * latent_size)
+
+  def forward(self, audio: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Forward pass of the encoder.
+    Arguments:
+      - audio: torch.Tensor, the input audio tensor [batch_size, n_samples]
+    Returns:
+      - mu, logvar: Tuple[torch.Tensor, torch.Tensor], each [batch_size, T_ctl, latent_size]
+    """
+    # Add channel dimension: [B, T] -> [B, 1, T]
+    x = audio.unsqueeze(1)
+
+    # Strided convolutions: [B, 1, T] -> [B, C, T_ctl]
+    x = self.conv_encoder(x)
+
+    # Permute to [B, T_ctl, C] for GRU
+    x = x.permute(0, 2, 1)
+
+    # Normalize
+    x = self.normalization(x)
+
+    # GRU with streaming support
+    if self.streaming and _is_batch_size_one(x):
+      x, hx = self.gru(x, self._hidden_state)
+      self._hidden_state.copy_(hx)
+    else:
+      x, _ = self.gru(x)
+
+    # Bottleneck MLP
+    x = self.bottleneck(x)
+
+    # Project to mu and logvar
+    z = self.mu_logvar_out(x)
+    mu, logvar = z.chunk(2, dim=-1)
+
+    return mu, logvar
+
+  def reparametrize(self, mean: torch.Tensor, scale: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    Reparametrize the latent variable z.
+    Args:
+      - mean: torch.Tensor[batch_size, n_latents, latent_size], the mean
+      - scale: torch.Tensor[batch_size, n_latents, latent_size], the scale (pre-softplus)
+    Returns:
+      - z: torch.Tensor[batch_size, n_latents, latent_size], the reparametrized latent variable
+      - kl: torch.Tensor[1], the KL divergence
+    """
+    std = F.softplus(scale) + 1e-4
+    var = std * std
+    logvar = torch.log(var)
+
+    z = torch.randn_like(mean) * std + mean
+
+    # Calculate KL divergence
+    kl_weight = 1.0 / (z.shape[1] * z.shape[2])
+    kl = (mean * mean + var - logvar - 1).sum(1).mean()
+
+    return z, kl * kl_weight
+
+
 class VariationalEncoder(nn.Module):
   def __init__(self,
                sample_rate: int = 44100,
