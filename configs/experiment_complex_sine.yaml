@@ -12,42 +12,50 @@ experiment:
   training_dir: training
 
 audio:
-  fs: 22050
+  fs: 44100
   chunk_duration_s: 2.0
 
 data:
-  dataset_path: /path/to/dataset
-  augmentations:
-    - type: RandomMute
-      params:
-        prob: 0.1
+  # dataset_path: /mnt/mariadata/datasets/surrogate/single_sound/processed
+  dataset_path: /mnt/mariadata/datasets/surrogate/stationary_dataset/processed
+  # augmentations:
+  #   - type: RandomMute
+  #     params:
+  #       prob: 0.1
 
 model:
   resampling_factor: 32
+
+  encoder_type: waveform
+  encoder_hidden_channels: [32, 64, 128]
+  encoder_strides: [4, 4, 2]  # Product must equal resampling_factor (4*4*2=32)
+
   control_space:
-    - name: loudness
-      dim: 1
-      source: feature
-      extractor: LibrosaFeatureExtractor
-      params:
-        feature_fn_name: rms
-        smoothing_kernel_size: 65
-        postprocess: true
-    - name: pitch
-      dim: 1
-      source: feature
-      extractor: CrepePitchExtractor
-      params:
-        postprocess: true
-    # - name: latents
-    #   dim: 8
-    #   source: latent
+    # - name: loudness
+    #   dim: 1
+    #   source: feature
+    #   extractor: LibrosaFeatureExtractor
+    #   params:
+    #     feature_fn_name: rms
+    #     smoothing_kernel_size: 65
+    #     postprocess: true
+    # - name: centroid
+    #   dim: 1
+    #   source: feature
+    #   extractor: LibrosaFeatureExtractor
+    #   params:
+    #     feature_fn_name: spectral_centroid
+    #     smoothing_kernel_size: 65
+    #     postprocess: true
+    - name: latents
+      dim: 512
+      source: latent
   synths:
     - type: ComplexSineSynth
       params:
-        n_sines: 64
-  latent_smoothing_kernel: 65
-  decoder_gru_layers: 2
+        n_sines: 32
+  latent_smoothing_kernel: 1
+  decoder_gru_layers: 1
   learning_rate: 1e-4
   plateau_patience: 100000
   capacity: 32
@@ -57,7 +65,7 @@ losses:
     weight: 1.0
 
 adversarial:
-  enabled: true
+  enabled: false
   weights:
     gen: 1.0
     fm: 1.0

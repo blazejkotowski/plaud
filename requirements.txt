@@ -8,3 +8,6 @@ nn-tilde
 scipy
 librosa
 lmdb
+matplotlib
+torchcrepe
+hydra-core
