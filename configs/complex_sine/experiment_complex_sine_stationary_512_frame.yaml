@@ -8,7 +8,7 @@
 #     trainer.force_restart=true
 
 experiment:
-  name: ddsp_complex_sine
+  name: complex_sine_violin_512_frame
   training_dir: training
 
 audio:
@@ -16,18 +16,19 @@ audio:
   chunk_duration_s: 2.0
 
 data:
-  dataset_path: /path/to/dataset
+  dataset_path:  /mnt/mariadata/datasets/surrogate/stationary_dataset/processed
   # augmentations:
   #   - type: RandomMute
   #     params:
   #       prob: 0.1
 
 model:
-  resampling_factor: 32
+  resampling_factor: 512
+  analysis_window: 512
 
   encoder_type: waveform
   encoder_hidden_channels: [32, 64, 128]
-  encoder_strides: [4, 4, 2]  # Product must equal resampling_factor (4*4*2=32)
+  encoder_strides: [16, 8, 4]  # Product must equal analysis_window (16*8*4=512)
 
   control_space:
     # - name: loudness
@@ -75,7 +76,7 @@ adversarial:
 
 trainer:
   batch_size: 8
-  max_epochs: 5001
+  max_epochs: 10001
   log_every_n_steps: 10
   force_restart: false
 

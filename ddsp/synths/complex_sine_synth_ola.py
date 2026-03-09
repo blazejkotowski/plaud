@@ -36,6 +36,11 @@ class ComplexSineSynth(BaseSynth):
     self._device = device
     self.n_sines = n_sines
 
+    # For overlap-add inference: store the "tail" from previous chunk
+    # persistent=False prevents saving to checkpoint
+    self.register_buffer("_ola_tail", torch.empty(0), persistent=False)
+    self._ola_initialized = False
+
 
   @property
   def n_params(self):
@@ -47,55 +52,122 @@ class ComplexSineSynth(BaseSynth):
   def jit_name(self):
     return "ComplexSineSynth"
 
-  @property
-  def raw_output(self) -> bool:
-    return True
+
+  def reset_ola(self):
+    """Reset the overlap-add tail buffer for starting a new audio generation."""
+    self._ola_initialized = False
+    self._ola_tail = torch.empty(0)
 
 
-  def forward(self, parameters: torch.Tensor, limit_components: float = 0.0) -> torch.Tensor:
+  def forward(self, parameters: torch.Tensor) -> torch.Tensor:
     """
     Synthesizes a signal from the predicted parameters.
     Args:
       - parameters: torch.Tensor[batch_size, n_params, n_frames], real-valued parameters
-      - limit_components: float, fraction of sinusoids to mute (0.0 = all active, 1.0 = all muted)
     Returns:
       - signal: torch.Tensor[batch_size, 1, sig_length], the synthesized signal
+
+    Uses overlap-add synthesis with Hann window in both training and inference
+    for consistent behavior. Streaming tail buffer is only used during inference.
     """
     k = self.n_sines
 
-    # Parameters arrive RAW from the decoder (no _scaled_sigmoid applied).
-    # Activations:
-    #   omega:   raw value → radians/sample (unbounded, since exp(iω) is periodic)
-    #   phi:     raw value → radians (unbounded, same reason)
-    #   amp:     softplus(x) / n_sines → positive, starts small (~0.022/sine)
-    # Using raw omega/phi avoids sigmoid saturation that traps frequencies
-    # near Nyquist/2 (11 kHz) and prevents learning low frequencies.
-    omega = parameters[:, :k, :]
-    phi = parameters[:, k:2*k, :]
-    amp_starts = F.softplus(parameters[:, 2*k:3*k, :]) / k
-    amp_ends = F.softplus(parameters[:, 3*k:, :]) / k
+    # Extract angles and amplitudes
+    omega = parameters[:, :k, :] * math.pi  # frequency: radians per sample [0, ~2π]
+    phi = parameters[:, k:2*k, :] * math.pi  # phase: radians [0, ~2π]
+    amp_starts = parameters[:, 2*k:3*k, :]
+    amp_ends = parameters[:, 3*k:, :]
 
-    # Limit components: keep only top-K sinusoids by mean amplitude
-    limit_components = max(0.0, min(limit_components, 1.0))
-    if limit_components > 0:
-      max_sines = max(int(k * (1 - limit_components)), 1)
-      mean_amps = ((amp_starts + amp_ends) / 2).mean(dim=-1)  # [batch, n_sines]
-      _, top_indices = torch.topk(mean_amps, max_sines, dim=1)
-      mask = torch.zeros_like(amp_starts)
-      mask.scatter_(1, top_indices.unsqueeze(-1).expand(-1, -1, amp_starts.shape[-1]), 1)
-      amp_starts = amp_starts * mask
-      amp_ends = amp_ends * mask
-
-    # Construct unit complex numbers from angles (Esteban's approach)
-    # z_freq = exp(i * omega) = cos(omega) + i*sin(omega)
-    # z_phase = exp(i * phi) = cos(phi) + i*sin(phi)
+    # Construct unit complex numbers from angles
     z_freqs = torch.complex(torch.cos(omega), torch.sin(omega))
     z_phases = torch.complex(torch.cos(phi), torch.sin(phi))
 
-    signal_length = self._resampling_factor * parameters.shape[-1]
-    signal = SynthCoreFunction.apply(z_freqs, z_phases, amp_starts, amp_ends, signal_length)
+    # Use overlap-add synthesis in both modes
+    signal = self._overlap_add_synthesis(z_freqs, z_phases, amp_starts, amp_ends, parameters.device)
 
     return signal.unsqueeze(1)
+
+
+  def _overlap_add_synthesis(self, z_freq, z_phase, amp_start, amp_end, device):
+    """
+    Overlap-add synthesis: generate extended windowed frames and sum them.
+
+    Each frame is synthesized with 2x length, Hann windowed, then overlap-added
+    at 50% overlap (hop = samples_per_frame).
+
+    Uses F.fold for vectorized, gradient-friendly overlap-add.
+    """
+    batch_size, num_sinusoids, n_frames = z_freq.shape
+    samples_per_frame = self._resampling_factor
+    window_size = 2 * samples_per_frame  # 50% overlap
+    hop_size = samples_per_frame
+    output_length = samples_per_frame * n_frames
+
+    # Hann window (sqrt-Hann for COLA property: sum of squared windows = 1)
+    window = torch.hann_window(window_size, device=device, dtype=amp_start.dtype)
+
+    # Time indices within each window: [window_size]
+    n = torch.arange(window_size, device=device, dtype=torch.float32)
+    n_expanded = n.view(1, window_size, 1, 1)
+
+    # Expand parameters for broadcasting
+    z_freq_expanded = z_freq.unsqueeze(1)    # [batch, 1, n_sin, n_frames]
+    z_phase_expanded = z_phase.unsqueeze(1)  # [batch, 1, n_sin, n_frames]
+
+    # Compute z_phase * z_freq^n for extended window
+    # Result: [batch, window_size, n_sin, n_frames]
+    z_combined = z_phase_expanded * (z_freq_expanded ** n_expanded)
+    sinusoids = torch.real(z_combined)
+
+    # Amplitude envelope over the window (linear interpolation extended)
+    t = torch.linspace(0, 1, window_size, device=device, dtype=amp_start.dtype)
+    t_expanded = t.view(1, window_size, 1, 1)
+    amp_start_expanded = amp_start.unsqueeze(1)  # [batch, 1, n_sin, n_frames]
+    amp_end_expanded = amp_end.unsqueeze(1)
+    amp_env = amp_start_expanded * (1 - t_expanded) + amp_end_expanded * t_expanded
+
+    # Apply amplitude envelope
+    sinusoids = sinusoids * amp_env
+
+    # Sum over sinusoids: [batch, window_size, n_frames]
+    frames_summed = sinusoids.sum(dim=2)
+
+    # Apply Hann window: [batch, window_size, n_frames]
+    frames_windowed = frames_summed * window.view(1, window_size, 1)
+
+    # Reshape for F.fold: [batch, window_size, n_frames] -> [batch, window_size, n_frames]
+    # F.fold expects [batch, C*kernel_size, L] where L = n_frames
+    # We treat window_size as kernel_size and sum along it
+    frames_for_fold = frames_windowed  # [batch, window_size, n_frames]
+
+    # Output size for fold: we want output_length + samples_per_frame to capture all overlap
+    fold_output_size = output_length + samples_per_frame
+
+    # Use F.fold for vectorized overlap-add
+    # fold expects input shape [batch, C * kernel_size, num_blocks]
+    # Here C=1, kernel_size=window_size, num_blocks=n_frames
+    output = F.fold(
+      frames_for_fold,  # [batch, window_size, n_frames]
+      output_size=(1, fold_output_size),
+      kernel_size=(1, window_size),
+      stride=(1, hop_size)
+    )  # [batch, 1, 1, fold_output_size]
+
+    output = output.squeeze(1).squeeze(1)  # [batch, fold_output_size]
+
+    # Handle streaming (inference only)
+    if not self.training:
+      if self._ola_initialized and self._ola_tail.shape[0] == batch_size:
+        output = output.clone()
+        output[:, :samples_per_frame] = output[:, :samples_per_frame] + self._ola_tail
+
+      # Save tail for next chunk
+      self._ola_tail = output[:, output_length:output_length + samples_per_frame].clone().detach()
+      self._ola_initialized = True
+
+    # Return only the valid portion
+    return output[:, :output_length]
+
 
   def get_frequencies_hz(self, parameters: torch.Tensor) -> torch.Tensor:
     """
@@ -107,7 +179,7 @@ class ComplexSineSynth(BaseSynth):
       - frequencies: torch.Tensor[batch_size, n_sines, n_frames] in Hz
     """
     k = self.n_sines
-    omega = parameters[:, :k, :]  # raw radians per sample
+    omega = parameters[:, :k, :] * math.pi  # radians per sample
     freq_hz = omega * self._fs / (2 * math.pi)
     return freq_hz
 
@@ -122,8 +194,8 @@ class ComplexSineSynth(BaseSynth):
       - (amp_starts, amp_ends): tuple of [batch_size, n_sines, n_frames] tensors
     """
     k = self.n_sines
-    amp_starts = F.softplus(parameters[:, 2*k:3*k, :]) / k
-    amp_ends = F.softplus(parameters[:, 3*k:, :]) / k
+    amp_starts = parameters[:, 2*k:3*k, :]
+    amp_ends = parameters[:, 3*k:, :]
     return amp_starts, amp_ends
 
 
@@ -147,7 +219,7 @@ class ComplexSineSynth(BaseSynth):
     amplitudes_mean = (amp_starts + amp_ends) / 2.0
 
     # Extract phase (phi) in radians
-    phi = parameters[:, k:2*k, :]  # raw radians
+    phi = parameters[:, k:2*k, :] * math.pi
 
     return {
       'frequencies_hz': frequencies_hz,
@@ -156,110 +228,6 @@ class ComplexSineSynth(BaseSynth):
       'amplitudes_end': amp_ends,
       'phases_rad': phi,
     }
-
-
-  def compute_frequency_stability_loss(self, parameters: torch.Tensor,
-                                        freq_dev_offset: float = 20.0,
-                                        freq_dev_slope: float = 0.01) -> torch.Tensor:
-    """
-    Compute a loss that penalizes frequency jumps between consecutive frames.
-
-    Uses a linear frequency-dependent threshold inspired by SMS-tools sineTracking:
-      threshold_hz = freq_dev_offset + freq_dev_slope * freq_hz
-
-    This allows a fixed minimum tolerance (offset) at low frequencies and
-    increasing tolerance at higher frequencies (slope), matching human
-    perception of pitch intervals.
-
-    Args:
-      - parameters: torch.Tensor[batch_size, n_params, n_frames], decoder output
-      - freq_dev_offset: float, maximum allowed frequency deviation at 0 Hz (in Hz)
-      - freq_dev_slope: float, slope of additional allowed deviation per Hz of frequency
-    Returns:
-      - loss: torch.Tensor scalar, mean penalty for frequency jumps exceeding threshold
-    """
-    k = self.n_sines
-
-    # Get frequencies in Hz
-    omega = parameters[:, :k, :]  # raw radians/sample
-    freq_hz = omega * self._fs / (2 * math.pi)  # Convert to Hz
-
-    # Compute frame-to-frame frequency differences
-    freq_diff = torch.diff(freq_hz, dim=-1)  # [batch, n_sines, n_frames-1]
-    freq_diff_abs = torch.abs(freq_diff)
-
-    # Linear frequency-dependent threshold: offset + slope * freq
-    freq_at_boundaries = (freq_hz[:, :, :-1] + freq_hz[:, :, 1:]) / 2
-    threshold_hz = freq_dev_offset + freq_dev_slope * freq_at_boundaries.abs()
-
-    # Penalize only jumps exceeding the threshold (hinge loss)
-    excess = torch.relu(freq_diff_abs - threshold_hz)
-
-    return excess.mean()
-
-
-  def compute_phase_continuity_loss(self, parameters: torch.Tensor) -> torch.Tensor:
-    """
-    Compute a loss that penalizes phase discontinuities between consecutive frames.
-
-    For each sinusoid, the phase at the start of frame t+1 should equal the
-    phase accumulated by the end of frame t:
-      phi_expected[t+1] = phi[t] + omega[t] * N   (where N = samples per frame)
-
-    Uses a **cosine distance** formulation in the complex domain for numerical
-    stability. Instead of computing angular difference via atan2 on large
-    accumulated angles (which loses float32 precision), we work with unit
-    complex phasors:
-      z_expected = exp(i * phi[t]) * exp(i * omega[t])^N
-      z_actual   = exp(i * phi[t+1])
-      loss = 1 - cos(angle(z_actual) - angle(z_expected))
-           = 1 - Re(z_actual * conj(z_expected))
-
-    This is smooth, bounded [0, 2], and avoids precision issues with large angles.
-    The loss is weighted by amplitude so that silent sinusoids don't contribute.
-
-    Args:
-      - parameters: torch.Tensor[batch_size, n_params, n_frames], decoder output
-    Returns:
-      - loss: torch.Tensor scalar, amplitude-weighted mean phase discontinuity
-    """
-    k = self.n_sines
-    N = self._resampling_factor
-
-    omega = parameters[:, :k, :]   # [batch, n_sines, n_frames] radians/sample
-    phi = parameters[:, k:2*k, :]  # [batch, n_sines, n_frames] radians
-
-    # Build unit phasors for actual phase at each frame
-    z_phi = torch.complex(torch.cos(phi), torch.sin(phi))  # [batch, k, T]
-
-    # Build unit phasors for frequency: exp(i*omega)
-    z_omega = torch.complex(torch.cos(omega), torch.sin(omega))  # [batch, k, T]
-
-    # Expected phasor at start of frame t+1:
-    #   z_expected = z_phi[t] * z_omega[t]^N
-    # z_omega^N = exp(i * omega * N) — computed in the complex domain, stays on unit circle
-    z_omega_N = z_omega[:, :, :-1] ** N  # [batch, k, T-1]
-    z_expected = z_phi[:, :, :-1] * z_omega_N  # [batch, k, T-1]
-
-    # Actual phasor at frame t+1
-    z_actual = z_phi[:, :, 1:]  # [batch, k, T-1]
-
-    # Cosine distance: 1 - Re(z_actual * conj(z_expected))
-    # When phases match: Re(...) = 1, loss = 0
-    # When phases are opposite: Re(...) = -1, loss = 2
-    cos_dist = 1.0 - (z_actual * z_expected.conj()).real  # [batch, k, T-1]
-
-    # Amplitude weighting: focus loss on sinusoids that are actually audible
-    amp_starts = F.softplus(parameters[:, 2*k:3*k, :]) / k
-    amp_ends = F.softplus(parameters[:, 3*k:, :]) / k
-    amp_mean = (amp_starts + amp_ends) / 2.0  # [batch, k, T]
-    # Use geometric mean of amplitudes at boundary frames
-    amp_weight = (amp_mean[:, :, :-1] * amp_mean[:, :, 1:]).sqrt()  # [batch, k, T-1]
-    amp_weight = amp_weight / (amp_weight.sum(dim=1, keepdim=True) + 1e-8)  # normalise per frame
-
-    weighted_loss = (cos_dist * amp_weight).sum(dim=1).mean()  # scalar
-
-    return weighted_loss
 
 
 class SynthCoreFunction(torch.autograd.Function):
@@ -275,9 +243,6 @@ class SynthCoreFunction(torch.autograd.Function):
 
         # Time indices within each frame: [samples_per_frame]
         n = torch.arange(samples_per_frame, device=device, dtype=torch.float32)
-
-        # z_freq and z_phase are already on unit circle (constructed from exp(i*theta))
-        # No normalization needed
 
         # Expand for broadcasting:
         # z_freq: [batch, n_sin, n_frames] -> [batch, 1, n_sin, n_frames]
@@ -341,14 +306,7 @@ class SynthCoreFunction(torch.autograd.Function):
 
         grad_z_freq, grad_z_phase, grad_amp_start, grad_amp_end = grads
 
-        # Normalize the local gradients (only if they exist)
-        # Essential: z_freq^n causes gradient magnitudes to scale with n (=resampling_factor),
-        # making raw gradients extremely large. Per-element normalization preserves direction
-        # while keeping magnitudes uniform, preventing gradient explosion through the network.
-        # NOTE: Only frequency/phase gradients are normalized (sign-only gradient).
-        # Amplitude gradients keep their natural magnitude — following Esteban's approach.
-        # Normalizing amplitude gradients destroys the smooth amplitude loss landscape
-        # and makes the decoder unable to learn proper amplitude scaling.
+        # 🔥 Normalize the local gradients (only if they exist)
         if grad_z_freq is not None:
             grad_z_freq = grad_z_freq / (grad_z_freq.abs() + 1e-8)
         if grad_z_phase is not None:

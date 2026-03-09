@@ -8,7 +8,7 @@
 #     trainer.force_restart=true
 
 experiment:
-  name: ddsp_complex_sine
+  name: complex_sine_violin_ola_compact_smooth
   training_dir: training
 
 audio:
@@ -16,7 +16,7 @@ audio:
   chunk_duration_s: 2.0
 
 data:
-  dataset_path: /path/to/dataset
+  dataset_path: /mnt/mariadata/datasets/ddsp-vae/instruments/violin/processed
   # augmentations:
   #   - type: RandomMute
   #     params:
@@ -47,14 +47,14 @@ model:
     #     smoothing_kernel_size: 65
     #     postprocess: true
     - name: latents
-      dim: 512
+      dim: 4
       source: latent
   synths:
     - type: ComplexSineSynth
       params:
         n_sines: 32
-  latent_smoothing_kernel: 1
-  decoder_gru_layers: 1
+  latent_smoothing_kernel: 255
+  decoder_gru_layers: 2
   learning_rate: 1e-4
   plateau_patience: 100000
   capacity: 32
@@ -75,7 +75,7 @@ adversarial:
 
 trainer:
   batch_size: 8
-  max_epochs: 5001
+  max_epochs: 10001
   log_every_n_steps: 10
   force_restart: false
 

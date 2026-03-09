@@ -40,6 +40,18 @@ class BaseSynth(nn.Module):
     """Returns the number of control parameters"""
     raise NotImplementedError
 
+  @property
+  def raw_output(self) -> bool:
+    """If True, the decoder should skip _scaled_sigmoid for this synth's params.
+    The synth will apply its own per-parameter activations instead."""
+    return False
+
+  @property
+  def params_per_sine(self) -> int:
+    """Number of parameters per sinusoid. Override in subclasses.
+    First n_sines params are always frequency; the rest are 'other' (phase, amp, etc.)."""
+    return 4
+
   @classmethod
   def builder(cls: Type['BaseSynth'], **kwargs) -> Callable[[], 'BaseSynth']:
     """

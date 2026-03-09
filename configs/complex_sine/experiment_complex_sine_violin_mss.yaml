@@ -8,7 +8,7 @@
 #     trainer.force_restart=true
 
 experiment:
-  name: ddsp_complex_sine
+  name: complex_sine_violin_mss
   training_dir: training
 
 audio:
@@ -16,7 +16,7 @@ audio:
   chunk_duration_s: 2.0
 
 data:
-  dataset_path: /path/to/dataset
+  dataset_path: /mnt/mariadata/datasets/ddsp-vae/instruments/violin/processed
   # augmentations:
   #   - type: RandomMute
   #     params:
@@ -60,8 +60,10 @@ model:
   capacity: 32
 
 losses:
-  - type: MSELoss
+  - type: MRSTFT
     weight: 1.0
+    params:
+      fft_sizes: [2053, 1021, 509, 257, 129, 65, 33]
 
 adversarial:
   enabled: false
@@ -75,7 +77,7 @@ adversarial:
 
 trainer:
   batch_size: 8
-  max_epochs: 5001
+  max_epochs: 10001
   log_every_n_steps: 10
   force_restart: false
 

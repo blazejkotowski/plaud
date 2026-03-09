@@ -242,7 +242,7 @@ class AudioFeatureDataset(Dataset):
         align_corners=False,
       ).squeeze(0).T  # [T_ctl, D_feat]
 
-    return audio, feat_ds
+    return audio, feat_ds, idx
 
 
   def _load_dataset(self, path: str) -> torch.Tensor:

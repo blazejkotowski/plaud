@@ -1,14 +1,15 @@
+# @package _global_
 # ComplexSineSynth experiment — complex-surrogate frequency estimation
 # Uses ONLY the ComplexSineSynth (no noise bands / other synths).
 #
 # Run:
-#   python -m cli.train -cn experiment_complex_sine \
+#   python -m cli.train -cn complex_sine/experiment_complex_sine_single_1024_frame \
 #     data.dataset_path=/path/to/dataset \
 #     ++experiment.name=my_experiment \
 #     trainer.force_restart=true
 
 experiment:
-  name: ddsp_complex_sine
+  name: complex_sine_single_1024_frame
   training_dir: training
 
 audio:
@@ -16,18 +17,19 @@ audio:
   chunk_duration_s: 2.0
 
 data:
-  dataset_path: /path/to/dataset
+  dataset_path:  /mnt/mariadata/datasets/surrogate/single_sound/processed
   # augmentations:
   #   - type: RandomMute
   #     params:
   #       prob: 0.1
 
 model:
-  resampling_factor: 32
+  resampling_factor: 1024
+  analysis_window: 1024
 
   encoder_type: waveform
-  encoder_hidden_channels: [32, 64, 128]
-  encoder_strides: [4, 4, 2]  # Product must equal resampling_factor (4*4*2=32)
+  encoder_hidden_channels: [16, 32, 64]
+  encoder_strides: [16, 8, 8]  # Product must equal analysis_window (16*8*4=512)
 
   control_space:
     # - name: loudness
@@ -52,12 +54,21 @@ model:
   synths:
     - type: ComplexSineSynth
       params:
-        n_sines: 32
+        n_sines: 64
   latent_smoothing_kernel: 1
   decoder_gru_layers: 1
-  learning_rate: 1e-4
-  plateau_patience: 100000
+  learning_rate: 1e-3
+  plateau_patience: 5000
   capacity: 32
+  orth_embed_dim: 128
+  use_param_table: true
+  freeze_table: true
+  pretrained_table_path: /home/btadeusz/code/ddsp_vae/training/synth/complex_sine_single_1024_frame/best-v20.ckpt
+  stft_n_fft: 4096
+  freq_bin_selection: true
+  freq_n_fft: 4096
+  distill_weight: 1.0
+  decoder_recons_weight: 0.0
 
 losses:
   - type: MSELoss
@@ -75,7 +86,7 @@ adversarial:
 
 trainer:
   batch_size: 8
-  max_epochs: 5001
+  max_epochs: 100001
   log_every_n_steps: 10
   force_restart: false
 

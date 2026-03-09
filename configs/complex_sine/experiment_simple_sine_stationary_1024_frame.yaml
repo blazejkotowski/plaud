@@ -1,0 +1,87 @@
+# @package _global_
+# SimpleSineSynth on stationary_dataset (10 sounds × 60s = 300 chunks)
+# Same training regime as the single_sound experiment: STFT init → freeze → distillation.
+#
+# Run:
+#   python -m cli.train -cn complex_sine/experiment_simple_sine_stationary_1024_frame \
+#     trainer.force_restart=true
+
+experiment:
+  name: simple_sine_stationary_1024_frame
+  training_dir: training
+
+audio:
+  fs: 44100
+  chunk_duration_s: 2.0
+
+data:
+  dataset_path: /mnt/mariadata/datasets/surrogate/stationary_dataset/processed
+
+model:
+  resampling_factor: 1024
+  analysis_window: 1024
+
+  encoder_type: waveform
+  encoder_hidden_channels: [16, 32, 64]
+  encoder_strides: [16, 8, 8]
+
+  control_space:
+    - name: latents
+      dim: 512
+      source: latent
+  synths:
+    - type: SimpleSineSynth
+      params:
+        n_sines: 64
+  latent_smoothing_kernel: 1
+  decoder_gru_layers: 1
+  learning_rate: 1e-3
+  plateau_patience: 5000
+  capacity: 32
+  orth_embed_dim: 128
+  use_param_table: true
+  freeze_table: true
+  distill_weight: 1.0
+  decoder_recons_weight: 0.0
+  stft_n_fft: 4096
+  freq_bin_selection: true
+  freq_n_fft: 4096
+
+losses:
+  - type: MRSTFT
+    weight: 1.0
+
+adversarial:
+  enabled: false
+  weights:
+    gen: 1.0
+    fm: 1.0
+    disc: 1.0
+  schedule:
+    g_start_epoch: 100
+    d_start_epoch: 150
+
+trainer:
+  batch_size: 8
+  max_epochs: 100001
+  log_every_n_steps: 10
+  force_restart: false
+
+prior:
+  enabled: false
+
+  model:
+    embedding_dim: 32
+    quantization_channels: 16
+    nhead: 8
+    num_layers: 4
+    dropout: 0.1
+    max_len: 64
+
+  dataset:
+    stride_factor: 0.2
+    in_memory: true
+
+  training:
+    batch_size: 256
+    max_epochs: 10000
