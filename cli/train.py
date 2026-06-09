@@ -4,133 +4,142 @@ from lightning.pytorch.callbacks import EarlyStopping, ModelCheckpoint
 
 import torch
 torch.set_default_dtype(torch.float32)
+torch.set_float32_matmul_precision('medium')
 
-import argparse
 import os
+import shutil
 
-from torch.utils.data import DataLoader, random_split
-from ddsp import DDSP, AudioDataset
-from ddsp.callbacks import BetaWarmupCallback, CyclicalBetaWarmupCallback
+from torch.utils.data import DataLoader, Subset, random_split
+from ddsp import DDSP, AudioFeatureDataset
+from ddsp.synths import BendableNoiseBandSynth
+from ddsp.callbacks import BetaWarmupCallback
+from ddsp.interfaces import build_control_space
+from ddsp.augmentations import build_audio_augmentation_pipeline
+from ddsp.registry import SYNTHS
+
+from ddsp.prior import Prior, PriorDataset
 from ddsp.utils import find_checkpoint
 
-if __name__ == '__main__':
-  parser = argparse.ArgumentParser()
-  parser.add_argument('--dataset_path', help='Directory of the training sound/sounds')
-  parser.add_argument('--device', help='Device to use', default='cuda', choices=['cuda', 'cpu'])
-  parser.add_argument('--batch_size', type=int, default=16, help='Batch size for training')
-  parser.add_argument('--lr', type=float, default=1e-4, help='Learning rate')
-  parser.add_argument('--n_band', type=int, default=512, help='Number of bands of the filter bank')
-  parser.add_argument('--fs', type=int, default=44100, help='Sampling rate of the audio')
-  parser.add_argument('--encoder_ratios', type=int, nargs='+', default=[8, 4, 2], help='Capacity ratios for the encoder')
-  parser.add_argument('--n_mfcc', type=int, default=30, help='Number of MFCCs to extract')
-  parser.add_argument('--decoder_ratios', type=int, nargs='+', default=[2, 4, 8], help='Capacity ratios for the decoder')
-  parser.add_argument('--capacity', type=int, default=64, help='Capacity of the model')
-  parser.add_argument('--latent_size', type=int, default=16, help='Dimensionality of the latent space')
-  parser.add_argument('--audio_chunk_duration', type=float, default=1.5, help='Duration of the audio chunks in seconds')
-  parser.add_argument('--resampling_factor', type=int, default=32, help='Resampling factor for the control signal and noise bands')
-  parser.add_argument('--mixed_precision', type=bool, default=True, help='Use mixed precision')
-  parser.add_argument('--training_dir', type=str, default='training', help='Directory to save the training logs')
-  parser.add_argument('--model_name', type=str, default='ddsp', help='Name of the model')
-  parser.add_argument('--max_epochs', type=int, default=10000, help='Maximum number of epochs')
-  parser.add_argument('--control_params', type=str, nargs='+', default=['loudness', 'centroid'], help='Control parameters to use, possible: aloudness, centroid, flatness')
-  parser.add_argument('--beta', type=float, default=1.0, help='Beta parameter for the beta-VAE loss')
-  parser.add_argument('--warmup_start', type=int, default=300, help='Step to start the beta warmup')
-  parser.add_argument('--warmup_end', type=int, default=1300, help='Step to end the beta warmup')
-  parser.add_argument('--kld_weight', type=float, default=0.0001, help='Weight for the KLD loss')
-  parser.add_argument('--early_stopping', type=bool, default=False, help='Use early stopping')
-  parser.add_argument('--force_restart', type=bool, default=False, help='Force restart the training. Ignore the existing checkpoint.')
-  # parser.add_argument('--warmup_cycle', type=int, default=50, help='Number of epochs for a full beta cycle')
-  config = parser.parse_args()
+import hydra
+from omegaconf import DictConfig
+from hydra.core.hydra_config import HydraConfig
 
-  n_signal = int(config.audio_chunk_duration * config.fs)
 
-  # Create training directory
-  training_path = os.path.join(config.training_dir, config.model_name)
-  os.makedirs(training_path, exist_ok=True)
+@hydra.main(version_base=None, config_path="../configs", config_name="experiment")
+def main(cfg: DictConfig) -> None:
+  # Set default device/tensor type only during CLI execution
+  if torch.cuda.is_available():
+    try:
+      torch.set_default_device('cuda')
+      torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    except Exception:
+      pass
+  # Shared audio params
+  fs = int(cfg.audio.fs)
+  resampling_factor = int(cfg.model.resampling_factor)
+  chunk_duration_s = float(cfg.audio.chunk_duration_s)
+  n_signal = int(fs * chunk_duration_s)
 
-  # Load Dataset
-  dataset = AudioDataset(
-    dataset_path=config.dataset_path,
+  # Paths
+  dataset_path = cfg.data.dataset_path
+  model_name = cfg.experiment.name
+  training_dir = cfg.experiment.training_dir
+  synth_training_path = os.path.join(training_dir, 'synth', model_name)
+  os.makedirs(synth_training_path, exist_ok=True)
+
+  # Control space
+  control_space = build_control_space(cfg.model.control_space)
+
+  # Optional audio augmentations
+  transform_fn = build_audio_augmentation_pipeline(
+    getattr(cfg.data, 'augmentations', None),
     n_signal=n_signal,
-    sampling_rate=config.fs,
+    sampling_rate=fs,
   )
 
-  # Split into training and validation
-  train_set, val_set = random_split(dataset, [0.9, 0.1])
-  train_loader = DataLoader(train_set, batch_size=config.batch_size, shuffle=True)
-  val_loader = DataLoader(val_set, batch_size=config.batch_size, shuffle=False)
+  # Dataset
+  synth_dataset = AudioFeatureDataset(
+    dataset_path=dataset_path,
+    n_signal=n_signal,
+    sampling_rate=fs,
+    resampling_factor=resampling_factor,
+    control_space=control_space,
+    transform_fn=transform_fn,
+  )
+
+  # Dataloaders
+  batch_size = int(cfg.trainer.batch_size)
+  generator = torch.Generator(device='cuda')
+  synth_total_len = len(synth_dataset)
+  synth_val_len = int(0.2 * synth_total_len)
+  synth_indices = torch.randperm(synth_total_len, generator=generator)
+  synth_val_indices = synth_indices[:synth_val_len]
+  train_indices = synth_indices
+  train_loader = DataLoader(Subset(synth_dataset, train_indices), batch_size=batch_size, shuffle=True, num_workers=0, generator=generator)
+  val_loader = DataLoader(Subset(synth_dataset, synth_val_indices), batch_size=batch_size, shuffle=False, num_workers=0, generator=generator)
+
+  # Synths from config
+  synth_configs = []
+  for s in cfg.model.synths:
+    synth_configs.append({"class": s.type, "params": dict(s.params)})
+
+  # Capture the active Hydra config name for logging/hparams
+  try:
+    active_config_name = HydraConfig.get().job.config_name
+  except Exception:
+    active_config_name = None
 
   # Core model
   ddsp = DDSP(
-    n_filters=config.n_band,
-    latent_size=config.latent_size,
-    fs=config.fs,
-    encoder_ratios=config.encoder_ratios,
-    n_mfcc=config.n_mfcc,
-    decoder_ratios=config.decoder_ratios,
-    capacity=config.capacity,
-    resampling_factor=config.resampling_factor,
-    learning_rate=config.lr,
-    kld_weight=config.kld_weight,
+    control_space=control_space,
+    synth_configs=synth_configs,
+    fs=fs,
+    resampling_factor=resampling_factor,
+    latent_smoothing_kernel=int(cfg.model.latent_smoothing_kernel),
+    decoder_gru_layers=int(cfg.model.decoder_gru_layers),
+    learning_rate=float(cfg.model.learning_rate),
+    perceptual_loss_weight=float(getattr(cfg.model, 'perceptual_loss_weight', 0.0)),
+    plateau_patience=int(cfg.model.plateau_patience),
+    capacity=int(cfg.model.capacity),
+    losses=[dict(l) for l in getattr(cfg, 'losses', [])],
+    adversarial_loss=bool(cfg.adversarial.enabled),
+    adv_g_start_epoch=int(cfg.adversarial.schedule.g_start_epoch),
+    adv_d_start_epoch=int(cfg.adversarial.schedule.d_start_epoch),
+    adv_gen_weight=float(cfg.adversarial.weights.gen),
+    adv_disc_weight=float(cfg.adversarial.weights.disc),
+    adv_fm_weight=float(cfg.adversarial.weights.fm),
+    config_name=active_config_name,
   )
 
   # Tensorboard
-  tb_logger = TensorBoardLogger(config.training_dir, name=config.model_name)
+  tb_logger = TensorBoardLogger(synth_training_path, name=model_name)
 
-  training_callbacks = []
+  # Callbacks
+  callbacks = []
+  if 'beta' in cfg.model:
+    callbacks.append(BetaWarmupCallback(beta=float(cfg.model.beta), start_steps=50, end_steps=100))
 
-  # Warming up beta parameter
-  beta_warmup = BetaWarmupCallback(
-    beta=config.beta,
-    start_steps=config.warmup_start,
-    end_steps=config.warmup_end
-  )
-  training_callbacks.append(beta_warmup)
+  callbacks.append(ModelCheckpoint(dirpath=synth_training_path, filename='best', monitor='val_loss', mode='min', save_top_k=1, save_last=True))
 
-  # Early stopping
-  if config.early_stopping:
-    training_callbacks += [EarlyStopping(monitor='train_loss', patience=10, mode='min')]
-
-  # Define the checkpoint callback
-  best_checkpoint_callback = ModelCheckpoint(
-      filename='best',
-      monitor='val_loss',
-      mode='min',
-  )
-  training_callbacks.append(best_checkpoint_callback)
-
-  # Callback to save the last checkpoint after every epoch
-  last_checkpoint_callback = ModelCheckpoint(
-    filename='last',
-    save_top_k=1,  # Save only one file, the most recent one
-    save_last=True  # Always save the model at the end of the epoch
-  )
-  training_callbacks.append(last_checkpoint_callback)
-
-  # Configure the trainer
-  precision = 16 if config.mixed_precision else 32
-  trainer = L.Trainer(
-    callbacks=training_callbacks,
-    max_epochs=config.max_epochs,
-    accelerator=config.device,
-    precision=precision,
-    log_every_n_steps=4,
+  # Trainer
+  synth_trainer = L.Trainer(
+    callbacks=callbacks,
+    max_epochs=int(cfg.trainer.max_epochs),
+    log_every_n_steps=int(cfg.trainer.log_every_n_steps),
     logger=tb_logger,
   )
 
-  # Try to find previously trained checkpoint
-  ckpt_path = find_checkpoint(training_path, return_none=True) if not config.force_restart else None
-  if config.force_restart:
+  # Resume checkpoint
+  synth_ckpt_path = find_checkpoint(synth_training_path, return_none=True, typ='last') if not bool(cfg.trainer.force_restart) else None
+  if cfg.trainer.force_restart:
     print("Force restart set to True")
-  else:
-    if ckpt_path is not None:
-      print(f"Resuming from checkpoint: {ckpt_path}")
-    else:
-      print(f"Did not find any checkpoint at {training_path}.")
+  elif synth_ckpt_path is not None:
+    print(f"Resuming from checkpoint: {synth_ckpt_path}")
 
-  # Start training
-  trainer.fit(model=ddsp,
-    train_dataloaders=train_loader,
-    val_dataloaders=val_loader,
-    ckpt_path=ckpt_path
-  )
+  # Train
+  synth_trainer.fit(model=ddsp, train_dataloaders=train_loader, val_dataloaders=val_loader, ckpt_path=synth_ckpt_path)
+  print(f"Synthesizer training completed. Your checkpoints are in {synth_training_path}")
+
+
+if __name__ == '__main__':
+  main()

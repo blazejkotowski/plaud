@@ -1,0 +1,104 @@
+# Features-only ControlSpace
+
+experiment:
+  name: ddsp_features_only
+  training_dir: training
+
+audio:
+  fs: 22050
+  chunk_duration_s: 2.0
+
+data:
+  dataset_path: /path/to/dataset
+  augmentations:
+    - type: RandomMute
+      params:
+        prob: 0.1
+
+model:
+  resampling_factor: 256
+  control_space:
+    - name: loudness
+      dim: 1
+      source: feature
+      extractor: LibrosaFeatureExtractor
+      params:
+        feature_fn_name: rms
+        smoothing_kernel_size: 65
+        postprocess: true
+    # - name: centroid
+    #   dim: 1
+    #   source: feature
+    #   extractor: LibrosaFeatureExtractor
+    #   params:
+    #     feature_fn_name: spectral_centroid
+    #     smoothing_kernel_size: 65
+    #     postprocess: true
+    - name: pitch
+      dim: 1
+      source: feature
+      extractor: CrepePitchExtractor
+      params:
+        postprocess: True
+    # No latent field (dim=0 implied)
+  synths:
+    - type: BendableNoiseBandSynth
+      params:
+        n_filters: 512
+  latent_smoothing_kernel: 65
+  decoder_gru_layers: 2
+  learning_rate: 1e-4
+  plateau_patience: 100000
+  capacity: 32
+
+losses:
+  - type: MRSTFT
+    weight: 1.0
+    params:
+      fft_sizes: [2053, 1021, 509, 257, 129, 65, 33]
+
+adversarial:
+  enabled: true
+  weights:
+    gen: 0.1
+    fm: 0.1
+    disc: 1.0
+  schedule:
+    g_start_epoch: 100
+    d_start_epoch: 150
+
+trainer:
+  batch_size: 8
+  max_epochs: 5001
+  log_every_n_steps: 10
+  force_restart: false
+
+prior:
+  enabled: true
+
+  model:
+    embedding_dim: 32
+    quantization_channels: 16
+    nhead: 8
+    num_layers: 4
+    dropout: 0.1
+    max_len: 64
+
+  dataset:
+    stride_factor: 0.2
+    in_memory: true
+
+    # Optional normalization for latent values; if omitted, model clamps to [-1,1]
+    # normalization:
+      # min: -1.0
+      # max: 1.0
+
+  training:
+    batch_size: 256
+    max_epochs: 10000
+    num_workers: 4
+    lr: 1e-4
+    force_restart: false
+
+
+
