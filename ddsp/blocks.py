@@ -175,6 +175,7 @@ class Decoder(nn.Module):
                layer_sizes: List[int] = [32, 64, 128],
                output_mlp_layers: int = 3,
                gru_layers: int = 1,
+               temporal_stride: int = 1,
                streaming: bool = False):
     """
     Arguments:
@@ -183,12 +184,14 @@ class Decoder(nn.Module):
       - layer_sizes: List[int], the sizes of the layers in the bottleneck
       - output_mlp_layers: int, the number of layers in the output MLP
       - gru_layers: int, the number of GRU layers in the decoder
+      - temporal_stride: int, subsample time axist by this factor before the GRU, upsample after
       - streaming: bool, streaming mode (realtime)
     """
     super().__init__()
 
     self.n_params = n_params
     self.streaming = streaming
+    self.temporal_stride = temporal_stride
 
     # MLP mapping from the latent space
     self.input_latent_bottleneck = _make_sequential([latent_size] + layer_sizes)
@@ -219,6 +222,14 @@ class Decoder(nn.Module):
     Returns:
       - synth_params: torch.Tensor, the predicted synthesiser parameters
     """
+    # Store for upsampling
+    T = z.shape[1]
+
+    # Temporal subsampling: process at lower resolution through GRU
+    if self.temporal_stride > 1:
+      z = z[:, ::self.temporal_stride, :]
+      features = features[:, ::self.temporal_stride, :]
+
     # Pass latents through the input MLP
     z_transformed = self.input_latent_bottleneck(z)
 
@@ -240,6 +251,10 @@ class Decoder(nn.Module):
 
     # Pass through the output layer
     output = _scaled_sigmoid(self.output_params(x))
+
+    # Upsample back to original temporal resolution
+    if self.temporal_stride > 1:
+       output = output.repeat_interleave(self.temporal_stride, dim=1)[:, :T, :]
 
     return output.permute(0, 2, 1)
 

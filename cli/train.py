@@ -97,6 +97,7 @@ def main(cfg: DictConfig) -> None:
     resampling_factor=resampling_factor,
     latent_smoothing_kernel=int(cfg.model.latent_smoothing_kernel),
     decoder_gru_layers=int(cfg.model.decoder_gru_layers),
+    decoder_temporal_stride=int(getattr(cfg.model, 'decoder_temporal_stride', 1)),
     learning_rate=float(cfg.model.learning_rate),
     perceptual_loss_weight=float(getattr(cfg.model, 'perceptual_loss_weight', 0.0)),
     plateau_patience=int(cfg.model.plateau_patience),

@@ -97,6 +97,15 @@ class NoiseBandSynth(BaseSynth):
     # Shift of the noisebands between inferences, to maintain continuity
     self._noisebands_shift = 0
 
+    # Precompute blocked noisebands for fast batch=1 inference synthesis.
+    # Reshape [n_filters, band_len] -> [n_blocks, n_filters, rf] where n_blocks = band_len // rf
+    # Each block corresponds to one control frame's worth of audio samples.
+    nb = self._filterbank.noisebands # [n_filters, band_len]
+    n_f, band_len = nb.shape
+    n_blocks = band_len // resampling_factor
+    nb_blocked = nb.reshape(n_f, n_blocks, resampling_factor).permute(1, 0, 2).contiguous()
+    self.register_buffer('_nb_blocked', nb_blocked, persistent=False) # -> [n_blocks, n_filters, rf]
+
 
   @property
   def n_params(self):
@@ -112,57 +121,63 @@ class NoiseBandSynth(BaseSynth):
     """
     Synthesizes a signal from the predicted amplitudes and the baked noise bands.
     Args:
-      - amplitudes: torch.Tensor[batch_size, n_bands, sig_length], the predicted amplitudes of the noise bands
+      - amplitudes: torch.Tensor[batch_size, n_bands, n_ctrl], the predicted amplitudes of the noise bands
       - limit_components: float, the attenuation factor for the number of used bands
       - waveshaping_factor: float, does nothing, it is here for the JIT compatibility with other synth classes
     Returns:
-      - signal: torch.Tensor[batch_size, sig_length], the synthesized signal
+      - signal: torch.Tensor[batch_size, 1, sig_length], the synthesized signal
     """
-    # limit_components = kwargs.get('limit_components', 0.0)
-    # Clamp the limit components
     limit_components = max(0.0, min(limit_components, 1.0))
-
-    # upsample the amplitudes
-    upsampled_amplitudes = F.interpolate(amplitudes, scale_factor=float(self._resampling_factor), mode='linear')
-
-    # shift the noisebands to maintain the continuity of the noise signal
-    noisebands = torch.roll(self._noisebands, shifts=-self._noisebands_shift, dims=-1)
+    rf = int(self._resampling_factor)
+    noisebands = self._noisebands  # [n_filters, band_len]
+    band_len = noisebands.shape[-1]
+    n_ctrl = amplitudes.shape[-1]
+    total_len = n_ctrl * rf
+    batch_size = amplitudes.shape[0]
 
     if self.training:
-      # roll the noisebands randomly to avoid overfitting to the noise values
-      # check whether model is training
-      noisebands = torch.roll(noisebands, shifts=int(torch.randint(0, noisebands.shape[-1], size=(1,), device=self._device)), dims=-1)
+      # Roll noisebands randomly during training to avoid overfitting to specific noise values
+      noisebands = torch.roll(noisebands, shifts=int(torch.randint(0, band_len, size=(1,), device=noisebands.device)), dims=-1)
 
-    # fit the noisebands into the mplitudes
-    repeats = math.ceil(upsampled_amplitudes.shape[-1] / noisebands.shape[-1])
-    looped_bands = noisebands.repeat(1, repeats) # repeat
-    looped_bands = looped_bands[:, :upsampled_amplitudes.shape[-1]] # trim
+    # Track shift for streaming continuity (start_pos is always a multiple of rf)
+    start_pos = self._noisebands_shift % band_len
+    self._noisebands_shift = (self._noisebands_shift + total_len) % band_len
 
-    # Save the noisebands shift for the next iteration
-    self._noisebands_shift = (self._noisebands_shift + upsampled_amplitudes.shape[-1]) % self._noisebands.shape[-1]
-
-    # Synthesize the signal
-    # If the limit_components is higher than 0, we need to limit the number of bands
-    # by choosing the first max_bands, in relation to their amplitudes
-    limit_components = max(0.0, min(limit_components, 1.0))
+    # Apply band mask at control rate (mean is identical pre- vs post-upsample)
     if limit_components > 0:
-      # Calculate the number of bands to keep (at least 1)
-      max_bands = int(self.n_params * (1 - limit_components))
-      max_bands = max(max_bands, 1)
+      max_bands = max(int(self.n_params * (1 - limit_components)), 1)
+      _, indices = torch.topk(amplitudes.mean(dim=-1), max_bands, dim=1)
+      mask = torch.zeros(batch_size, self.n_params, 1, dtype=amplitudes.dtype, device=amplitudes.device)
+      mask.scatter_(1, indices.unsqueeze(-1), 1)
+      amplitudes = amplitudes * mask
 
-      # Get the indices of the max_bands largest amplitudes (mean over time)
-      mean_amps = upsampled_amplitudes.mean(dim=-1)
-      _, indices = torch.topk(mean_amps, max_bands, dim=1)
-      # Create a mask of the same shape as the amplitudes
-      mask = torch.zeros_like(upsampled_amplitudes)
-      mask.scatter_(1, indices.unsqueeze(-1).expand(-1, -1, upsampled_amplitudes.shape[-1]), 1)
+    # Fast inference path for batch_size=1: periodic blocked BMM, handles limit_components too.
+    # _nb_blocked: [n_blocks, n_filters, rf], each block = one control frame's audio.
+    if not self.training and batch_size == 1:
+      n_blocks = self._nb_blocked.shape[0]
+      start_block = start_pos // rf
+      amp_T = amplitudes.squeeze(0).T  # [n_ctrl, n_filters]
+      nb_blocked = self._nb_blocked.to(amp_T.dtype)  # bmm requires matching dtypes (noisebands are float64)
+      out = torch.empty(n_ctrl, rf, dtype=amplitudes.dtype, device=amplitudes.device)
+      t, b = 0, start_block
+      while t < n_ctrl:
+        avail = n_blocks - b
+        take = min(avail, n_ctrl - t)
+        out[t:t+take] = torch.bmm(amp_T[t:t+take].unsqueeze(1), nb_blocked[b:b+take]).squeeze(1)
+        t += take; b = (b + take) % n_blocks
+      return out.reshape(1, 1, -1)
 
-      # Apply the mask to the amplitudes and looped_bands
-      upsampled_amplitudes = upsampled_amplitudes * mask
-      looped_bands = looped_bands * mask
-
-    signal = torch.sum(upsampled_amplitudes * looped_bands, dim=1, keepdim=True)
-
+    # General path: training or batch_size > 1
+    upsampled_amplitudes = amplitudes.repeat_interleave(rf, dim=-1)
+    signal = torch.zeros(batch_size, 1, total_len, dtype=upsampled_amplitudes.dtype, device=upsampled_amplitudes.device)
+    out_pos, nb_pos = 0, start_pos
+    while out_pos < total_len:
+      avail = band_len - nb_pos
+      take = min(avail, total_len - out_pos)
+      nb_chunk = noisebands[:, nb_pos:nb_pos+take]
+      amp_chunk = upsampled_amplitudes[:, :, out_pos:out_pos+take]
+      signal[:, :, out_pos:out_pos+take] = (amp_chunk * nb_chunk).sum(dim=1, keepdim=True)
+      out_pos += take; nb_pos = (nb_pos + take) % band_len
     return signal
 
   @property

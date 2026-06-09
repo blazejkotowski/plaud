@@ -49,6 +49,7 @@ class DDSP(L.LightningModule):
                n_melbands: int = 128,
                decoder_ratios: List[int] = [2, 4, 8],
                decoder_gru_layers: int = 1,
+               decoder_temporal_stride: int = 1,
                capacity: int = 64,
                resampling_factor: int = 32,
                learning_rate: float = 1e-3,
@@ -56,14 +57,14 @@ class DDSP(L.LightningModule):
                perceptual_loss_weight: float = 0.0,
                streaming: bool = False,
                plateau_patience: int = 20,
-                adversarial_loss: bool = True,
-                # adversarial schedule and weights
-                adv_g_start_epoch: int = 100,
-                adv_d_start_epoch: int = 150,
-                adv_gen_weight: float = 1.0,
-                adv_disc_weight: float = 1.0,
-                adv_fm_weight: float = 1.0,
-                config_name: str | None = None,
+               adversarial_loss: bool = True,
+               # adversarial schedule and weights
+               adv_g_start_epoch: int = 100,
+               adv_d_start_epoch: int = 150,
+               adv_gen_weight: float = 1.0,
+               adv_disc_weight: float = 1.0,
+               adv_fm_weight: float = 1.0,
+               config_name: str | None = None,
                device: str = 'cuda'):
     super().__init__()
     # Turn of autoamtic optimization
@@ -154,6 +155,7 @@ class DDSP(L.LightningModule):
       n_features=max(self.feature_dim, 1),
       layer_sizes=(np.array(decoder_ratios)*capacity).tolist(),
       gru_layers=decoder_gru_layers,
+      temporal_stride=decoder_temporal_stride,
       streaming=streaming,
     )
 
