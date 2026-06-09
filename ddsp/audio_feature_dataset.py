@@ -23,12 +23,14 @@ class AudioFeatureDataset(Dataset):
                resampling_factor: int,
                control_space: ControlSpace,
                transform_fn: Callable = None,
+               n_channels: int = 1,
                device: str = 'cuda'):
     """
     Arguments:
       - dataset_path: str, the path to the dataset
       - n_signal: int, the size of the audio chunks, in samples
       - sampling_rate: int, the sampling rate of the audio
+      - n_channels: int, the number of audio channels (files are zero-padded/cropped to this count)
       - device: str, the device to use
     """
     self._device = device
@@ -37,6 +39,7 @@ class AudioFeatureDataset(Dataset):
     self._resampling_factor = resampling_factor
     self._transform_fn = transform_fn
     self._control_space = control_space
+    self._n_channels = n_channels
 
     # Build feature extractors from control space (feature fields only)
     self._extractor_specs: List[tuple[str, object, dict]] = []
@@ -63,14 +66,14 @@ class AudioFeatureDataset(Dataset):
   def _create_cache_key(self, dataset_path: str, n_signal: int, sampling_rate: int, resampling_factor: int, control_space: ControlSpace) -> str:
     """Create a unique cache key based on dataset parameters and control space."""
     field_sig = ";".join([f"{f.name}:{f.source}:{f.dim}:{f.extractor}:{sorted((f.params or {}).items())}" for f in control_space.fields])
-    key_string = f"{dataset_path}_{n_signal}_{sampling_rate}_{resampling_factor}_{field_sig}"
+    key_string = f"{dataset_path}_{n_signal}_{sampling_rate}_{resampling_factor}_{self._n_channels}ch_{field_sig}"
     return hashlib.md5(key_string.encode()).hexdigest()[:8]
 
   def _create_cache(self, dataset_path: str):
     """Load audio, process it, and save to LMDB."""
-    # Load and process audio
+    # Load and process audio -> [n_channels, T_total]
     self._audio = self._load_dataset(dataset_path).to(self._device)
-    self._dataset_length = int(len(self._audio) // self._n_signal)
+    self._dataset_length = int(self._audio.shape[-1] // self._n_signal)
 
     # Extract features
     self._features = self._extract_features()
@@ -102,7 +105,7 @@ class AudioFeatureDataset(Dataset):
     Save audio/features to LMDB in chunks to stay under LMDB's ~2 GiB per-value limit.
     """
     chunk_samps = 10_000_000
-    N = int(self._audio.shape[0])
+    N = int(self._audio.shape[-1])
     F = int(self._features.shape[-1])
 
     env = lmdb.open(
@@ -123,6 +126,7 @@ class AudioFeatureDataset(Dataset):
         "n_signal": self._n_signal,
         "sampling_rate": self._sampling_rate,
         "resampling_factor": self._resampling_factor,
+        "n_channels": int(self._n_channels),
         "total_samps": N,
         "feat_dim": F,
         "chunk_samps": chunk_samps,
@@ -137,7 +141,7 @@ class AudioFeatureDataset(Dataset):
     txn = env.begin(write=True)
     try:
       for idx, (a, b) in enumerate(self._iter_chunks(N, chunk_samps)):
-        aud = self._audio[a:b].detach().to("cpu").contiguous().to(torch.float32)
+        aud = self._audio[:, a:b].detach().to("cpu").contiguous().to(torch.float32)
         fea = self._features[a:b].detach().to("cpu").contiguous().to(torch.float32)
 
         aud_bytes = aud.numpy().tobytes(order="C")
@@ -167,11 +171,12 @@ class AudioFeatureDataset(Dataset):
       self._dataset_length = int(meta["dataset_length"])
       N = int(meta.get("total_samps", 0)) or (self._dataset_length * self._n_signal)
       F = int(meta.get("feat_dim", 0))
+      n_channels = int(meta.get("n_channels", 1))
       cs = int(meta["chunk_samps"])
       dtype = np.float32
 
       n_chunks = math.ceil(N / cs)
-      audio_cpu = torch.empty(N, dtype=torch.float32)
+      audio_cpu = torch.empty((n_channels, N), dtype=torch.float32)
       feats_cpu = torch.empty((N, F), dtype=torch.float32)
 
       pos = 0
@@ -185,10 +190,11 @@ class AudioFeatureDataset(Dataset):
           raise RuntimeError(f"Missing chunk {idx} in LMDB")
 
         a_arr = np.frombuffer(a_buf, dtype=dtype)
-        n_samps = a_arr.shape[0]
+        n_samps = a_arr.shape[0] // n_channels
+        a_arr = a_arr.reshape(n_channels, n_samps)
         f_arr = np.frombuffer(f_buf, dtype=dtype).reshape(n_samps, F)
 
-        audio_cpu[pos:pos+n_samps] = torch.from_numpy(a_arr)
+        audio_cpu[:, pos:pos+n_samps] = torch.from_numpy(a_arr)
         feats_cpu[pos:pos+n_samps] = torch.from_numpy(f_arr)
         pos += n_samps
 
@@ -205,12 +211,13 @@ class AudioFeatureDataset(Dataset):
     sample_start = int(idx * self._n_signal)
     sample_end = int(sample_start + self._n_signal)
 
-    if sample_end > len(self._audio):
-      audio = torch.cat([self._audio[sample_start:], self._audio[:sample_end - len(self._audio)]])
+    total_samps = self._audio.shape[-1]
+    if sample_end > total_samps:
+      audio = torch.cat([self._audio[:, sample_start:], self._audio[:, :sample_end - total_samps]], dim=-1)
       features = torch.cat([self._features[sample_start:], self._features[:sample_end - len(self._features)]])
 
     else:
-      audio = self._audio[sample_start:sample_end]
+      audio = self._audio[:, sample_start:sample_end]
       features = self._features[sample_start:sample_end]
 
     if self._transform_fn is not None:
@@ -255,18 +262,28 @@ class AudioFeatureDataset(Dataset):
     if len(filepaths) == 0:
       raise RuntimeError(f"No audio files found in path: {path}")
 
-    audio = torch.tensor([], device=self._device)
+    audio = torch.zeros((self._n_channels, 0), device=self._device)
     for filepath in filepaths:
-      x = self._load_file(filepath)
-      audio = torch.concat([audio, torch.from_numpy(x).to(self._device)], dim=0)
+      x = self._load_file(filepath)  # [n_channels, T]
+      audio = torch.concat([audio, torch.from_numpy(x).to(self._device)], dim=-1)
     return audio
 
 
   def _load_file(self, path: str):
     """
-    Load an audio file from a path.
+    Load an audio file from a path and conform it to n_channels.
+    Returns a numpy array of shape [n_channels, n_samples].
     """
-    audio, _ = li.load(path, sr = self._sampling_rate, mono = True)
+    audio, _ = li.load(path, sr = self._sampling_rate, mono = False)
+    # librosa returns [n_samples] for mono and [n_channels, n_samples] otherwise
+    audio = np.atleast_2d(audio)
+
+    n_channels = audio.shape[0]
+    if n_channels > self._n_channels:
+      audio = audio[:self._n_channels]
+    elif n_channels < self._n_channels:
+      padding = np.zeros((self._n_channels - n_channels, audio.shape[-1]), dtype=audio.dtype)
+      audio = np.concatenate([audio, padding], axis=0)
     return audio
 
 
@@ -275,10 +292,12 @@ class AudioFeatureDataset(Dataset):
     Extract features from the audio dataset.
     This is a placeholder function, as the actual feature extraction logic is not provided.
     """
-    # Compute audio-rate features for the full concatenated audio
+    # Compute audio-rate features from a mono downmix of the full concatenated audio.
+    # Sum over channels so a single shared feature/control stream drives all channels.
+    mono = self._audio.sum(dim=0)  # [T_total]
     feats = []
     for name, extractor, norm in self._extractor_specs:
-      feat = extractor(self._audio, self._sampling_rate)  # [N, C] at audio rate
+      feat = extractor(mono, self._sampling_rate)  # [N, C] at audio rate
       if feat.ndim == 1:
         feat = feat.unsqueeze(-1)
       # Apply optional normalization per field
