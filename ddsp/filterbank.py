@@ -2,6 +2,7 @@ from torch import nn
 import torch
 import numpy as np
 import scipy.signal as signal
+import math
 
 from typing import List, Any, Optional
 
@@ -46,16 +47,11 @@ class FilterBank(nn.Module):
     # self.register_buffer('noisebands', torch.from_numpy(np.array(self._bake_noisebands())))
 
     # optimisation: store the baked noisebands as int8 + per-band float scales instead of float32
-    nb = torch.from_numpy(np.array(self._bake_noisebands())) # => [n_filters, n_signal]
-    scale = (nb.abs().amax(dim=1, keepdim=True) / 127.0).clamp(min=1e-12) # => [n_filters, 1]
-    q = torch.round(nb / scale).clamp(-127, 127).to(torch.int8)
-    self.register_buffer('_noisebands_q', q)
-    self.register_buffer('_noisebands_scale', scale)
-
-  @property
-  def noisebands(self) -> torch.Tensor:
-    """Dequantized noise bands [n_filters, n_signal], reconstructed from int8 storage"""
-    return self._noisebands_q.float() * self._noisebands_scale
+    _nb = torch.from_numpy(np.array(self._bake_noisebands())).float()  # [n_filters, n_signal]
+    _nb_scale = (_nb.abs().amax(dim=1) / 127.0).clamp_min(1e-12)       # [n_filters] per-band
+    _nb_q = torch.round(_nb / _nb_scale.unsqueeze(1)).clamp(-128.0, 127.0).to(torch.int8)
+    self.register_buffer('noisebands', _nb_q, persistent=False)
+    self.register_buffer('noisebands_scale', _nb_scale, persistent=False)  # [n_filters]
 
 
   def _calculate_boundaries(self):
@@ -165,5 +161,3 @@ class FilterBank(nn.Module):
 
     # return the filter (h)
     return signal.firwin(numtaps=numtaps, cutoff=band, window=('kaiser', beta), scale=True, fs=self._fs, pass_zero=pass_zero)
-
-

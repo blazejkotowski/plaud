@@ -5,7 +5,7 @@ import torchaudio
 import torch.nn.functional as F
 import numpy as np
 
-from ddsp.filterbank import FilterBank
+from ddsp.filterbank import FilterBank, LazyFilterBank
 # from ddsp.sgd.sinusoidal_gradient_descent.core import complex_oscillator
 
 
@@ -71,122 +71,122 @@ class BaseSynth(nn.Module):
     return cls(**params)
 
 
-@register_synth
-class NoiseBandSynth(BaseSynth):
-  """
-  A synthesiser that generates a mixture noise bands from amplitudes.
+# @register_synth
+# class NoiseBandSynth(BaseSynth):
+#   """
+#   A synthesiser that generates a mixture noise bands from amplitudes.
 
-  Arguments:
-    - n_filters: int, the number of filters in the filterbank
-    - fs: int, the sampling rate of the input signal
-    - resampling_factor: int, the internal up / down sampling factor for the signal
-    - device: str, the device to use
-  """
+#   Arguments:
+#     - n_filters: int, the number of filters in the filterbank
+#     - fs: int, the sampling rate of the input signal
+#     - resampling_factor: int, the internal up / down sampling factor for the signal
+#     - device: str, the device to use
+#   """
 
-  def __init__(self, n_filters: int = 2048, fs: int = 44100, resampling_factor: int = 32, device: str = 'cuda'):
-    super().__init__()
-    self._resampling_factor = resampling_factor
-    self._device = device
+#   def __init__(self, n_filters: int = 2048, fs: int = 44100, resampling_factor: int = 32, device: str = 'cuda'):
+#     super().__init__()
+#     self._resampling_factor = resampling_factor
+#     self._device = device
 
-    self._filterbank = FilterBank(
-      n_filters=n_filters,
-      fs=fs,
-      device=self._device
-    )
+#     self._filterbank = FilterBank(
+#       n_filters=n_filters,
+#       fs=fs,
+#       device=self._device
+#     )
 
-    # Shift of the noisebands between inferences, to maintain continuity
-    self._noisebands_shift = 0
+#     # Shift of the noisebands between inferences, to maintain continuity
+#     self._noisebands_shift = 0
 
-    # Precompute blocked noisebands for fast batch=1 inference synthesis.
-    # Reshape [n_filters, band_len] -> [n_blocks, n_filters, rf] where n_blocks = band_len // rf
-    # Each block corresponds to one control frame's worth of audio samples.
-    nb = self._filterbank.noisebands # [n_filters, band_len]
-    n_f, band_len = nb.shape
-    n_blocks = band_len // resampling_factor
-    nb_blocked = nb.reshape(n_f, n_blocks, resampling_factor).permute(1, 0, 2).contiguous()
-    self.register_buffer('_nb_blocked', nb_blocked, persistent=False) # -> [n_blocks, n_filters, rf]
-
-
-  @property
-  def n_params(self):
-    return len(self._filterbank.noisebands)
+#     # Precompute blocked noisebands for fast batch=1 inference synthesis.
+#     # Reshape [n_filters, band_len] -> [n_blocks, n_filters, rf] where n_blocks = band_len // rf
+#     # Each block corresponds to one control frame's worth of audio samples.
+#     nb = self._filterbank.noisebands # [n_filters, band_len]
+#     n_f, band_len = nb.shape
+#     n_blocks = band_len // resampling_factor
+#     nb_blocked = nb.reshape(n_f, n_blocks, resampling_factor).permute(1, 0, 2).contiguous()
+#     self.register_buffer('_nb_blocked', nb_blocked, persistent=False) # -> [n_blocks, n_filters, rf]
 
 
-  @property
-  def jit_name(self):
-    return "NoiseBandSynth"
+#   @property
+#   def n_params(self):
+#     return len(self._filterbank.noisebands)
 
 
-  def forward(self, amplitudes: torch.Tensor, limit_components: float = 0.0, waveshaping_factor: float = 0.0) -> torch.Tensor:
-    """
-    Synthesizes a signal from the predicted amplitudes and the baked noise bands.
-    Args:
-      - amplitudes: torch.Tensor[batch_size, n_bands, n_ctrl], the predicted amplitudes of the noise bands
-      - limit_components: float, the attenuation factor for the number of used bands
-      - waveshaping_factor: float, does nothing, it is here for the JIT compatibility with other synth classes
-    Returns:
-      - signal: torch.Tensor[batch_size, 1, sig_length], the synthesized signal
-    """
-    limit_components = max(0.0, min(limit_components, 1.0))
-    rf = int(self._resampling_factor)
-    noisebands = self._noisebands  # [n_filters, band_len]
-    band_len = noisebands.shape[-1]
-    n_ctrl = amplitudes.shape[-1]
-    total_len = n_ctrl * rf
-    batch_size = amplitudes.shape[0]
+#   @property
+#   def jit_name(self):
+#     return "NoiseBandSynth"
 
-    if self.training:
-      # Roll noisebands randomly during training to avoid overfitting to specific noise values
-      noisebands = torch.roll(noisebands, shifts=int(torch.randint(0, band_len, size=(1,), device=noisebands.device)), dims=-1)
 
-    # Track shift for streaming continuity (start_pos is always a multiple of rf)
-    start_pos = self._noisebands_shift % band_len
-    self._noisebands_shift = (self._noisebands_shift + total_len) % band_len
+#   def forward(self, amplitudes: torch.Tensor, limit_components: float = 0.0, waveshaping_factor: float = 0.0) -> torch.Tensor:
+#     """
+#     Synthesizes a signal from the predicted amplitudes and the baked noise bands.
+#     Args:
+#       - amplitudes: torch.Tensor[batch_size, n_bands, n_ctrl], the predicted amplitudes of the noise bands
+#       - limit_components: float, the attenuation factor for the number of used bands
+#       - waveshaping_factor: float, does nothing, it is here for the JIT compatibility with other synth classes
+#     Returns:
+#       - signal: torch.Tensor[batch_size, 1, sig_length], the synthesized signal
+#     """
+#     limit_components = max(0.0, min(limit_components, 1.0))
+#     rf = int(self._resampling_factor)
+#     noisebands = self._noisebands  # [n_filters, band_len]
+#     band_len = noisebands.shape[-1]
+#     n_ctrl = amplitudes.shape[-1]
+#     total_len = n_ctrl * rf
+#     batch_size = amplitudes.shape[0]
 
-    # Apply band mask at control rate (mean is identical pre- vs post-upsample)
-    if limit_components > 0:
-      max_bands = max(int(self.n_params * (1 - limit_components)), 1)
-      _, indices = torch.topk(amplitudes.mean(dim=-1), max_bands, dim=1)
-      mask = torch.zeros(batch_size, self.n_params, 1, dtype=amplitudes.dtype, device=amplitudes.device)
-      mask.scatter_(1, indices.unsqueeze(-1), 1)
-      amplitudes = amplitudes * mask
+#     if self.training:
+#       # Roll noisebands randomly during training to avoid overfitting to specific noise values
+#       noisebands = torch.roll(noisebands, shifts=int(torch.randint(0, band_len, size=(1,), device=noisebands.device)), dims=-1)
 
-    # Fast inference path (any batch size, including folded multichannel): periodic blocked BMM,
-    # handles limit_components too. _nb_blocked: [n_blocks, n_filters, rf], each block = one
-    # control frame's audio. All rows share the same noisebands and start_pos, so they are
-    # batched together over the leading dim.
-    if not self.training:
-      n_blocks = self._nb_blocked.shape[0]
-      start_block = start_pos // rf
-      nb_blocked = self._nb_blocked.to(amplitudes.dtype)  # match dtype (noisebands are float64)
-      out = torch.empty(batch_size, n_ctrl, rf, dtype=amplitudes.dtype, device=amplitudes.device)
-      t, b = 0, start_block
-      while t < n_ctrl:
-        avail = n_blocks - b
-        take = min(avail, n_ctrl - t)
-        # amplitudes[:, :, t:t+take]: [B, n_filters, take]; nb_blocked[b:b+take]: [take, n_filters, rf].
-        # Contract over filters per control frame -> [B, take, rf].
-        out[:, t:t+take, :] = torch.einsum('bft,tfr->btr', amplitudes[:, :, t:t+take], nb_blocked[b:b+take])
-        t += take; b = (b + take) % n_blocks
-      return out.reshape(batch_size, 1, -1)
+#     # Track shift for streaming continuity (start_pos is always a multiple of rf)
+#     start_pos = self._noisebands_shift % band_len
+#     self._noisebands_shift = (self._noisebands_shift + total_len) % band_len
 
-    # General path: training or batch_size > 1
-    upsampled_amplitudes = amplitudes.repeat_interleave(rf, dim=-1)
-    signal = torch.zeros(batch_size, 1, total_len, dtype=upsampled_amplitudes.dtype, device=upsampled_amplitudes.device)
-    out_pos, nb_pos = 0, start_pos
-    while out_pos < total_len:
-      avail = band_len - nb_pos
-      take = min(avail, total_len - out_pos)
-      nb_chunk = noisebands[:, nb_pos:nb_pos+take]
-      amp_chunk = upsampled_amplitudes[:, :, out_pos:out_pos+take]
-      signal[:, :, out_pos:out_pos+take] = (amp_chunk * nb_chunk).sum(dim=1, keepdim=True)
-      out_pos += take; nb_pos = (nb_pos + take) % band_len
-    return signal
+#     # Apply band mask at control rate (mean is identical pre- vs post-upsample)
+#     if limit_components > 0:
+#       max_bands = max(int(self.n_params * (1 - limit_components)), 1)
+#       _, indices = torch.topk(amplitudes.mean(dim=-1), max_bands, dim=1)
+#       mask = torch.zeros(batch_size, self.n_params, 1, dtype=amplitudes.dtype, device=amplitudes.device)
+#       mask.scatter_(1, indices.unsqueeze(-1), 1)
+#       amplitudes = amplitudes * mask
 
-  @property
-  def _noisebands(self):
-    """Delegate the noisebands to the filterbank object."""
-    return self._filterbank.noisebands
+#     # Fast inference path (any batch size, including folded multichannel): periodic blocked BMM,
+#     # handles limit_components too. _nb_blocked: [n_blocks, n_filters, rf], each block = one
+#     # control frame's audio. All rows share the same noisebands and start_pos, so they are
+#     # batched together over the leading dim.
+#     if not self.training:
+#       n_blocks = self._nb_blocked.shape[0]
+#       start_block = start_pos // rf
+#       nb_blocked = self._nb_blocked.to(amplitudes.dtype)  # match dtype (noisebands are float64)
+#       out = torch.empty(batch_size, n_ctrl, rf, dtype=amplitudes.dtype, device=amplitudes.device)
+#       t, b = 0, start_block
+#       while t < n_ctrl:
+#         avail = n_blocks - b
+#         take = min(avail, n_ctrl - t)
+#         # amplitudes[:, :, t:t+take]: [B, n_filters, take]; nb_blocked[b:b+take]: [take, n_filters, rf].
+#         # Contract over filters per control frame -> [B, take, rf].
+#         out[:, t:t+take, :] = torch.einsum('bft,tfr->btr', amplitudes[:, :, t:t+take], nb_blocked[b:b+take])
+#         t += take; b = (b + take) % n_blocks
+#       return out.reshape(batch_size, 1, -1)
+
+#     # General path: training or batch_size > 1
+#     upsampled_amplitudes = amplitudes.repeat_interleave(rf, dim=-1)
+#     signal = torch.zeros(batch_size, 1, total_len, dtype=upsampled_amplitudes.dtype, device=upsampled_amplitudes.device)
+#     out_pos, nb_pos = 0, start_pos
+#     while out_pos < total_len:
+#       avail = band_len - nb_pos
+#       take = min(avail, total_len - out_pos)
+#       nb_chunk = noisebands[:, nb_pos:nb_pos+take]
+#       amp_chunk = upsampled_amplitudes[:, :, out_pos:out_pos+take]
+#       signal[:, :, out_pos:out_pos+take] = (amp_chunk * nb_chunk).sum(dim=1, keepdim=True)
+#       out_pos += take; nb_pos = (nb_pos + take) % band_len
+#     return signal
+
+#   @property
+#   def _noisebands(self):
+#     """Delegate the noisebands to the filterbank object."""
+#     return self._filterbank.noisebands
 
 
 @register_synth
@@ -364,6 +364,137 @@ class SineSynth(BaseSynth):
     # Generate and sum the sinewaves
     signal = torch.sum(amplitudes * torch.sin(phases), dim=1, keepdim=True)
     return signal
+
+@register_synth
+class NoiseBandSynth(BaseSynth):
+  """
+  A synthesiser that generates a mixture noise bands from amplitudes.
+
+  Arguments:
+    - n_filters: int, the number of filters in the filterbank
+    - fs: int, the sampling rate of the input signal
+    - resampling_factor: int, the internal up / down sampling factor for the signal
+    - device: str, the device to use
+  """
+
+  def __init__(self, n_filters: int = 2048, fs: int = 44100, resampling_factor: int = 32, device: str = 'cuda'):
+    super().__init__()
+    self._resampling_factor = resampling_factor
+    self._device = device
+
+    self._filterbank = FilterBank(
+      n_filters=n_filters,
+      fs=fs,
+      device=self._device
+    )
+
+    # Shift of the noisebands between inferences, to maintain continuity
+    self._noisebands_shift = 0
+
+    # NOTE: the fast batch=1 path needs a [n_blocks, n_filters, rf] "blocked" view of
+    # `noisebands`. That view is a pure reshape+permute (zero-copy) of the existing
+    # `noisebands` buffer, so we derive it on the fly in forward() instead of storing a
+    # second, .contiguous() resident copy here. Keeping that copy doubled the resident
+    # noise-bank memory (mem exp1).
+
+
+  @property
+  def n_params(self):
+    return len(self._filterbank.noisebands)
+
+
+  @property
+  def jit_name(self):
+    return "NoiseBandSynth"
+
+
+  def forward(self, amplitudes: torch.Tensor, limit_components: float = 0.0, waveshaping_factor: float = 0.0) -> torch.Tensor:
+    """
+    Synthesizes a signal from the predicted amplitudes and the baked noise bands.
+    Args:
+      - amplitudes: torch.Tensor[batch_size, n_bands, n_ctrl], the predicted amplitudes of the noise bands
+      - limit_components: float, the attenuation factor for the number of used bands
+      - waveshaping_factor: float, does nothing, it is here for the JIT compatibility with other synth classes
+    Returns:
+      - signal: torch.Tensor[batch_size, 1, sig_length], the synthesized signal
+    """
+    limit_components = max(0.0, min(limit_components, 1.0))
+    rf = int(self._resampling_factor)
+    noisebands = self._noisebands  # int8 [n_filters, band_len] (mem exp3)
+    nb_scale = self._filterbank.noisebands_scale  # [n_filters] per-band; dequant = int8_slice.float() * scale[:,None]
+    band_len = noisebands.shape[-1]
+    n_ctrl = amplitudes.shape[-1]
+    total_len = n_ctrl * rf
+    batch_size = amplitudes.shape[0]
+
+    if self.training:
+      # Roll noisebands randomly during training to avoid overfitting to specific noise values
+      noisebands = torch.roll(noisebands, shifts=int(torch.randint(0, band_len, size=(1,), device=noisebands.device)), dims=-1)
+
+    # Track shift for streaming continuity (start_pos is always a multiple of rf)
+    start_pos = self._noisebands_shift % band_len
+    self._noisebands_shift = (self._noisebands_shift + total_len) % band_len
+
+    if limit_components > 0:
+      upsampled_amplitudes = amplitudes.repeat_interleave(rf, dim=-1)
+      max_bands = max(int(self.n_params * (1 - limit_components)), 1)
+      mean_amps = upsampled_amplitudes.mean(dim=-1)
+      _, indices = torch.topk(mean_amps, max_bands, dim=1)
+      mask = torch.zeros_like(upsampled_amplitudes)
+      mask.scatter_(1, indices.unsqueeze(-1).expand(-1, -1, total_len), 1)
+      upsampled_amplitudes = upsampled_amplitudes * mask
+      signal = torch.zeros(batch_size, 1, total_len, dtype=upsampled_amplitudes.dtype, device=upsampled_amplitudes.device)
+      out_pos, nb_pos = 0, start_pos
+      while out_pos < total_len:
+        avail = band_len - nb_pos
+        take = min(avail, total_len - out_pos)
+        nb_seg = noisebands[:, nb_pos:nb_pos+take].to(torch.float32) * nb_scale.unsqueeze(-1)
+        signal[:, :, out_pos:out_pos+take] = (upsampled_amplitudes[:, :, out_pos:out_pos+take] * nb_seg).sum(1, keepdim=True)
+        out_pos += take; nb_pos = (nb_pos + take) % band_len
+      return signal
+
+    # Fast inference path for batch_size=1 and no limit_components:
+    # Periodic blocked BMM — avoids repeat_interleave and processes at control rate.
+    # _nb_blocked: [n_blocks, n_filters, rf], each block = one control frame's audio.
+    if not self.training and batch_size == 1:
+      # Blocked view [n_blocks, n_filters, rf] derived as a zero-copy reshape+permute
+      # of `noisebands` [n_filters, band_len]; no second resident copy (mem exp1).
+      n_f = noisebands.shape[0]
+      n_blocks = band_len // rf
+      nb_blocked = noisebands.reshape(n_f, n_blocks, rf).permute(1, 0, 2)
+      start_block = start_pos // rf
+      # Fold the per-band scale into the amplitudes (cheap: [n_ctrl, n_filters]) instead of
+      # scaling the large noise slices — out = Σ_f amp_f·(int8_f·scale_f) (mem exp3).
+      amp_T = amplitudes.squeeze(0).T * nb_scale.unsqueeze(0)  # [n_ctrl, n_filters]
+      out = torch.empty(n_ctrl, rf, dtype=amplitudes.dtype, device=amplitudes.device)
+      t, b = 0, start_block
+      while t < n_ctrl:
+        avail = n_blocks - b
+        take = min(avail, n_ctrl - t)
+        # nb_blocked[b:b+take] is a (non-contiguous) int8 view; convert just this small
+        # per-segment slice to float (never the full table), then bmm against scaled amps.
+        nb_seg = nb_blocked[b:b+take].to(torch.float32)
+        out[t:t+take] = torch.bmm(amp_T[t:t+take].unsqueeze(1), nb_seg).squeeze(1)
+        t += take; b = (b + take) % n_blocks
+      return out.reshape(1, 1, -1)
+
+    # General path: training or batch_size > 1
+    upsampled_amplitudes = amplitudes.repeat_interleave(rf, dim=-1)
+    signal = torch.zeros(batch_size, 1, total_len, dtype=upsampled_amplitudes.dtype, device=upsampled_amplitudes.device)
+    out_pos, nb_pos = 0, start_pos
+    while out_pos < total_len:
+      avail = band_len - nb_pos
+      take = min(avail, total_len - out_pos)
+      nb_chunk = noisebands[:, nb_pos:nb_pos+take].to(torch.float32) * nb_scale.unsqueeze(-1)
+      amp_chunk = upsampled_amplitudes[:, :, out_pos:out_pos+take]
+      signal[:, :, out_pos:out_pos+take] = (amp_chunk * nb_chunk).sum(dim=1, keepdim=True)
+      out_pos += take; nb_pos = (nb_pos + take) % band_len
+    return signal
+
+  @property
+  def _noisebands(self):
+    """Delegate the noisebands to the filterbank object."""
+    return self._filterbank.noisebands
 
 @register_synth
 class BendableNoiseBandSynth(BaseSynth):
