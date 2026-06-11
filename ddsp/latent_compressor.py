@@ -178,68 +178,127 @@ class ConvDecoder(nn.Module):
 
 
 class VectorQuantizer(nn.Module):
-    """VQ-VAE style vector quantizer (single codebook, straight-through)."""
+    """Single-codebook VQ with EMA codebook updates + dead-code restart.
 
-    def __init__(self, embedding_dim: int, codebook_size: int, beta: float = 0.25):
+    Anti-collapse design (vs a plain straight-through VQ):
+      * the codebook is updated by an exponential moving average of the encoder
+        outputs assigned to each code, not by gradient (only a commitment loss
+        flows to the encoder);
+      * the codebook is initialised from the first batch of encoder outputs;
+      * codes that go (almost) unused are periodically re-seeded from live encoder
+        outputs.
+    These keep all codes alive on low-diversity / small datasets, where a plain
+    VQ collapses to a handful of codes.
+
+    Interface is unchanged:
+      forward(z_e:[B,C,T]) -> (z_q_st:[B,C,T], indices:[B,T], vq_loss, perplexity)
+      embed(indices:[B,T]) -> z_q:[B,C,T]
+    """
+
+    def __init__(self, embedding_dim: int, codebook_size: int, beta: float = 0.25,
+                 decay: float = 0.99, eps: float = 1e-5, restart_threshold: float = 1.0):
         super().__init__()
         self.embedding_dim = int(embedding_dim)
         self.codebook_size = int(codebook_size)
         self.beta = float(beta)
+        self.decay = float(decay)
+        self.eps = float(eps)
+        self.restart_threshold = float(restart_threshold)
 
-        self.codebook = nn.Embedding(self.codebook_size, self.embedding_dim)
-        nn.init.uniform_(self.codebook.weight, -1.0 / self.codebook_size, 1.0 / self.codebook_size)
+        embed = torch.randn(self.codebook_size, self.embedding_dim) * 0.1
+        # Codebook + EMA stats live in buffers (updated in-place, not via autograd).
+        self.register_buffer("codebook", embed)
+        self.register_buffer("cluster_size", torch.zeros(self.codebook_size))
+        self.register_buffer("embed_avg", embed.clone())
+        self.register_buffer("_initted", torch.zeros((), dtype=torch.bool))
 
     def embed(self, indices: torch.Tensor) -> torch.Tensor:
-        """Map code indices to quantized vectors.
-
-        Args:
-            indices: [B, T] long
-        Returns:
-            z_q: [B, C, T]
-        """
+        """Map code indices [B, T] -> quantized vectors [B, C, T]."""
         if indices.dtype != torch.long:
             indices = indices.long()
-        z_q = self.codebook(indices)  # [B, T, C]
+        z_q = F.embedding(indices, self.codebook)  # [B, T, C]
         return z_q.permute(0, 2, 1).contiguous()
+
+    @torch.jit.unused
+    def _data_init(self, z_flat: torch.Tensor) -> None:
+        """Initialise the codebook from the first batch of encoder outputs (training only)."""
+        with torch.no_grad():
+            n = z_flat.shape[0]
+            if n >= self.codebook_size:
+                idx = torch.randperm(n, device=z_flat.device)[: self.codebook_size]
+            else:
+                idx = torch.randint(0, n, (self.codebook_size,), device=z_flat.device)
+            chosen = z_flat[idx].detach()
+            self.codebook.copy_(chosen)
+            self.embed_avg.copy_(chosen)
+            self.cluster_size.fill_(1.0)
+            self._initted.fill_(True)
+
+    @torch.jit.unused
+    def _ema_update(self, z_flat: torch.Tensor, onehot: torch.Tensor) -> None:
+        """EMA codebook update + dead-code restart (training only)."""
+        with torch.no_grad():
+            code_count = onehot.sum(0)              # [K]
+            embed_sum = onehot.t() @ z_flat         # [K, C]
+            self.cluster_size.mul_(self.decay).add_(code_count, alpha=1.0 - self.decay)
+            self.embed_avg.mul_(self.decay).add_(embed_sum, alpha=1.0 - self.decay)
+            # Laplace-smoothed normalisation of the codebook.
+            n = self.cluster_size.sum()
+            cluster_size = (self.cluster_size + self.eps) / (n + self.codebook_size * self.eps) * n
+            self.codebook.copy_(self.embed_avg / cluster_size.unsqueeze(1))
+            # Dead-code restart: re-seed underused codes from live encoder outputs.
+            dead = self.cluster_size < self.restart_threshold
+            n_dead = int(dead.sum())
+            if n_dead > 0:
+                m = z_flat.shape[0]
+                ridx = torch.randint(0, m, (n_dead,), device=z_flat.device)
+                samples = z_flat[ridx].detach()
+                self.codebook[dead] = samples
+                self.embed_avg[dead] = samples
+                self.cluster_size[dead] = 1.0
 
     def forward(self, z_e: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Args:
             z_e: [B, C, T] continuous latents
         Returns:
-            z_q: [B, C, T] quantized latents
+            z_q_st: [B, C, T] quantized latents (straight-through)
             indices: [B, T] code indices
-            vq_loss: scalar
+            vq_loss: scalar (commitment only; codebook learned via EMA)
             perplexity: scalar
         """
         B, C, T = z_e.shape
         z = z_e.permute(0, 2, 1).contiguous()  # [B, T, C]
-        z_flat = z.view(B * T, C)  # [B*T, C]
+        z_flat = z.reshape(B * T, C)           # [N, C]
 
-        # Compute squared L2 distance to each codebook vector
-        cb = self.codebook.weight  # [K, C]
+        if self.training and not bool(self._initted):
+            self._data_init(z_flat)
+
+        # Squared L2 distance to each codebook vector.
         dist = (
             z_flat.pow(2).sum(dim=1, keepdim=True)
-            + cb.pow(2).sum(dim=1).unsqueeze(0)
-            - 2.0 * (z_flat @ cb.t())
+            + self.codebook.pow(2).sum(dim=1).unsqueeze(0)
+            - 2.0 * (z_flat @ self.codebook.t())
         )
-        indices = torch.argmin(dist, dim=1)  # [B*T]
+        indices = torch.argmin(dist, dim=1)  # [N]
 
-        z_q_flat = self.codebook(indices)  # [B*T, C]
+        z_q_flat = F.embedding(indices, self.codebook)  # [N, C]
         z_q = z_q_flat.view(B, T, C).permute(0, 2, 1).contiguous()  # [B, C, T]
 
-        # VQ losses (codebook + commitment)
-        # Standard VQ-VAE: ||sg[z_e]-e||^2 + beta * ||z_e - sg[e]||^2
-        codebook_loss = F.mse_loss(z_q, z_e.detach())
-        commitment_loss = F.mse_loss(z_e, z_q.detach())
-        vq_loss = codebook_loss + self.beta * commitment_loss
+        onehot = F.one_hot(indices, num_classes=self.codebook_size).type(z_flat.dtype)  # [N, K]
 
-        # Straight-through estimator
+        if self.training:
+            self._ema_update(z_flat, onehot)
+
+        # Only the commitment loss trains the encoder; the codebook is EMA-updated.
+        commitment_loss = F.mse_loss(z_e, z_q.detach())
+        vq_loss = self.beta * commitment_loss
+
+        # Straight-through estimator.
         z_q_st = z_e + (z_q - z_e).detach()
 
-        # Perplexity
-        enc_onehot = F.one_hot(indices, num_classes=self.codebook_size).float()  # [B*T, K]
-        avg_probs = enc_onehot.mean(dim=0)
+        # Perplexity (effective number of codes used in this batch).
+        avg_probs = onehot.mean(dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
 
         return z_q_st, indices.view(B, T), vq_loss, perplexity

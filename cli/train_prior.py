@@ -139,7 +139,8 @@ def _train_compressor(cfg: DictConfig, control_space, synth_configs, device: str
   out_dir = os.path.join(cfg.experiment.training_dir, 'compressor', cfg.experiment.name)
   os.makedirs(out_dir, exist_ok=True)
   ckpt_cb = ModelCheckpoint(dirpath=out_dir, filename='best', monitor='val_loss',
-                            mode='min', save_top_k=1, save_weights_only=True)
+                            mode='min', save_top_k=1, save_weights_only=True,
+                            enable_version_counter=False)
   early = EarlyStopping(monitor='val_loss', patience=80, mode='min')
 
   trainer = L.Trainer(
@@ -310,6 +311,7 @@ def _train_discrete(cfg: DictConfig, control_space, synth_configs, in_memory: bo
     monitor='val_acc',
     mode='max',
     save_on_train_epoch_end=True,
+    enable_version_counter=False,
   )
   ckpt_loss = ModelCheckpoint(
     dirpath=output_dir,
@@ -319,6 +321,7 @@ def _train_discrete(cfg: DictConfig, control_space, synth_configs, in_memory: bo
     monitor='val_loss',
     mode='min',
     save_on_train_epoch_end=True,
+    enable_version_counter=False,
   )
   callbacks = [ckpt_acc, ckpt_loss]
   logger = TensorBoardLogger(save_dir=output_dir, name='logs')
@@ -431,6 +434,7 @@ def main(cfg: DictConfig):
     monitor='loss',
     mode='min',
     save_on_train_epoch_end=True,
+    enable_version_counter=False,
   )
   logger = TensorBoardLogger(save_dir=output_dir, name='logs')
 
