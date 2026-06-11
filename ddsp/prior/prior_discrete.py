@@ -42,12 +42,17 @@ class PriorDiscrete(L.LightningModule):
         self._lr = float(lr)
         self._max_len = int(max_len)
 
+        # A learned START token per codebook (id == codebook_size) gives generation
+        # an in-distribution cold start instead of a zero/random primer.
+        self._start_id = self._codebook_size
+        self._vocab_per_codebook = self._codebook_size + 1  # +1 for START
+
         # One shared embedding table with per-codebook offsets.
-        vocab_size = self._codebook_size * self._num_codebooks
+        vocab_size = self._vocab_per_codebook * self._num_codebooks
         self._embedding = nn.Embedding(vocab_size, self._embedding_dim)
         self.register_buffer(
             "_codebook_offsets",
-            torch.arange(self._num_codebooks, dtype=torch.long) * self._codebook_size,
+            torch.arange(self._num_codebooks, dtype=torch.long) * self._vocab_per_codebook,
             persistent=False,
         )
 
@@ -81,6 +86,10 @@ class PriorDiscrete(L.LightningModule):
     def codebook_size(self) -> int:
         return self._codebook_size
 
+    @property
+    def start_token_id(self) -> int:
+        return self._start_id
+
     def forward(self, x_tokens: torch.Tensor) -> torch.Tensor:
         """Return logits for next-token prediction.
 
@@ -103,7 +112,7 @@ class PriorDiscrete(L.LightningModule):
         x = x_tokens.permute(1, 0, 2)
 
         offsets = self._codebook_offsets.view(1, 1, -1)
-        idx = (x + offsets).clamp(min=0, max=self._codebook_size * self._num_codebooks - 1)
+        idx = (x + offsets).clamp(min=0, max=self._vocab_per_codebook * self._num_codebooks - 1)
 
         # [S, B, N, E]
         embed = self._embedding(idx)
@@ -159,14 +168,17 @@ class PriorDiscrete(L.LightningModule):
         if batch.dtype != torch.long:
             batch = batch.long()
 
-        x = batch[:, :-1, :]
-        y = batch[:, 1:, :]
+        b, s, n = batch.shape
+        # Prepend a START token so the model learns P(first token | START).
+        start = torch.full((b, 1, n), self._start_id, dtype=torch.long, device=batch.device)
+        seq = torch.cat([start, batch], dim=1)  # [B, S+1, N]
+        x = seq[:, :-1, :]  # [B, S, N], begins with START
+        y = seq[:, 1:, :]   # [B, S, N], the real tokens
 
-        logits = self(x)  # [B, S-1, N, K]
+        logits = self(x)  # [B, S, N, K]
         y_hat = torch.argmax(logits, dim=-1)
         acc = (y_hat == y).float().mean()
 
-        b = batch.size(0)
         k = self._codebook_size
         ce = cross_entropy(
             logits.permute(0, 3, 1, 2).reshape(b, k, -1),

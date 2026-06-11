@@ -337,6 +337,8 @@ class PriorDiscreteWrapper(torch.nn.Module):
     self.init_primer_len = int(self.max_len // 4)
     self.num_codebooks = int(self.prior.num_codebooks)
     self.codebook_size = int(self.prior.codebook_size)
+    # START token id (prior-only; must never be fed to the compressor's VQ).
+    self.start_id = int(getattr(self.prior, 'start_token_id', self.codebook_size))
     self.compression_ratio = int(getattr(self.compressor, 'compression_ratio', 32))
 
     # Infer control dimension via a dummy decode.
@@ -344,17 +346,35 @@ class PriorDiscreteWrapper(torch.nn.Module):
       _dummy = torch.zeros(1, 1, self.num_codebooks, dtype=torch.long)
       _num_controls = int(compressor.decode_codes(_dummy).shape[2])
 
-    self.register_buffer("token_buffer", torch.zeros(1, self.max_len, self.num_codebooks, dtype=torch.long))
+    # Cold start from the learned START token at position 0, length 1.
+    _init_buf = torch.zeros(1, self.max_len, self.num_codebooks, dtype=torch.long)
+    _init_buf[:, 0, :] = self.start_id
+    self.register_buffer("token_buffer", _init_buf)
     # Scalar state as 0-d long tensors so TorchScript reliably persists mutations across calls.
-    self.register_buffer("_current_len", torch.tensor(self.init_primer_len, dtype=torch.long))
+    self.register_buffer("_current_len", torch.tensor(1, dtype=torch.long))
     # One token's worth of decoded control frames; _ctrl_pos is the next frame to emit.
     # Initialised with _ctrl_pos == compression_ratio to signal "empty" on first call.
     self.register_buffer("_ctrl_buf", torch.zeros(1, self.compression_ratio, _num_controls))
     self.register_buffer("_ctrl_pos", torch.tensor(self.compression_ratio, dtype=torch.long))
 
-  def _shift_to_primer(self, buf: torch.Tensor, current_len: int) -> int:
-    buf[:, :self.init_primer_len, :] = buf[:, current_len - self.init_primer_len:current_len, :].clone()
-    return int(self.init_primer_len)
+    # The conv decoder needs a few tokens of right-context or the emitted frames are
+    # boundary-corrupted. We decode with a small lookahead and emit a lagging token
+    # (=> ~decode_lookahead tokens of latency), which makes the streaming decode match
+    # a full-sequence decode exactly.
+    self.decode_ctx = 8
+    self.decode_lookahead = 2
+    # Index into token_buffer of the next real token to emit (1 == first token after START).
+    self.register_buffer("_emit_idx", torch.tensor(1, dtype=torch.long))
+
+  @torch.jit.export
+  def reset_state(self):
+    # Clean cold start: only the START token in the buffer, nothing decoded yet.
+    self.token_buffer.zero_()
+    self.token_buffer[:, 0, :] = self.start_id
+    self._current_len.fill_(1)
+    self._emit_idx.fill_(1)
+    self._ctrl_buf.zero_()
+    self._ctrl_pos.fill_(self.compression_ratio)
 
   def forward(self, x: torch.Tensor) -> torch.Tensor:
     # x: [B, total_params + 2, steps]
@@ -367,7 +387,8 @@ class PriorDiscreteWrapper(torch.nn.Module):
       return x[:1, :-2, :].float()
 
     local_buf   = self.token_buffer.clone()
-    current_len = int(self._current_len.item())
+    current_len = int(self._current_len.item())   # tokens generated so far (incl START)
+    emit_idx    = int(self._emit_idx.item())      # buffer index of the next token to emit
     ctrl_buf    = self._ctrl_buf.clone()          # [1, CR, D]
     ctrl_pos    = int(self._ctrl_pos.item())      # next frame to emit
 
@@ -375,36 +396,45 @@ class PriorDiscreteWrapper(torch.nn.Module):
     out = torch.zeros(1, steps, num_controls)
     frames_written = 0
 
+    CR = self.compression_ratio
     # Emit exactly `steps` control frames, generating new tokens on demand.
-    for _iter in range(steps + self.compression_ratio):
+    for _iter in range(steps + CR):
       if frames_written >= steps:
         break
 
-      if ctrl_pos >= self.compression_ratio:
-        # Current token exhausted — sample the next one.
-        ti   = int(min(steps - 1, frames_written))
-        temp = torch.clamp(temperature[:, ti:ti+1], min=1e-4)
+      if ctrl_pos >= CR:
+        # Generate ahead so emit_idx has `decode_lookahead` tokens of right-context.
+        while current_len < emit_idx + 1 + self.decode_lookahead:
+          ti   = int(min(steps - 1, frames_written))
+          temp = torch.clamp(temperature[:, ti:ti+1], min=1e-4)
 
-        prime      = local_buf[:, :current_len, :]
-        logits     = self.prior(prime)
-        next_logits = logits[:, -1, :, :]
-        probs      = torch.softmax(next_logits / temp.unsqueeze(-1), dim=-1)
-        samples    = torch.multinomial(probs.reshape(-1, self.codebook_size), 1).reshape(1, self.num_codebooks)
+          prime      = local_buf[:, :current_len, :]
+          logits     = self.prior(prime)
+          next_logits = logits[:, -1, :, :]
+          probs      = torch.softmax(next_logits / temp.unsqueeze(-1), dim=-1)
+          samples    = torch.multinomial(probs.reshape(-1, self.codebook_size), 1).reshape(1, self.num_codebooks)
 
-        if current_len >= self.max_len:
-          current_len = self._shift_to_primer(local_buf, current_len)
+          if current_len >= self.max_len:
+            shift = current_len - self.init_primer_len
+            local_buf[:, :self.init_primer_len, :] = local_buf[:, shift:current_len, :].clone()
+            current_len = self.init_primer_len
+            emit_idx = emit_idx - shift
 
-        local_buf[:, current_len:current_len+1, :] = samples.unsqueeze(1)
-        current_len += 1
+          local_buf[:, current_len:current_len+1, :] = samples.unsqueeze(1)
+          current_len += 1
 
-        # Decode new token with a small context window for boundary accuracy.
-        _ctx         = 8
-        decode_start = max(0, current_len - 1 - _ctx)
-        decoded      = self.compressor.decode_codes(local_buf[:, decode_start:current_len, :])
-        ctrl_buf     = decoded[:, -self.compression_ratio:, :].detach()
-        ctrl_pos     = 0
+        # Decode emit_idx with `decode_lookahead` tokens of right-context, then keep
+        # exactly that token's block. Clamp so a leading START token never indexes the VQ.
+        lo = max(0, emit_idx - self.decode_ctx)
+        hi = emit_idx + 1 + self.decode_lookahead
+        decode_win = local_buf[:, lo:hi, :].clamp(min=0, max=self.codebook_size - 1)
+        decoded    = self.compressor.decode_codes(decode_win)
+        off        = emit_idx - lo
+        ctrl_buf   = decoded[:, off * CR:(off + 1) * CR, :].detach()
+        ctrl_pos   = 0
+        emit_idx   += 1
 
-      take = min(steps - frames_written, self.compression_ratio - ctrl_pos)
+      take = min(steps - frames_written, CR - ctrl_pos)
       out[:, frames_written:frames_written + take, :] = ctrl_buf[:, ctrl_pos:ctrl_pos + take, :]
       frames_written += take
       ctrl_pos       += take
@@ -415,11 +445,9 @@ class PriorDiscreteWrapper(torch.nn.Module):
     # Persist all state as tensors so TorchScript keeps mutations across calls.
     self.token_buffer.copy_(local_buf)
     self._current_len.fill_(current_len)
+    self._emit_idx.fill_(emit_idx)
     self._ctrl_buf.copy_(ctrl_buf)
     self._ctrl_pos.fill_(ctrl_pos)
-    if int(self._current_len.item()) >= self.max_len:
-      new_len = self._shift_to_primer(self.token_buffer, int(self._current_len.item()))
-      self._current_len.fill_(new_len)
 
     if x.size(0) > 1:
       out = out.repeat_interleave(x.size(0), dim=0)
@@ -568,6 +596,12 @@ if __name__ == '__main__':
 
 
     scripted = ScriptedDDSP(ddsp, prior, config.target_fs).to('cpu')
+    # Registering/scripting the nn~ methods can advance the discrete-prior wrapper's
+    # token buffer with junk; clear it so the saved model starts from a clean START.
+    if isinstance(prior, PriorDiscreteWrapper):
+      prior.reset_state()
+      print("discrete prior wrapper state after reset:",
+            int(prior._current_len.item()), int(prior._emit_idx.item()))
     scripted.export_to_ts(config.output_path)
 
     print("Model exported to: ", config.output_path)
