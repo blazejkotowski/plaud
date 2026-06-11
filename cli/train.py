@@ -12,7 +12,7 @@ import shutil
 from torch.utils.data import DataLoader, Subset, random_split
 from ddsp import DDSP, AudioFeatureDataset
 from ddsp.synths import BendableNoiseBandSynth
-from ddsp.callbacks import BetaWarmupCallback
+from ddsp.callbacks import BetaWarmupEpochCallback
 from ddsp.interfaces import build_control_space
 from ddsp.augmentations import build_audio_augmentation_pipeline
 from ddsp.registry import SYNTHS
@@ -121,7 +121,11 @@ def main(cfg: DictConfig) -> None:
   # Callbacks
   callbacks = []
   if 'beta' in cfg.model:
-    callbacks.append(BetaWarmupCallback(beta=float(cfg.model.beta), start_steps=50, end_steps=100))
+    callbacks.append(BetaWarmupEpochCallback(
+      beta=float(cfg.model.beta.target),
+      start_epoch=int(cfg.model.beta.start_epoch),
+      end_epoch=int(cfg.model.beta.end_epoch),
+    ))
 
   callbacks.append(ModelCheckpoint(dirpath=synth_training_path, filename='best', monitor='val_loss', mode='min', save_top_k=1, save_last=True))
 
