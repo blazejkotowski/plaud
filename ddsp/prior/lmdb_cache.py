@@ -28,6 +28,7 @@ def _create_cache_key(
     n_signal: int,
     sampling_rate: int,
     resampling_factor: int,
+    n_channels: int,
     control_space: ControlSpace,
     ddsp_checkpoint_path: str,
     seq_len: int,
@@ -40,7 +41,7 @@ def _create_cache_key(
     ckpt_stat = os.stat(ddsp_checkpoint_path)
     ckpt_sig = f"{ddsp_checkpoint_path}:{int(ckpt_stat.st_mtime)}:{int(ckpt_stat.st_size)}"
     field_sig = _control_space_signature(control_space)
-    key_string = f"{dataset_path}_{n_signal}_{sampling_rate}_{resampling_factor}_{seq_len}_{stride_factor}_{field_sig}_{ckpt_sig}"
+    key_string = f"{dataset_path}_{n_signal}_{sampling_rate}_{resampling_factor}_{n_channels}_{seq_len}_{stride_factor}_{field_sig}_{ckpt_sig}"
     return hashlib.md5(key_string.encode()).hexdigest()[:8]
 
 
@@ -125,7 +126,9 @@ def ensure_prior_controls_lmdb(
     num_controls: Optional[int] = None
 
     l_chunk = sr * 40
-    n_chunks_audio = (audio.size(0) + l_chunk - 1) // l_chunk
+    # audio is [n_channels, T_total]; chunk along the time axis (last dim).
+    T_total = int(audio.shape[-1])
+    n_chunks_audio = (T_total + l_chunk - 1) // l_chunk
 
     # Write in batched transactions; per-key begin/commit is extremely slow.
     commit_bytes = 256 * 1024**2  # ~256 MiB
@@ -133,9 +136,9 @@ def ensure_prior_controls_lmdb(
     txn = env.begin(write=True)
     try:
         for i_chunk in range(int(n_chunks_audio)):
-            a = audio[i_chunk * l_chunk : (i_chunk + 1) * l_chunk]
+            a = audio[:, i_chunk * l_chunk : (i_chunk + 1) * l_chunk]  # [n_channels, chunk_len]
             f = features[i_chunk * l_chunk : (i_chunk + 1) * l_chunk]
-            if a.numel() < rf:
+            if a.shape[-1] < rf:
                 continue
 
             # Downsample features to control frames
@@ -164,6 +167,12 @@ def ensure_prior_controls_lmdb(
                     z = torch.zeros(feat.size(0), Dz, device=feat.device, dtype=feat.dtype)
                 else:
                     z = torch.empty((feat.size(0), 0), device=feat.device, dtype=feat.dtype)
+
+            # Align time dims: encoder downsampling may differ from the feature
+            # downsampling by ±1, especially on the trailing partial chunk.
+            T_ctl = min(feat.size(0), z.size(0))
+            feat = feat[:T_ctl]
+            z = z[:T_ctl]
 
             seq = torch.cat([feat, z], dim=-1)  # [T_ctl, D]
 
@@ -251,6 +260,7 @@ def build_or_load_prior_cache_from_cfg(
     resampling_factor = int(cfg.model.resampling_factor)
     chunk_duration_s = float(cfg.audio.chunk_duration_s)
     n_signal = int(fs * chunk_duration_s)
+    n_channels = int(cfg.audio.n_channels)
 
     dataset_path = str(cfg.data.dataset_path)
 
@@ -263,6 +273,7 @@ def build_or_load_prior_cache_from_cfg(
         n_signal=n_signal,
         sampling_rate=fs,
         resampling_factor=resampling_factor,
+        n_channels=n_channels,
         control_space=control_space,
         ddsp_checkpoint_path=ddsp_checkpoint_path,
         seq_len=seq_len,
