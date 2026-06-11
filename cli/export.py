@@ -1,10 +1,12 @@
 import nn_tilde
 import argparse
+import os
 import math
 import torch
 import torch.nn.functional as F
 import lightning as L
 import cached_conv as cc
+from typing import Optional
 
 import time
 
@@ -13,7 +15,8 @@ from ddsp.utils import find_checkpoint
 from ddsp import DDSP
 from ddsp.interfaces import ControlField, ControlSpace
 import torch
-from ddsp.prior import Prior
+from ddsp.prior import Prior, PriorDiscrete
+from ddsp.latent_compressor import LatentCompressor
 
 torch.enable_grad(False)
 torch.set_printoptions(threshold=10000)
@@ -21,7 +24,7 @@ torch.set_printoptions(threshold=10000)
 class ScriptedDDSP(nn_tilde.Module):
   def __init__(self,
                pretrained: DDSP,
-               prior_model: Prior = None,
+               prior_model: torch.nn.Module = None,
                target_fs: float = 16000.0):
     super().__init__()
 
@@ -44,8 +47,9 @@ class ScriptedDDSP(nn_tilde.Module):
 
     if prior_model is None:
       prior_model = FakePrior()
-    else:
+    elif isinstance(prior_model, Prior):
       prior_model = PriorWrapper(prior_model, resample_ratio=self.resample_ratio)
+    # else: assume it's already a wrapper module compatible with ScriptedDDSP.prior()
 
     self.prior_model = prior_model
 
@@ -296,6 +300,135 @@ class PriorWrapper(torch.nn.Module):
 
     return output.permute(0, 2, 1).float()
 
+
+class LatentCompressorDecodeOnly(torch.nn.Module):
+  def __init__(self, vq: torch.nn.Module, decoder: torch.nn.Module, compression_ratio: int):
+    super().__init__()
+    self.vq = vq
+    self.decoder = decoder
+    self.compression_ratio = int(compression_ratio)
+
+  def decode_codes(self, indices: torch.Tensor, output_len: Optional[int] = None) -> torch.Tensor:
+    z_q = self.vq.embed(indices)
+    x_hat = self.decoder(z_q, None)
+
+    if output_len is not None:
+      T_out = int(x_hat.shape[1])
+      if T_out > output_len:
+        x_hat = x_hat[:, :output_len, :]
+      elif T_out < output_len:
+        x_hat = F.pad(x_hat, (0, 0, 0, output_len - T_out))
+
+    return x_hat
+
+  def forward(self, indices: torch.Tensor, output_len: Optional[int] = None) -> torch.Tensor:
+    return self.decode_codes(indices, output_len=output_len)
+
+
+class PriorDiscreteWrapper(torch.nn.Module):
+  def __init__(self, prior: PriorDiscrete, compressor: torch.nn.Module, resample_ratio: float = 1.0):
+    super().__init__()
+
+    self.prior = prior
+    self.compressor = compressor
+    self.resample_ratio = resample_ratio
+
+    self.max_len = int(self.prior._max_len)
+    self.init_primer_len = int(self.max_len // 4)
+    self.num_codebooks = int(self.prior.num_codebooks)
+    self.codebook_size = int(self.prior.codebook_size)
+    self.compression_ratio = int(getattr(self.compressor, 'compression_ratio', 32))
+
+    # Infer control dimension via a dummy decode.
+    with torch.no_grad():
+      _dummy = torch.zeros(1, 1, self.num_codebooks, dtype=torch.long)
+      _num_controls = int(compressor.decode_codes(_dummy).shape[2])
+
+    self.register_buffer("token_buffer", torch.zeros(1, self.max_len, self.num_codebooks, dtype=torch.long))
+    # Scalar state as 0-d long tensors so TorchScript reliably persists mutations across calls.
+    self.register_buffer("_current_len", torch.tensor(self.init_primer_len, dtype=torch.long))
+    # One token's worth of decoded control frames; _ctrl_pos is the next frame to emit.
+    # Initialised with _ctrl_pos == compression_ratio to signal "empty" on first call.
+    self.register_buffer("_ctrl_buf", torch.zeros(1, self.compression_ratio, _num_controls))
+    self.register_buffer("_ctrl_pos", torch.tensor(self.compression_ratio, dtype=torch.long))
+
+  def _shift_to_primer(self, buf: torch.Tensor, current_len: int) -> int:
+    buf[:, :self.init_primer_len, :] = buf[:, current_len - self.init_primer_len:current_len, :].clone()
+    return int(self.init_primer_len)
+
+  def forward(self, x: torch.Tensor) -> torch.Tensor:
+    # x: [B, total_params + 2, steps]
+    transposition = x[:1, :-2, :]
+    temperature   = x[:1, -2, :]
+    prediction_annealing = 1 - x[:1, -1, :]
+
+    steps = int(x.shape[-1])
+    if steps <= 0:
+      return x[:1, :-2, :].float()
+
+    local_buf   = self.token_buffer.clone()
+    current_len = int(self._current_len.item())
+    ctrl_buf    = self._ctrl_buf.clone()          # [1, CR, D]
+    ctrl_pos    = int(self._ctrl_pos.item())      # next frame to emit
+
+    num_controls = int(ctrl_buf.shape[2])
+    out = torch.zeros(1, steps, num_controls)
+    frames_written = 0
+
+    # Emit exactly `steps` control frames, generating new tokens on demand.
+    for _iter in range(steps + self.compression_ratio):
+      if frames_written >= steps:
+        break
+
+      if ctrl_pos >= self.compression_ratio:
+        # Current token exhausted — sample the next one.
+        ti   = int(min(steps - 1, frames_written))
+        temp = torch.clamp(temperature[:, ti:ti+1], min=1e-4)
+
+        prime      = local_buf[:, :current_len, :]
+        logits     = self.prior(prime)
+        next_logits = logits[:, -1, :, :]
+        probs      = torch.softmax(next_logits / temp.unsqueeze(-1), dim=-1)
+        samples    = torch.multinomial(probs.reshape(-1, self.codebook_size), 1).reshape(1, self.num_codebooks)
+
+        if current_len >= self.max_len:
+          current_len = self._shift_to_primer(local_buf, current_len)
+
+        local_buf[:, current_len:current_len+1, :] = samples.unsqueeze(1)
+        current_len += 1
+
+        # Decode new token with a small context window for boundary accuracy.
+        _ctx         = 8
+        decode_start = max(0, current_len - 1 - _ctx)
+        decoded      = self.compressor.decode_codes(local_buf[:, decode_start:current_len, :])
+        ctrl_buf     = decoded[:, -self.compression_ratio:, :].detach()
+        ctrl_pos     = 0
+
+      take = min(steps - frames_written, self.compression_ratio - ctrl_pos)
+      out[:, frames_written:frames_written + take, :] = ctrl_buf[:, ctrl_pos:ctrl_pos + take, :]
+      frames_written += take
+      ctrl_pos       += take
+
+    out = out.permute(0, 2, 1)  # [1, D, steps]
+    out = out * prediction_annealing.unsqueeze(1) + transposition
+
+    # Persist all state as tensors so TorchScript keeps mutations across calls.
+    self.token_buffer.copy_(local_buf)
+    self._current_len.fill_(current_len)
+    self._ctrl_buf.copy_(ctrl_buf)
+    self._ctrl_pos.fill_(ctrl_pos)
+    if int(self._current_len.item()) >= self.max_len:
+      new_len = self._shift_to_primer(self.token_buffer, int(self._current_len.item()))
+      self._current_len.fill_(new_len)
+
+    if x.size(0) > 1:
+      out = out.repeat_interleave(x.size(0), dim=0)
+    if self.resample_ratio != 1:
+      out = F.interpolate(out, scale_factor=self.resample_ratio, mode='linear')
+
+    return out.float()
+
+
 class ONNXDDSP(torch.nn.Module):
   def __init__(self,
                pretrained: DDSP):
@@ -328,6 +461,8 @@ if __name__ == '__main__':
   parser.add_argument('--streaming', type=bool, default=True, help='Whether to use streaming mode')
   parser.add_argument('--type', default='best', help='Type of model to export', choices=['best', 'last'])
   parser.add_argument('--target_fs', type=float, default=16000.0, help='Target sampling rate for the exported model')
+  parser.add_argument('--prior_kind', default='mulaw', choices=['mulaw', 'discrete'], help='Which prior checkpoint type to load')
+  parser.add_argument('--compressor_checkpoint', type=str, default=None, help='LatentCompressor checkpoint (required for prior_kind=discrete)')
   config = parser.parse_args()
 
   cc.use_cached_conv(config.streaming)
@@ -340,17 +475,56 @@ if __name__ == '__main__':
     raise ValueError(f'Invalid format: {format}, supported formats are: ts, onnx')
 
   prior = None
+  prior_discrete = None
+  compressor = None
   if config.prior_directory is not None:
-    prior_checkpoint_path = find_checkpoint(config.prior_directory, typ=config.type)
-    print("exporting prior model from checkpoint: ", prior_checkpoint_path)
-    prior = Prior.load_from_checkpoint(prior_checkpoint_path, strict=False).to('cpu')
-    prior.eval()
-    if prior._normalization_dict is not None:
-      for k, v in prior._normalization_dict.items():
-        if torch.is_tensor(v):
-          prior._normalization_dict[k] = v.to('cpu')
+    prior_checkpoint_path = None
+    if config.prior_kind == 'discrete':
+      if config.type == 'best':
+        # Prefer best_acc checkpoint for discrete prior.
+        for root, _, files in os.walk(config.prior_directory):
+          for file in files:
+            if 'best_acc' in file and file.endswith('.ckpt'):
+              p = os.path.join(root, file)
+              if prior_checkpoint_path is None or os.path.getctime(p) > os.path.getctime(prior_checkpoint_path):
+                prior_checkpoint_path = p
+      if prior_checkpoint_path is None:
+        prior_checkpoint_path = find_checkpoint(config.prior_directory, typ=config.type)
+      print("exporting discrete prior model from checkpoint: ", prior_checkpoint_path)
 
-    prior._trainer = L.Trainer()
+      if config.compressor_checkpoint is None:
+        raise RuntimeError("--compressor_checkpoint is required when --prior_kind=discrete")
+
+      prior_discrete = PriorDiscrete.load_from_checkpoint(prior_checkpoint_path, strict=False).to('cpu')
+      prior_discrete.eval()
+      prior_discrete._trainer = L.Trainer()
+
+      compressor_full = LatentCompressor.load_from_checkpoint(config.compressor_checkpoint, strict=False).to('cpu')
+      compressor_full.eval()
+      compressor_full._trainer = L.Trainer()
+
+      if getattr(compressor_full, 'use_skip_connections', True):
+        raise RuntimeError("LatentCompressor must have use_skip_connections=False for codes-only decoding")
+      if getattr(compressor_full, 'vq', None) is None:
+        raise RuntimeError("LatentCompressor must have vq_enabled=True for discrete-prior export")
+
+      compressor = LatentCompressorDecodeOnly(
+        vq=compressor_full.vq,
+        decoder=compressor_full.decoder,
+        compression_ratio=int(getattr(compressor_full, 'compression_ratio', 32)),
+      ).to('cpu')
+      compressor.eval()
+    else:
+      prior_checkpoint_path = find_checkpoint(config.prior_directory, typ=config.type)
+      print("exporting prior model from checkpoint: ", prior_checkpoint_path)
+      prior = Prior.load_from_checkpoint(prior_checkpoint_path, strict=False).to('cpu')
+      prior.eval()
+      if prior._normalization_dict is not None:
+        for k, v in prior._normalization_dict.items():
+          if torch.is_tensor(v):
+            prior._normalization_dict[k] = v.to('cpu')
+
+      prior._trainer = L.Trainer()
 
   # Reconstruct minimal ControlSpace from checkpoint hyperparameters
   ckpt = torch.load(checkpoint_path, map_location='cpu')
@@ -368,6 +542,10 @@ if __name__ == '__main__':
 
   ddsp = DDSP.load_from_checkpoint(checkpoint_path, strict=False, streaming=True, device='cpu', control_space=control_space).to('cpu')
   ddsp.streaming(True)
+
+  if config.prior_kind == 'discrete' and prior_discrete is not None:
+    prior = PriorDiscreteWrapper(prior_discrete, compressor, resample_ratio=(config.target_fs / float(ddsp.fs)))
+
   if format == 'onnx':
     ddsp.eval()
     scripted = ONNXDDSP(ddsp).to('cpu')

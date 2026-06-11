@@ -60,10 +60,15 @@ class PriorDataset(Dataset):
     print("Encoding audio dataset...")
 
     l_chunk = self._sampling_rate * 40  # process in 40s chunks (as before)
-    for i_chunk in range(math.ceil(self._audio.size(0) / l_chunk)):
-      audio = self._audio[i_chunk*l_chunk : (i_chunk+1)*l_chunk].to(self._device)
+    # audio is [n_channels, T_total]; chunk along the time axis (last dim).
+    T_total = int(self._audio.shape[-1])
+    for i_chunk in range(math.ceil(T_total / l_chunk)):
+      audio = self._audio[:, i_chunk*l_chunk : (i_chunk+1)*l_chunk].to(self._device)  # [n_channels, chunk_len]
       features = self._features[i_chunk*l_chunk:(i_chunk+1)*l_chunk].to(self._device)
+      if audio.shape[-1] < self._resampling_factor:
+        continue
 
+      # Encoder downmixes the [1, n_channels, T] input internally.
       mu, scale = self._vae.encoder(audio.unsqueeze(0))
       z, _ = self._vae.encoder.reparametrize(mu, scale)
       z = self._vae._smooth_latents(z).squeeze(0)
@@ -72,6 +77,12 @@ class PriorDataset(Dataset):
       feat = features.t().unsqueeze(0)
       feat = F.interpolate(feat, scale_factor=1/self._resampling_factor, mode='linear', align_corners=False)  # [1, F, Tz]
       feat = feat.squeeze(0).t()
+
+      # Encoder downsampling may differ from feature downsampling by +/-1 on the
+      # trailing partial chunk; align time dims before concatenating.
+      T_ctl = min(feat.size(0), z.size(0))
+      feat = feat[:T_ctl]
+      z = z[:T_ctl]
 
       # prepend features to latents
       seq = torch.cat([feat, z], dim=-1)
