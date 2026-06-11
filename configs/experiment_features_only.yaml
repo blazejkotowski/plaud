@@ -7,6 +7,7 @@ experiment:
 audio:
   fs: 22050
   chunk_duration_s: 2.0
+  n_channels: 1
 
 data:
   dataset_path: /path/to/dataset

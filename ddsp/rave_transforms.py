@@ -51,7 +51,10 @@ class Compose(Transform):
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         for elm in self.transform_list:
             dev = x.device
-            x = elm(x).squeeze().to(dev)
+            x = elm(x).to(dev)
+            # Drop only a leading singleton (batch) dim, preserving the channel axis [C, T]
+            while x.dim() > 2 and x.shape[0] == 1:
+                x = x.squeeze(0)
         return x
 
 

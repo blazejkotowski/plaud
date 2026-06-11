@@ -151,21 +151,24 @@ class NoiseBandSynth(BaseSynth):
       mask.scatter_(1, indices.unsqueeze(-1), 1)
       amplitudes = amplitudes * mask
 
-    # Fast inference path for batch_size=1: periodic blocked BMM, handles limit_components too.
-    # _nb_blocked: [n_blocks, n_filters, rf], each block = one control frame's audio.
-    if not self.training and batch_size == 1:
+    # Fast inference path (any batch size, including folded multichannel): periodic blocked BMM,
+    # handles limit_components too. _nb_blocked: [n_blocks, n_filters, rf], each block = one
+    # control frame's audio. All rows share the same noisebands and start_pos, so they are
+    # batched together over the leading dim.
+    if not self.training:
       n_blocks = self._nb_blocked.shape[0]
       start_block = start_pos // rf
-      amp_T = amplitudes.squeeze(0).T  # [n_ctrl, n_filters]
-      nb_blocked = self._nb_blocked.to(amp_T.dtype)  # bmm requires matching dtypes (noisebands are float64)
-      out = torch.empty(n_ctrl, rf, dtype=amplitudes.dtype, device=amplitudes.device)
+      nb_blocked = self._nb_blocked.to(amplitudes.dtype)  # match dtype (noisebands are float64)
+      out = torch.empty(batch_size, n_ctrl, rf, dtype=amplitudes.dtype, device=amplitudes.device)
       t, b = 0, start_block
       while t < n_ctrl:
         avail = n_blocks - b
         take = min(avail, n_ctrl - t)
-        out[t:t+take] = torch.bmm(amp_T[t:t+take].unsqueeze(1), nb_blocked[b:b+take]).squeeze(1)
+        # amplitudes[:, :, t:t+take]: [B, n_filters, take]; nb_blocked[b:b+take]: [take, n_filters, rf].
+        # Contract over filters per control frame -> [B, take, rf].
+        out[:, t:t+take, :] = torch.einsum('bft,tfr->btr', amplitudes[:, :, t:t+take], nb_blocked[b:b+take])
         t += take; b = (b + take) % n_blocks
-      return out.reshape(1, 1, -1)
+      return out.reshape(batch_size, 1, -1)
 
     # General path: training or batch_size > 1
     upsampled_amplitudes = amplitudes.repeat_interleave(rf, dim=-1)

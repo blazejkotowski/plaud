@@ -44,6 +44,7 @@ class DDSP(L.LightningModule):
                control_space: ControlSpace,
                synth_configs: List[Dict[Any, Any]] = [],
                fs: int = 44100,
+               n_channels: int = 1,
                encoder_ratios: List[int] = [8, 4, 2],
                latent_smoothing_kernel: int = 1,
                n_melbands: int = 128,
@@ -77,6 +78,7 @@ class DDSP(L.LightningModule):
     self._device = device
     self._plateau_patience = plateau_patience
     self.fs = fs
+    self.n_channels = n_channels
     # Control space is the single source of dims
     self.control_space = control_space
     self.latent_size = self.control_space.latent_dim
@@ -153,6 +155,7 @@ class DDSP(L.LightningModule):
       n_params=self._total_synth_params,
       latent_size=max(self.latent_size, 1),
       n_features=max(self.feature_dim, 1),
+      n_channels=n_channels,
       layer_sizes=(np.array(decoder_ratios)*capacity).tolist(),
       gru_layers=decoder_gru_layers,
       temporal_stride=decoder_temporal_stride,
@@ -408,8 +411,8 @@ class DDSP(L.LightningModule):
       z = z[:, :T_min, :]
 
     synth_params = self.decoder(features_for_decoder, z)
-    # Decoder outputs [B, n_params, T_ctl]; synthesize to audio-rate
-    assert synth_params.shape[1] == self._total_synth_params, "decoder param size mismatch"
+    # Decoder outputs [B, n_channels, n_params, T_ctl]; synthesize to audio-rate
+    assert synth_params.shape[2] == self._total_synth_params, "decoder param size mismatch"
     signal = self._synthesize(synth_params)
     return signal
 
@@ -453,8 +456,8 @@ class DDSP(L.LightningModule):
       self.toggle_optimizer(opt_disc)
 
       # D(real) and D(fake.detach()) with grads ONLY for D
-      pred_real = self._discriminator(x_audio.float())
-      pred_fake_det = self._discriminator(y_audio.float().detach())
+      pred_real = self._discriminate(x_audio.float())
+      pred_fake_det = self._discriminate(y_audio.float().detach())
 
       self.log("D(real)", sum([out[-1].mean() for out in pred_real]).item(), prog_bar=True, logger=True)
       self.log("D(fake)", sum([out[-1].mean() for out in pred_fake_det]).item(), prog_bar=True, logger=True)
@@ -490,9 +493,9 @@ class DDSP(L.LightningModule):
     if self._adversarial_loss and self.current_epoch >= self._adv_g_start_epoch:
       self.toggle_optimizer(opt_ddsp)                 # freezes D params for this block
 
-      pred_real = self._discriminator(x_audio.float())
+      pred_real = self._discriminate(x_audio.float())
       # D(fake) WITHOUT detach, but D is frozen so grads flow to G only
-      pred_fake = self._discriminator(y_audio.float())
+      pred_fake = self._discriminate(y_audio.float())
 
       # Generator hinge term: -E[D(fake)]
       for out in pred_fake:
@@ -680,6 +683,18 @@ class DDSP(L.LightningModule):
   #   self._validation_index += 1
 
 
+  def _discriminate(self, audio: torch.Tensor):
+    """
+    Run the (mono) discriminator on each channel independently by folding the channel axis
+    into the batch. Downstream hinge/feature-matching reductions then average over batch*channels,
+    i.e. a per-channel discriminator. Accepts [B, N, T] or legacy [B, T]/[B, 1, T].
+    """
+    if audio.dim() == 2:
+      audio = audio.unsqueeze(1)
+    B, N, T = audio.shape
+    return self._discriminator(audio.reshape(B * N, 1, T))
+
+
   def _synthesize(self, params: torch.Tensor, waveshaping_factor: float=0.0, limit_components: float=0.0) -> torch.Tensor:
     """
     Synthesizes a signal from the predicted amplitudes and the baked noise bands.
@@ -692,6 +707,13 @@ class DDSP(L.LightningModule):
     Returns:
       - signal: torch.Tensor[batch_size, sig_length], the synthesized signal
     """
+    # Fold the channel axis into the batch so each synth processes [B*N, n_params, T]
+    # transparently. Legacy/JIT callers may pass [B, n_params, T]; treat it as a single channel.
+    if params.dim() == 3:
+      params = params.unsqueeze(1)
+    B, N = params.shape[0], params.shape[1]
+    params = params.reshape(B * N, params.shape[2], params.shape[3])
+
     params_idx = 0
     audio = []
 
@@ -709,7 +731,9 @@ class DDSP(L.LightningModule):
         # Default call with parameters only
         audio.append(synth(synth_params))
 
-    return torch.sum(torch.hstack(audio), dim=1, keepdim=True)
+    # Sum across synths -> [B*N, 1, T], then restore the channel axis -> [B, N, T]
+    mixed = torch.sum(torch.hstack(audio), dim=1, keepdim=True)
+    return mixed.reshape(B, N, mixed.shape[-1])
 
 
   def _reconstruction_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
@@ -723,6 +747,9 @@ class DDSP(L.LightningModule):
       min_length = min(x.shape[-1], y.shape[-1])
       x = x[..., :min_length]
       y = y[..., :min_length]
+    # Fold channels into the batch so each loss sees mono [B*N, 1, T] (per-channel averaged).
+    x = x.reshape(x.shape[0] * x.shape[1], 1, x.shape[-1])
+    y = y.reshape(y.shape[0] * y.shape[1], 1, y.shape[-1])
 
     total = 0.0
     # Each loss function may expect shapes [B,1,T] or [B,T]; try both
@@ -747,6 +774,9 @@ class DDSP(L.LightningModule):
       min_length = min(x.shape[-1], y.shape[-1])
       x = x[..., :min_length]
       y = y[..., :min_length]
+    # Fold channels into the batch so each loss sees mono [B*N, 1, T] (per-channel averaged).
+    x = x.reshape(x.shape[0] * x.shape[1], 1, x.shape[-1])
+    y = y.reshape(y.shape[0] * y.shape[1], 1, y.shape[-1])
 
     comps: Dict[str, torch.Tensor] = {}
     for loss_fn, _w in self._loss_items:

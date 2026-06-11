@@ -77,26 +77,28 @@ class ScriptedDDSP(nn_tilde.Module):
 
     total_params = self.pretrained.num_params + self.pretrained.n_features
 
+    n_channels = self.pretrained.n_channels
+
     self.register_method(
       "decode",
       in_channels = total_params,
       in_ratio = self._nn_decode_ratio,
-      out_channels = 1, # number of output audio channels
+      out_channels = n_channels, # number of output audio channels
       # out_ratio = 1/3,
       out_ratio = 1,
       input_labels=[f'(signal) Latent Dimension {i}' for i in range(1, total_params+1)],
-      output_labels=['(signal) Audio Output'],
+      output_labels=[f'(signal) Audio Output {i}' for i in range(1, n_channels+1)],
       test_method=True,
     )
 
     if self.pretrained.latent_size > 0:
       self.register_method(
         "encode",
-        in_channels = 1,
+        in_channels = n_channels,
         in_ratio = 1,
         out_channels = self.pretrained.num_params,
         out_ratio = self.pretrained.resampling_factor,
-        input_labels=['(signal) Audio Input'],
+        input_labels=[f'(signal) Audio Input {i}' for i in range(1, n_channels+1)],
         output_labels=[f'(signal) Latent Dimension {i}' for i in range(1, self.pretrained.num_params+1)],
         test_method=True
       )
@@ -145,7 +147,8 @@ class ScriptedDDSP(nn_tilde.Module):
   def encode(self, audio: torch.Tensor):
     if self.pretrained.encoder is None:
       raise RuntimeError("encode() requested but the pretrained model has no encoder (latent_size=0)")
-    mu, scale = self.pretrained.encoder(audio.squeeze(1))
+    # Encoder downmixes the [B, n_channels, T] input internally
+    mu, scale = self.pretrained.encoder(audio)
     latents, _ = self.pretrained.encoder.reparametrize(mu, scale)
     latents = self.pretrained._smooth_latents(latents)
     latents = self.pretrained.normalize_latents(latents)
@@ -370,7 +373,7 @@ if __name__ == '__main__':
     scripted = ONNXDDSP(ddsp).to('cpu')
     torch.onnx.dynamo_export(
       scripted,
-      torch.zeros(1, 1, 2**14),
+      torch.zeros(1, ddsp.n_channels, 2**14),
     ).save(config.output_path)
   elif format == 'ts':
     # ugly workaround for the torchscript

@@ -105,6 +105,11 @@ class VariationalEncoder(nn.Module):
     Returns:
       - mu, logvar: Tuple[torch.Tensor, torch.Tensor], the latent space tensor
     """
+    # Downmix multichannel input to mono. We sum (not average) so that zero-padded
+    # channels contribute nothing and a single channel passes through unchanged.
+    if audio.dim() == 3:
+      audio = audio.sum(dim=1)
+
     # Calculate Mel spectrogram
     melspec = self.melspec(audio)
 
@@ -172,6 +177,7 @@ class Decoder(nn.Module):
                n_params: int = 500,
                latent_size: int = 16,
                n_features: int = 4,
+               n_channels: int = 1,
                layer_sizes: List[int] = [32, 64, 128],
                output_mlp_layers: int = 3,
                gru_layers: int = 1,
@@ -179,8 +185,9 @@ class Decoder(nn.Module):
                streaming: bool = False):
     """
     Arguments:
-      - n_params: int, the number of synthesis parameters
+      - n_params: int, the number of synthesis parameters (per channel)
       - latent_size: int, the size of the latent space
+      - n_channels: int, the number of output audio channels (one parameter head per channel)
       - layer_sizes: List[int], the sizes of the layers in the bottleneck
       - output_mlp_layers: int, the number of layers in the output MLP
       - gru_layers: int, the number of GRU layers in the decoder
@@ -190,6 +197,7 @@ class Decoder(nn.Module):
     super().__init__()
 
     self.n_params = n_params
+    self.n_channels = n_channels
     self.streaming = streaming
     self.temporal_stride = temporal_stride
 
@@ -209,8 +217,8 @@ class Decoder(nn.Module):
     # Intermediary 3-layer MLP
     self.inter_mlp = _make_mlp(self.hidden_size, output_mlp_layers, self.hidden_size)
 
-    # Output layer predicting noiseband amplitudes, and sine frequencies and amplitudes
-    self.output_params = nn.Linear(self.hidden_size, n_params)
+    # Output layer predicting per-channel synth parameters (n_channels sets of n_params)
+    self.output_params = nn.Linear(self.hidden_size, n_channels * n_params)
 
 
   def forward(self, features: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
@@ -220,7 +228,8 @@ class Decoder(nn.Module):
       - features: torch.Tensor, the input features tensor [batch_size, n_features, n_signal]
       - z: torch.Tensor, the latent space tensor [batch_size, latent_size, n_signal]
     Returns:
-      - synth_params: torch.Tensor, the predicted synthesiser parameters
+      - synth_params: torch.Tensor[batch_size, n_channels, n_params, n_signal], the predicted
+        per-channel synthesiser parameters
     """
     # Store for upsampling
     T = z.shape[1]
@@ -249,14 +258,17 @@ class Decoder(nn.Module):
     # Pass through the intermediary MLP
     x = self.inter_mlp(x)
 
-    # Pass through the output layer
+    # Pass through the output layer -> [batch_size, n_signal, n_channels * n_params]
     output = _scaled_sigmoid(self.output_params(x))
 
     # Upsample back to original temporal resolution
     if self.temporal_stride > 1:
        output = output.repeat_interleave(self.temporal_stride, dim=1)[:, :T, :]
 
-    return output.permute(0, 2, 1)
+    # Expose the channel axis -> [batch_size, n_channels, n_params, n_signal]
+    batch_size, n_signal = output.shape[0], output.shape[1]
+    output = output.view(batch_size, n_signal, self.n_channels, self.n_params)
+    return output.permute(0, 2, 3, 1)
 
 
   def positional_encoding(self, d_model, length):

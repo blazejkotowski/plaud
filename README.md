@@ -8,6 +8,7 @@ PLAUD is a modular PyTorch framework for Differentiable Digital Signal Processin
 
 - **Explicit ControlSpace**: Authoritative source for control dimensions and rate.
 - **Modular synth routing**: Choose synth blocks and their parameters via config (no inspect-based magic).
+- **Multichannel output**: Set `audio.n_channels` to synthesize and export N audio channels (mono by default).
 - **Configurable losses**: Flexible list (e.g., MRSTFT-only by default) with per-component logging.
 - **Optional adversarial regime**: Gate discriminator and generator loss contributions by epoch.
 - **Prior integration**: Transformer Prior learns on exported control sequences; continuous controls at runtime.
@@ -119,6 +120,33 @@ Export details:
 - Use `--config-name/-cn` to select a file; use `++path.to.field=value` to override existing fields; use `+new.key=value` to add new keys.
 - Losses are a list with `name` and `weight`. MRSTFT-only is a sensible default.
 - Adversarial regime is optional and epoch-gated.
+
+## Multichannel
+
+`audio.n_channels` (default `1`) sets the number of audio channels the model synthesizes. Override it
+like any other field:
+
+```zsh
+python -m cli.train -cn experiment_features_only \
+  data.dataset_path=/absolute/path/to/dataset \
+  ++audio.n_channels=2
+```
+
+Behavior:
+
+- **Decoder per-channel heads**: a single shared latent/feature stream drives `n_channels` independent
+  sets of synth parameters, so each channel is synthesized separately. Channels differ only through
+  the decoder — the encoder and feature extractors consume a **mono downmix** of the input.
+- **Data**: preprocess with channels preserved — `utils/dataset_converter.py` keeps the source channel
+  layout by default (pass `--channels N` to force one). At load time, files with fewer channels than
+  `n_channels` are **zero-padded** and files with more are **cropped** to the first `n_channels`.
+- **Adversarial**: the discriminator runs per channel (each channel judged as an independent mono
+  example) and is averaged.
+- **Export**: `decode` exposes `n_channels` audio outputs (one nn~ signal outlet per channel), and
+  `encode` accepts `n_channels` inputs.
+- **Backward compatible**: at `n_channels=1` everything is identical to the mono model and existing
+  checkpoints load unchanged. Changing `n_channels` rebuilds the dataset cache (it is part of the
+  cache key).
 
 ## Testing
 

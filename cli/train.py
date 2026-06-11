@@ -38,6 +38,7 @@ def main(cfg: DictConfig) -> None:
   fs = int(cfg.audio.fs)
   resampling_factor = int(cfg.model.resampling_factor)
   chunk_duration_s = float(cfg.audio.chunk_duration_s)
+  n_channels = int(getattr(cfg.audio, 'n_channels', 1))
   n_signal = int(fs * chunk_duration_s)
 
   # Paths
@@ -65,6 +66,7 @@ def main(cfg: DictConfig) -> None:
     resampling_factor=resampling_factor,
     control_space=control_space,
     transform_fn=transform_fn,
+    n_channels=n_channels,
   )
 
   # Dataloaders
@@ -94,6 +96,7 @@ def main(cfg: DictConfig) -> None:
     control_space=control_space,
     synth_configs=synth_configs,
     fs=fs,
+    n_channels=n_channels,
     resampling_factor=resampling_factor,
     latent_smoothing_kernel=int(cfg.model.latent_smoothing_kernel),
     decoder_gru_layers=int(cfg.model.decoder_gru_layers),

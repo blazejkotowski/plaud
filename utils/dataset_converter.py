@@ -4,7 +4,7 @@ import subprocess
 from tqdm import tqdm
 from glob import glob
 
-def convert_to_wav(input_dir, output_dir, sampling_rate, highpass=None):
+def convert_to_wav(input_dir, output_dir, sampling_rate, highpass=None, channels=None):
     # Check if output directory exists, create it if not
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -17,15 +17,17 @@ def convert_to_wav(input_dir, output_dir, sampling_rate, highpass=None):
         file_name = audio_file.split('/')[-1]
         output_file_path = os.path.join(output_dir, os.path.splitext(file_name)[0] + '.wav')
 
-        # Command to convert audio file to mono, 16-bit WAV, and specified sampling rate
+        # Command to convert audio file to 16-bit WAV at the specified sampling rate.
+        # Source channels are preserved by default; pass --channels to force a fixed count.
         command = [
             'sox',
             audio_file,
             '-r', str(sampling_rate),  # Sample rate
-            '-c', '1',                 # Mono
             '-b', '16',                # 16-bit
-            output_file_path
         ]
+        if channels is not None:
+            command.extend(['-c', str(channels)])  # Force channel count
+        command.append(output_file_path)
 
         if highpass:
             command.extend(['highpass', str(highpass)])
@@ -39,7 +41,8 @@ if __name__ == "__main__":
     parser.add_argument('--output_dir', type=str, help='Output directory for converted audio files')
     parser.add_argument('--sampling_rate', type=int, default=44100, help='Sampling rate for the output audio files')
     parser.add_argument('--highpass', type=int, default=None, help='High-pass filter cutoff frequency in Hz')
+    parser.add_argument('--channels', type=int, default=None, help='Force a fixed channel count (default: preserve source channels)')
 
     args = parser.parse_args()
 
-    convert_to_wav(args.input_dir, args.output_dir, args.sampling_rate, args.highpass)
+    convert_to_wav(args.input_dir, args.output_dir, args.sampling_rate, args.highpass, args.channels)
