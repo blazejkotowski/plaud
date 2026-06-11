@@ -40,6 +40,10 @@ class DDSP(L.LightningModule):
     - adversarial_loss: bool, enable adversarial training
     - device: str, device
   """
+
+  # Fixed (non-configurable) scaling on the KLD term. The β schedule modulates
+  # this further; recovered from the pre-refactor default (commit bb76ec9).
+  _KLD_WEIGHT = 0.0001
   def __init__(self,
                control_space: ControlSpace,
                synth_configs: List[Dict[Any, Any]] = [],
@@ -488,7 +492,7 @@ class DDSP(L.LightningModule):
     recons_loss = self._reconstruction_loss(y_audio.float(), x_audio.float())
     # Log individual loss components for visibility
     self._log_loss_components(y_audio.float(), x_audio.float(), split='train')
-    ddsp_loss = recons_loss + self._beta * kld_loss  # adv term added below if enabled
+    ddsp_loss = recons_loss + self._KLD_WEIGHT * self._beta * kld_loss  # adv term added below if enabled
 
     if self._adversarial_loss and self.current_epoch >= self._adv_g_start_epoch:
       self.toggle_optimizer(opt_ddsp)                 # freezes D params for this block

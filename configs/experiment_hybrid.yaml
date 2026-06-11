@@ -48,6 +48,10 @@ model:
   learning_rate: 1e-4
   plateau_patience: 100000
   capacity: 32
+  beta:
+    target: 0.001     # target β for the β-VAE KLD term
+    start_epoch: 100   # hold β at 0 until this epoch
+    end_epoch: 200     # linearly ramp β to target by this epoch
 
 losses:
   - type: MRSTFT
