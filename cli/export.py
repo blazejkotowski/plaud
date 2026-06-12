@@ -2,6 +2,7 @@ import nn_tilde
 import argparse
 import os
 import math
+import yaml
 import torch
 import torch.nn.functional as F
 import lightning as L
@@ -483,15 +484,56 @@ class ONNXDDSP(torch.nn.Module):
 
 if __name__ == '__main__':
   parser = argparse.ArgumentParser()
-  parser.add_argument('--model_directory', type=str, help='Path to the model training')
-  parser.add_argument('--prior_directory', type=str, default=None, help='Path to the prior model training')
-  parser.add_argument('--output_path', type=str, help='Directory to save the autoencoded audio')
+  parser.add_argument('--config', type=str, default=None,
+                      help='Experiment config (name in configs/ or a path). Derives all checkpoint '
+                           'paths, prior_kind, target_fs and output_path from experiment.name/training_dir.')
+  parser.add_argument('--model_directory', type=str, default=None, help='DDSP synth training dir (derived from --config if omitted)')
+  parser.add_argument('--prior_directory', type=str, default=None, help='Prior training dir (derived from --config if omitted)')
+  parser.add_argument('--output_path', type=str, default=None, help='Output .ts path (derived from --config if omitted)')
   parser.add_argument('--streaming', type=bool, default=True, help='Whether to use streaming mode')
   parser.add_argument('--type', default='best', help='Type of model to export', choices=['best', 'last'])
-  parser.add_argument('--target_fs', type=float, default=16000.0, help='Target sampling rate for the exported model')
-  parser.add_argument('--prior_kind', default='mulaw', choices=['mulaw', 'discrete'], help='Which prior checkpoint type to load')
-  parser.add_argument('--compressor_checkpoint', type=str, default=None, help='LatentCompressor checkpoint (required for prior_kind=discrete)')
+  parser.add_argument('--target_fs', type=float, default=None, help='Target sampling rate (defaults to the model fs from --config)')
+  parser.add_argument('--prior_kind', default=None, choices=['mulaw', 'discrete'], help='Derived from cfg.prior.discrete.enabled if omitted')
+  parser.add_argument('--compressor_checkpoint', type=str, default=None, help='LatentCompressor checkpoint (derived from --config for prior_kind=discrete)')
   config = parser.parse_args()
+
+  # Derive any unset options from the experiment config (explicit args win).
+  if config.config is not None:
+    cfg_path = config.config
+    if not os.path.isfile(cfg_path):
+      _name = config.config if config.config.endswith('.yaml') else config.config + '.yaml'
+      cfg_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'configs', _name)
+    with open(cfg_path) as f:
+      _cfg = yaml.safe_load(f)
+    _exp = _cfg.get('experiment', {}) or {}
+    name = _exp.get('name'); tdir = _exp.get('training_dir', 'training')
+    _disc = (_cfg.get('prior', {}) or {}).get('discrete', {}) or {}
+    if config.prior_kind is None:
+      config.prior_kind = 'discrete' if bool(_disc.get('enabled', False)) else 'mulaw'
+    if config.model_directory is None:
+      config.model_directory = os.path.join(tdir, 'synth', name)
+    if config.prior_directory is None:
+      sub = 'prior_discrete' if config.prior_kind == 'discrete' else 'prior'
+      config.prior_directory = os.path.join(tdir, sub, name)
+    if config.compressor_checkpoint is None and config.prior_kind == 'discrete':
+      config.compressor_checkpoint = _disc.get('compressor_ckpt', None) or os.path.join(tdir, 'compressor', name, 'best.ckpt')
+    if config.target_fs is None:
+      config.target_fs = float((_cfg.get('audio', {}) or {}).get('fs', 44100))
+    if config.output_path is None:
+      config.output_path = os.path.join('models', f'{name}.ts')
+    print(f"[config={config.config}] kind={config.prior_kind} model_dir={config.model_directory} "
+          f"prior_dir={config.prior_directory} compressor={config.compressor_checkpoint} "
+          f"target_fs={config.target_fs} out={config.output_path}")
+
+  # Fallbacks / validation when running without --config.
+  if config.prior_kind is None:
+    config.prior_kind = 'mulaw'
+  if config.target_fs is None:
+    config.target_fs = 16000.0
+  if config.model_directory is None:
+    parser.error('--model_directory is required when --config is not given')
+  if config.output_path is None:
+    parser.error('--output_path is required when --config is not given')
 
   cc.use_cached_conv(config.streaming)
 
