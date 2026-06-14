@@ -348,14 +348,17 @@ def _train_discrete(cfg: DictConfig, control_space, synth_configs, in_memory: bo
   else:
     print("Force restart requested; starting from scratch.")
 
+  _max_steps = int(os.environ.get('PRIOR_MAX_STEPS', '-1'))
   trainer = L.Trainer(
     max_epochs=cfg.prior.training.get('max_epochs', 10),
+    max_steps=_max_steps,
     accelerator='gpu' if device == 'cuda' else 'cpu',
     devices=1,
     log_every_n_steps=10,
     callbacks=callbacks,
     logger=logger,
     default_root_dir=output_dir,
+    enable_progress_bar=(os.environ.get('PRIOR_NO_PBAR', '0') != '1'),
   )
 
   trainer.fit(model, train_dl, val_dl, ckpt_path=ckpt_path)

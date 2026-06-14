@@ -135,6 +135,7 @@ def main(cfg: DictConfig) -> None:
     max_epochs=int(cfg.trainer.max_epochs),
     log_every_n_steps=int(cfg.trainer.log_every_n_steps),
     logger=tb_logger,
+    enable_progress_bar=(os.environ.get('SYNTH_NO_PBAR', '0') != '1'),
   )
 
   # Resume checkpoint
