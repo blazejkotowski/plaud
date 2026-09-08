@@ -75,6 +75,22 @@ from ddsp.losses import MultiScaleSlicedWassersteinLoss
 from ddsp.interfaces import ControlSpace
 
 
+def _as_channels_last_mono(pred: torch.Tensor, target: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+  """Align lengths and fold the channel axis into the batch, so losses see mono [B*N, 1, T]."""
+  if pred.dim() == 2:
+    pred = pred.unsqueeze(1)
+  if target.dim() == 2:
+    target = target.unsqueeze(1)
+  if pred.shape[-1] != target.shape[-1]:
+    min_length = min(pred.shape[-1], target.shape[-1])
+    pred = pred[..., :min_length]
+    target = target[..., :min_length]
+  pred = pred.reshape(pred.shape[0] * pred.shape[1], 1, pred.shape[-1])
+  target = target.reshape(target.shape[0] * target.shape[1], 1, target.shape[-1])
+  return pred, target
+
+
+
 class DDSP(L.LightningModule):
   """
   A neural network that learns how to resynthesise signal, predicting amplitudes of
@@ -810,60 +826,44 @@ class DDSP(L.LightningModule):
     return mixed.reshape(B, N, mixed.shape[-1])
 
 
-  def _reconstruction_loss(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-    """Computes reconstruction as weighted sum of configured losses."""
-    # Ensure [B,1,T] and aligned lengths
-    if y.dim() == 2:
-      y = y.unsqueeze(1)
-    if x.dim() == 2:
-      x = x.unsqueeze(1)
-    if x.shape[-1] != y.shape[-1]:
-      min_length = min(x.shape[-1], y.shape[-1])
-      x = x[..., :min_length]
-      y = y[..., :min_length]
-    # Fold channels into the batch so each loss sees mono [B*N, 1, T] (per-channel averaged).
-    x = x.reshape(x.shape[0] * x.shape[1], 1, x.shape[-1])
-    y = y.reshape(y.shape[0] * y.shape[1], 1, y.shape[-1])
+  def _reconstruction_loss(self, pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Computes reconstruction as weighted sum of configured losses.
+
+    Argument order matters. Every loss here follows auraloss' `(input, target)` convention, and
+    auraloss' spectral convergence is ||target - input||_F / ||target||_F -- it normalises by its
+    SECOND argument. Passing them the other way round normalises by the prediction, which makes
+    SC(a * target) = |1 - a| / a: being twice too loud costs 0.5, being half as loud costs 1.0.
+    That asymmetry silently biased every model here towards excessive output level.
+    """
+    pred, target = _as_channels_last_mono(pred, target)
 
     total = 0.0
     # Each loss function may expect shapes [B,1,T] or [B,T]; try both
     for loss_fn, w in self._loss_items:
       try:
-        val = loss_fn(y, x)
+        val = loss_fn(pred, target)
       except Exception:
-        val = loss_fn(y.squeeze(1), x.squeeze(1))
+        val = loss_fn(pred.squeeze(1), target.squeeze(1))
       total = total + (w * val)
     return total
 
-  def _loss_component_values(self, y: torch.Tensor, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+  def _loss_component_values(self, pred: torch.Tensor, target: torch.Tensor) -> Dict[str, torch.Tensor]:
     """Compute individual reconstruction loss component values without weighting.
     Returns a dict mapping component name -> value.
     """
-    # Ensure [B,1,T] and aligned lengths
-    if y.dim() == 2:
-      y = y.unsqueeze(1)
-    if x.dim() == 2:
-      x = x.unsqueeze(1)
-    if x.shape[-1] != y.shape[-1]:
-      min_length = min(x.shape[-1], y.shape[-1])
-      x = x[..., :min_length]
-      y = y[..., :min_length]
-    # Fold channels into the batch so each loss sees mono [B*N, 1, T] (per-channel averaged).
-    x = x.reshape(x.shape[0] * x.shape[1], 1, x.shape[-1])
-    y = y.reshape(y.shape[0] * y.shape[1], 1, y.shape[-1])
+    pred, target = _as_channels_last_mono(pred, target)
 
     comps: Dict[str, torch.Tensor] = {}
     for loss_fn, _w in self._loss_items:
       name = loss_fn.__class__.__name__
-      val = loss_fn(y, x)
-      comps[name] = val
+      comps[name] = loss_fn(pred, target)
     return comps
 
-  def _log_loss_components(self, y: torch.Tensor, x: torch.Tensor, split: str = 'train') -> None:
+  def _log_loss_components(self, pred: torch.Tensor, target: torch.Tensor, split: str = 'train') -> None:
     """Log individual reconstruction loss components for better visibility.
     split: 'train' logs on_step+on_epoch; 'val' logs on_epoch only.
     """
-    comps = self._loss_component_values(y, x)
+    comps = self._loss_component_values(pred, target)
     for name, val in comps.items():
       if split == 'train':
         self.log(f"{split}/{name}", val, prog_bar=False, logger=True, on_step=True, on_epoch=True)
