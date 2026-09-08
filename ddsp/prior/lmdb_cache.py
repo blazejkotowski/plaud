@@ -495,14 +495,19 @@ def ensure_prior_tokens_lmdb(
                 feat, scale_factor=1 / rf, mode="linear", align_corners=False,
             ).squeeze(0).t()  # [T_ctl, F]
             if getattr(ddsp, "encoder", None) is not None:
-                mu, scale = encoder(a.unsqueeze(0))
-                if hasattr(encoder, "reparametrize"):
-                    z, _ = encoder.reparametrize(mu, scale)
-                elif hasattr(ddsp, "reparametrize"):
-                    z, _ = ddsp.reparametrize(mu, scale)
-                else:
-                    z = mu
-                z = ddsp._smooth_latents(z).squeeze(0).to(feat.device)
+                # Cache building needs no gradients. Without this the encoder builds an autograd
+                # graph over a whole 40 s sub-chunk; the Mel encoder collapses to the control rate
+                # immediately and survives it, but a conv encoder holds audio-rate activations and
+                # blows out 22 GB of VRAM.
+                with torch.no_grad():
+                    mu, scale = encoder(a.unsqueeze(0))
+                    if hasattr(encoder, "reparametrize"):
+                        z, _ = encoder.reparametrize(mu, scale)
+                    elif hasattr(ddsp, "reparametrize"):
+                        z, _ = ddsp.reparametrize(mu, scale)
+                    else:
+                        z = mu
+                    z = ddsp._smooth_latents(z).squeeze(0).to(feat.device)
             else:
                 Dz = int(getattr(ddsp, "latent_size", 0))
                 z = (torch.zeros(feat.size(0), Dz, device=feat.device, dtype=feat.dtype)
