@@ -1006,6 +1006,10 @@ if __name__ == '__main__':
                            'training/postnet/<name>/ when present; pass a path to override.')
   parser.add_argument('--no_postnet', dest='no_postnet', action='store_true', default=False,
                       help='Do not attach a post-net even if one exists under --config.')
+  parser.add_argument('--no_control_stats', dest='control_stats', action='store_false', default=True,
+                      help='Do not add the dataset feature statistics ("controls") to <output>.json. They let '
+                           'a host analyse new audio into the trained control space (see cli/control_stats.py). '
+                           'Needs --config; the .ts is not affected.')
   config = parser.parse_args()
 
   # Derive any unset options from the experiment config (explicit args win).
@@ -1213,3 +1217,11 @@ if __name__ == '__main__':
                        json_path=base + '.json', png_path=base + '_terrain.png', device=t_device)
       except Exception as e:
         print(f"terrain render skipped: {e}")
+
+    # Feature statistics for analysing new audio (written after the terrain, which rewrites the JSON).
+    if getattr(config, 'control_stats', True) and config.config is not None:
+      try:
+        from cli.control_stats import write_control_stats
+        write_control_stats(config.config, os.path.splitext(config.output_path)[0] + '.json')
+      except Exception as e:
+        print(f"control stats skipped: {e}")
