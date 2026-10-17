@@ -6,8 +6,8 @@ Training turns each feature into [0, 1] between its 5th and 95th percentile over
 dataset (LibrosaFeatureExtractor._calculate on AudioFeatureDataset's mono downmix). Those numbers are
 not stored in the .ts, so a new file can't be placed on the same scale. This recomputes them exactly
 the way training did, checks the result against the dataset's cached features, and writes them into
-the model's JSON sidecar under "controls" (other keys are kept). The .ts itself is not touched, so the
-model stays exactly as nn~ sees it. The latents come from the model's own encode() method.
+the model's JSON sidecar under "controls" (other keys are kept). cli.export also builds them into the .ts,
+whose encode() then returns decode()'s full input (features + latents) for any audio.
 
   python -m cli.control_stats --config configs/night0908/05_putxet.yaml --json models/night0908/putxet.json
 
@@ -121,10 +121,12 @@ def compute_control_stats(cfg, verify: bool = True) -> Dict[str, Any]:
   }
 
 
-def write_control_stats(config_path: str, json_path: str, verify: bool = True) -> Dict[str, Any]:
-  cfg = OmegaConf.load(config_path)
-  print(f"control stats for {cfg.experiment.name} ({cfg.data.dataset_path})")
-  stats = compute_control_stats(cfg, verify=verify)
+def write_control_stats(config_path: str, json_path: str, verify: bool = True, stats: Dict[str, Any] = None) -> Dict[str, Any]:
+  """Writes the "controls" section into `json_path`, computing it unless `stats` is given."""
+  if stats is None:
+    cfg = OmegaConf.load(config_path)
+    print(f"control stats for {cfg.experiment.name} ({cfg.data.dataset_path})")
+    stats = compute_control_stats(cfg, verify=verify)
   data = {}
   if os.path.exists(json_path):
     with open(json_path) as f:

@@ -33,13 +33,24 @@ class ScriptedDDSP(nn_tilde.Module):
   # output, blended by the runtime `postnet_mix` attribute (0 = raw synth, 1 = fully transformed).
   # Pruned entirely when the model is exported without a post-net.
   has_stage2: torch.jit.Final[bool]
+  # encode(): see _setup_encode
+  enc_ratio: torch.jit.Final[int]
+  enc_ctx: torch.jit.Final[int]
+  enc_frame: torch.jit.Final[int]
+  enc_latents: torch.jit.Final[int]
+  enc_features: torch.jit.Final[int]
+  enc_smooth: torch.jit.Final[int]
+  enc_delay: torch.jit.Final[int]
+  feat_smooth: torch.jit.Final[int]
+  has_feature_stats: torch.jit.Final[bool]
 
   def __init__(self,
                pretrained: DDSP,
                prior_model: torch.nn.Module = None,
                target_fs: float = 16000.0,
                stage2_postnet: torch.nn.Module = None,
-               register_encode: bool = True):
+               register_encode: bool = True,
+               control_stats: Optional[dict] = None):
     super().__init__()
 
     self.pretrained = pretrained
@@ -133,17 +144,21 @@ class ScriptedDDSP(nn_tilde.Module):
       test_method=True,
     )
 
+    feature_names = self._setup_encode(control_stats)
     if self.pretrained.latent_size > 0 and register_encode:
+      # encode() gives what decode() takes: the features, then the latents, one frame per decode frame
       self.register_method(
         "encode",
         in_channels = n_channels,
         in_ratio = 1,
-        out_channels = self.pretrained.num_params,
-        out_ratio = self.pretrained.resampling_factor,
+        out_channels = total_params,
+        out_ratio = self._nn_decode_ratio,
         input_labels=[f'(signal) Audio Input {i}' for i in range(1, n_channels+1)],
-        output_labels=[f'(signal) Latent Dimension {i}' for i in range(1, self.pretrained.num_params+1)],
+        output_labels=[f'(signal) {name}' for name in feature_names]
+                      + [f'(signal) Latent Dimension {i}' for i in range(1, self.pretrained.num_params+1)],
         test_method=True
       )
+      self.reset_encoder()   # the registration's test call ran through the stream state
 
     if not isinstance(self.prior_model, FakePrior):
       if isinstance(self.prior_model, PriorDiscreteWrapper):
@@ -223,19 +238,180 @@ class ScriptedDDSP(nn_tilde.Module):
     return audio.float()
 
 
+  def _setup_encode(self, control_stats: Optional[dict]):
+    """
+    State and constants for encode(). It returns decode()'s input for the audio: the feature controls
+    as training computed them (librosa rms / spectral_centroid frames, scaled between the dataset's
+    5th and 95th percentile from cli/control_stats.py) and the latents as the decoder was trained on
+    them (encoder mu, causally smoothed like DDSP._smooth_latents; the sampling noise is left out).
+
+    nn~ calls it one buffer at a time, so with batch 1 it streams: the GRU state, the smoothing
+    history and a little audio context carry over between calls, and consecutive buffers give the
+    same result as one long call. A stream can't look ahead, so each feature comes from the analysis
+    window ending at its frame, which training places (frame_length - hop / 2) samples earlier; the
+    latents are delayed by the same amount (enc_delay frames, 14 at 2048 / 512 / 128) so features
+    and latents line up as in training. Without that, decode(encode(x)) loses most of its envelope
+    (correlation with the input 0.62 instead of 0.94 on putxet). Returns the feature names (for
+    the nn~ outlet labels).
+    """
+    enc = self.pretrained.encoder
+    ratio = int(self.pretrained.resampling_factor)
+    n_features = int(self.pretrained.n_features)
+    latents = int(self.pretrained.latent_size)
+    feats = list((control_stats or {}).get('features', []))
+    if enc is not None and len(feats) != n_features:
+      if n_features > 0:
+        print(f"encode(): no dataset feature statistics for {n_features} features: its feature outputs are zero")
+      feats = []
+    for f in feats:
+      if f['function'] not in ('rms', 'spectral_centroid'):
+        raise ValueError(f"encode(): feature function {f['function']} is not supported")
+    def frame_length(f):
+      d = f.get('librosa_defaults', {})
+      return int(d.get('frame_length', d.get('n_fft', 2048)))
+    lengths = {frame_length(f) for f in feats} or {2048}
+    if len(lengths) != 1:
+      raise ValueError("encode(): the features must share one frame length")
+    frame = lengths.pop()
+    smooth = {max(1, int(round(int(f.get('smoothing_kernel_size', 1)) / ratio))) for f in feats} or {1}
+
+    self.enc_ratio = ratio
+    self.enc_frame = frame
+    self.enc_ctx = int(math.ceil(max(frame, 512) / ratio)) * ratio
+    self.enc_latents = latents
+    self.enc_features = n_features
+    k = int(getattr(self.pretrained, '_latent_smoothing_kernel', 1))
+    self.enc_smooth = (k + 1 if k % 2 == 0 else k) if k > 1 else 1   # as _smooth_latents
+    self.feat_smooth = max(smooth)
+    self.has_feature_stats = len(feats) > 0
+    hop = int(feats[0].get('librosa_defaults', {}).get('hop_length', 512)) if feats else 512
+    self.enc_delay = int(round((frame - hop / 2) / ratio)) if feats else 0
+
+    hidden = enc._hidden_state if enc is not None else torch.zeros(1, 1, 1)
+    self.register_buffer('_enc_audio', torch.zeros(1, self.enc_ctx), persistent=False)
+    self.register_buffer('_enc_hidden', torch.zeros_like(hidden), persistent=False)
+    self.register_buffer('_enc_hist', torch.zeros(1, max(1, self.enc_smooth - 1), max(1, latents)), persistent=False)
+    self.register_buffer('_feat_hist', torch.zeros(1, max(1, n_features), max(1, self.feat_smooth - 1)), persistent=False)
+    self.register_buffer('_lat_delay', torch.zeros(1, max(1, latents), max(1, self.enc_delay)), persistent=False)
+    self.register_buffer('_enc_window', torch.hann_window(frame, periodic=True), persistent=False)
+    sr = float(feats[0].get('librosa_defaults', {}).get('sr', 22050.0)) if feats else 22050.0
+    for f in feats:
+      if f['function'] == 'spectral_centroid':
+        sr = float(f.get('librosa_defaults', {}).get('sr', 22050.0))
+    self.register_buffer('_enc_freqs', torch.arange(frame // 2 + 1, dtype=torch.float32) * sr / frame, persistent=False)
+
+    def column(key, default, dtype=torch.float32):
+      return torch.tensor([f.get(key, default) for f in feats] or [default], dtype=dtype)
+    self.register_buffer('_feat_kind', torch.tensor([0 if f['function'] == 'rms' else 1 for f in feats] or [0], dtype=torch.long), persistent=False)
+    self.register_buffer('_feat_lo', column('lo', 0.0), persistent=False)
+    self.register_buffer('_feat_hi', column('hi', 1.0), persistent=False)
+    norm_kind, norm_a, norm_b = [], [], []
+    for f in feats:
+      n = f.get('normalization') or {}
+      if 'mean' in n and 'std' in n:
+        norm_kind.append(1); norm_a.append(float(n['mean'])); norm_b.append(float(n['std']))
+      elif 'min' in n and 'max' in n:
+        norm_kind.append(2); norm_a.append(float(n['min'])); norm_b.append(float(n['max']))
+      else:
+        norm_kind.append(0); norm_a.append(0.0); norm_b.append(1.0)
+    self.register_buffer('_feat_norm', torch.tensor(norm_kind or [0], dtype=torch.long), persistent=False)
+    self.register_buffer('_feat_a', torch.tensor(norm_a or [0.0]), persistent=False)
+    self.register_buffer('_feat_b', torch.tensor(norm_b or [1.0]), persistent=False)
+    return [f['name'].capitalize() for f in feats] or [f'Feature {i}' for i in range(1, n_features + 1)]
+
+  @torch.jit.export
+  def reset_encoder(self):
+    """Starts encode()'s stream from silence."""
+    self._enc_audio.zero_()
+    self._enc_hidden.zero_()
+    self._enc_hist.zero_()
+    self._feat_hist.zero_()
+    self._lat_delay.zero_()
+
   @torch.jit.export
   def encode(self, audio: torch.Tensor):
     if self.pretrained.encoder is None:
       raise RuntimeError("encode() requested but the pretrained model has no encoder (latent_size=0)")
-    # Encoder downmixes the [B, n_channels, T] input internally
-    mu, scale = self.pretrained.encoder(audio)
-    latents, _ = self.pretrained.encoder.reparametrize(mu, scale)
-    latents = self.pretrained._smooth_latents(latents)
-    latents = self.pretrained.normalize_latents(latents)
-    latents = self.pretrained.latents_to_params(latents)
-    latents = latents.permute(0, 2, 1).float()
+    else:
+      # only compiled when the encoder is there (so --no_encode exports contain no stft / fft)
+      return self._encode(audio)
 
-    return latents
+  def _encode(self, audio: torch.Tensor) -> torch.Tensor:
+    enc = self.pretrained.encoder
+    # one signal, as in training (channels summed), at the model's rate
+    x = audio.sum(1) if audio.dim() == 3 else audio
+    if self.resample_ratio != 1.0:
+      x = F.interpolate(x.unsqueeze(1), scale_factor=1.0 / self.resample_ratio, mode='linear').squeeze(1)
+    R = self.enc_ratio
+    n = (x.shape[-1] // R) * R
+    x = x[:, :n]
+    B = x.shape[0]
+    frames = n // R
+    stream = B == 1
+    ctx = self._enc_audio if stream else torch.zeros(B, self.enc_ctx, dtype=x.dtype, device=x.device)
+    xa = torch.cat([ctx, x], -1)
+    if stream:
+      self._enc_audio.copy_(xa[:, xa.shape[-1] - self.enc_ctx:])
+
+    # latents: the encoder's steps (as VariationalEncoder.forward), with the context frames dropped
+    # before the GRU, whose state this module keeps
+    mel = enc.melspec(xa)
+    mel = F.interpolate(mel, size=xa.shape[-1], mode='nearest')
+    z = F.interpolate(mel, scale_factor=1.0 / R, mode='linear').permute(0, 2, 1)
+    z = z[:, self.enc_ctx // R:, :]
+    z = enc.normalization(z)
+    h = self._enc_hidden if stream else torch.zeros(self._enc_hidden.shape[0], B, self._enc_hidden.shape[2], dtype=z.dtype, device=z.device)
+    z, hn = enc.gru(z, h)
+    if stream:
+      self._enc_hidden.copy_(hn)
+    z = enc.mu_logvar_out(enc.bottleneck(z))
+    mu = z[:, :, :self.enc_latents]   # [B, frames, latents]
+    K = self.enc_smooth
+    if K > 1:
+      hist = self._enc_hist if stream else torch.zeros(B, K - 1, self.enc_latents, dtype=mu.dtype, device=mu.device)
+      full = torch.cat([hist, mu], 1)
+      if stream:
+        self._enc_hist.copy_(full[:, full.shape[1] - (K - 1):, :])
+      c = torch.cumsum(F.pad(full, [0, 0, 1, 0]), 1)
+      mu = (c[:, K:, :] - c[:, :c.shape[1] - K, :]) / K
+
+    # features: the analysis window ending at each frame
+    feats = torch.zeros(B, self.enc_features, frames, dtype=x.dtype, device=x.device)
+    if self.has_feature_stats:
+      win = xa[:, self.enc_ctx + R - self.enc_frame:].unfold(-1, self.enc_frame, R)   # [B, frames, frame]
+      rms = torch.sqrt((win * win).mean(-1))
+      spec = torch.abs(torch.fft.rfft(win * self._enc_window, dim=-1))
+      total = spec.sum(-1)
+      centroid = torch.where(total > 1e-30, (spec * self._enc_freqs).sum(-1) / torch.clamp(total, min=1e-30), torch.zeros_like(total))
+      for i in range(self.enc_features):
+        raw = rms if int(self._feat_kind[i]) == 0 else centroid
+        lo = self._feat_lo[i]
+        hi = self._feat_hi[i]
+        feats[:, i, :] = (torch.minimum(torch.maximum(raw, lo), hi) - lo) / (hi - lo + 1e-8)
+      S = self.feat_smooth
+      if S > 1:
+        hist = self._feat_hist if stream else torch.zeros(B, self.enc_features, S - 1, dtype=x.dtype, device=x.device)
+        full = torch.cat([hist, feats], 2)
+        if stream:
+          self._feat_hist.copy_(full[:, :, full.shape[2] - (S - 1):])
+        c = torch.cumsum(F.pad(full, [1, 0]), 2)
+        feats = (c[:, :, S:] - c[:, :, :c.shape[2] - S]) / S
+      for i in range(self.enc_features):
+        kind = int(self._feat_norm[i])
+        if kind == 1:
+          feats[:, i, :] = (feats[:, i, :] - self._feat_a[i]) / (self._feat_b[i] + 1e-8)
+        elif kind == 2:
+          feats[:, i, :] = (feats[:, i, :] - self._feat_a[i]) / (self._feat_b[i] - self._feat_a[i] + 1e-8)
+
+    lat = mu.permute(0, 2, 1)   # [B, latents, frames]
+    D = self.enc_delay
+    if D > 0:
+      past = self._lat_delay if stream else torch.zeros(B, self.enc_latents, D, dtype=lat.dtype, device=lat.device)
+      full = torch.cat([past, lat], 2)
+      if stream:
+        self._lat_delay.copy_(full[:, :, full.shape[2] - D:])
+      lat = full[:, :, :frames]
+    return torch.cat([feats, lat], 1).float()
 
   # @torch.jit.export
   # def forward(self, audio: torch.Tensor):
@@ -1007,9 +1183,9 @@ if __name__ == '__main__':
   parser.add_argument('--no_postnet', dest='no_postnet', action='store_true', default=False,
                       help='Do not attach a post-net even if one exists under --config.')
   parser.add_argument('--no_control_stats', dest='control_stats', action='store_false', default=True,
-                      help='Do not add the dataset feature statistics ("controls") to <output>.json. They let '
-                           'a host analyse new audio into the trained control space (see cli/control_stats.py). '
-                           'Needs --config; the .ts is not affected.')
+                      help='Skip the dataset feature statistics: no "controls" in <output>.json, and encode() '
+                           'outputs zero features. They let encode() and hosts put new audio into the trained '
+                           'control space (see cli/control_stats.py). Needs --config.')
   config = parser.parse_args()
 
   # Derive any unset options from the experiment config (explicit args win).
@@ -1190,8 +1366,18 @@ if __name__ == '__main__':
       stage2.eval()
       print(f"faithful post-net loaded: {config.postnet}")
 
+    # the dataset's feature levels, for encode() (and the JSON below)
+    control_stats = None
+    if config.register_encode and getattr(config, 'control_stats', True) and config.config is not None:
+      try:
+        from omegaconf import OmegaConf
+        from cli.control_stats import compute_control_stats
+        control_stats = compute_control_stats(OmegaConf.load(cfg_path))
+      except Exception as e:
+        print(f"control stats unavailable ({e}): encode() will output zero features")
+
     scripted = ScriptedDDSP(ddsp, prior, config.target_fs, stage2_postnet=stage2,
-                            register_encode=config.register_encode).to('cpu')
+                            register_encode=config.register_encode, control_stats=control_stats).to('cpu')
     # Registering/scripting the nn~ methods can advance the discrete-prior wrapper's
     # token buffer with junk; clear it so the saved model starts from a clean START.
     if isinstance(prior, PriorDiscreteWrapper):
@@ -1222,6 +1408,6 @@ if __name__ == '__main__':
     if getattr(config, 'control_stats', True) and config.config is not None:
       try:
         from cli.control_stats import write_control_stats
-        write_control_stats(config.config, os.path.splitext(config.output_path)[0] + '.json')
+        write_control_stats(cfg_path, os.path.splitext(config.output_path)[0] + '.json', stats=control_stats)
       except Exception as e:
         print(f"control stats skipped: {e}")
