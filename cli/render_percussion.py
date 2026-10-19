@@ -35,10 +35,10 @@ KITS = {
         "snare": [(S + "Snare Drum, Modern 1", "Hit"), (S + "Snare Drum, Modern 2", "Hit"), (S + "Snare Drum, Modern 3", "Hit"),
                   (S + "Snare Drum, Rope Tension", "")],
         "ghost": [(S + "Snare Drum, Modern 1", "Hit"), (S + "Snare Drum, Modern 2", "Hit")],
-        "hat": [(I + "Hi-Hat Cymbal", "Close|HitC")],
-        "open": [(I + "Hi-Hat Cymbal", "Open|HitO")],
-        "tom": [(S + "Tom 1", ""), (S + "Tom 2", "")],
-        "crash": [(I + "Suspended Cymbal 1", ""), (I + "Suspended Cymbal 2", ""), (I + "Clash Cymbals 1", "")],
+        "hat": [(I + "Hi-Hat Cymbal", "HitC|Close")],
+        "open": [(I + "Hi-Hat Cymbal", "HitO|Loose")],
+        "tom": [(S + "Tom 1", "Hit"), (S + "Tom 2", "Hit")],
+        "crash": [(I + "Suspended Cymbal 1", "hit"), (I + "Suspended Cymbal 2", "hit"), (I + "Clash Cymbals 1", "crash")],
     },
     "hands": {
         "kick": [(S + "Frame Drum", "Hit|Hand"), (I + "Cajon", "Bass|Low|Hit")],
@@ -54,7 +54,7 @@ KITS = {
         "snare": [(I + "Anvil", ""), (I + "Brake Drum", "")],
         "ghost": [(I + "Cowbells", ""), (I + "Agogo Bells", "")],
         "hat": [(I + "Triangles", ""), (I + "Finger Cymbals", ""), (I + "Sleigh Bells", "")],
-        "open": [(I + "Ratchet", ""), (I + "Vibraslap", "")],
+        "open": [(I + "Finger Cymbals", ""), (I + "Hand Bells, Nepalese", "")],
         "tom": [(I + "Slit Drum", ""), (I + "Brake Drum", "")],
         "crash": [(I + "Gong 1", ""), (I + "Gong 2", "")],
     },
@@ -85,11 +85,18 @@ STYLES = {
 }
 
 
+# articulations that are not single strikes (swells, rolls, bowing, scrapes, shakes)
+NOT_A_HIT = re.compile(r"bow|cresc|roll|scrape|crank|slow|fast|swell|trem|shake|taps|rub|gliss|buzz", re.I)
+DYNAMICS = {"ppp": 1, "pp": 2, "p": 3, "mp": 4, "mf": 5, "f": 6, "ff": 7, "fff": 8}
+MAX_S = dict(kick=1.2, snare=0.9, ghost=0.4, hat=0.3, open=0.9, tom=1.1, crash=2.5)
+
+
 class Instrument:
   """One VCSL instrument folder: its samples by velocity layer, one microphone."""
 
   def __init__(self, folder: str, art: str):
     files = sorted(glob.glob(os.path.join(folder, "**", "*.wav"), recursive=True))
+    files = [f for f in files if not NOT_A_HIT.search(os.path.basename(f))]
     if art:
       matching = [f for f in files if re.search(art, os.path.basename(f), re.I)]
       files = matching or files
@@ -103,8 +110,11 @@ class Instrument:
     files = mics[pref[0]] if pref else max(mics.values(), key=len)
     self.layers = {}
     for f in files:
-      v = re.search(r"_v(\d+)", os.path.basename(f))
-      self.layers.setdefault(int(v.group(1)) if v else 1, []).append(f)
+      base = os.path.basename(f)
+      v = re.search(r"_v(\d+)", base)
+      d = re.search(r"_(ppp|pp|p|mp|mf|f|ff|fff)\d*(?:_|\.wav)", base)
+      level = int(v.group(1)) if v else DYNAMICS[d.group(1)] if d else 1
+      self.layers.setdefault(level, []).append(f)
     self.keys = sorted(self.layers)
     self.cache = {}
     if not self.keys:
@@ -186,6 +196,10 @@ def render_take(kit: dict, style: str, seconds: float, rng, field: bool) -> tupl
           continue
         vel = np.clip(intensity * (0.55 if role == "ghost" else 1.0) * rng.uniform(0.75, 1.0), 0.05, 1.0)
         x = voices[role].sample(vel, rng)
+        n = int(MAX_S[role] * FS)
+        if len(x) > n:   # cap the tail, with a 40 ms fade
+          x = x[:n].copy()
+          x[-1920:] *= np.linspace(1.0, 0.0, 1920)
         lag = rng.normal(0.0, 0.006) + (0.008 if role == "snare" else 0.0)    # laid-back snare
         i0 = max(0, int((t + lag) * FS))
         x = x[: len(out) - i0] * gains[role] * (0.4 + 0.6 * vel)
