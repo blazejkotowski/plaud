@@ -14,6 +14,7 @@ import json
 import os
 import re
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -22,10 +23,15 @@ UA = {"User-Agent": "Mozilla/5.0 (compatible; plaud-dataset-builder/1.0; github.
 AUDIO = re.compile(r'href="(https://opengameart\.org/sites/default/files/[^"]+\.(?:ogg|mp3|wav|flac))"', re.I)
 
 
-def fetch(url: str, delay: float) -> str:
-  time.sleep(delay)
-  with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
-    return r.read().decode("utf-8", "replace")
+def fetch(url: str, delay: float, tries: int = 5) -> str:
+  for k in range(tries):
+    time.sleep(delay * (2 ** k))
+    try:
+      with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=60) as r:
+        return r.read().decode("utf-8", "replace")
+    except (urllib.error.URLError, ConnectionError, TimeoutError):
+      if k == tries - 1:
+        raise
 
 
 def search(keyword: str, delay: float, max_pages: int) -> list:
