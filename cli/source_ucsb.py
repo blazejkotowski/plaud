@@ -115,7 +115,7 @@ def main():
         if not re.fullmatch(r"\d{4}", year) or int(year) > args.max_year:
           skipped_year += 1
           continue
-        text = " ".join(take["performers"] + take["subjects"] + [take["title"]])
+        text = " ".join(take["performers"] + take["subjects"] + take["notes"] + [take["title"]])
         voice = SOLO if args.allow_choir else VOICE
         if args.instrumental and (voice.search(text) or VOICE_BASS.search(" ".join(take["performers"]))):
           skipped_voice += 1
