@@ -42,7 +42,8 @@ def load_mono(path: str) -> np.ndarray:
   return librosa.resample(x, orig_sr=sr, target_sr=FS) if sr != FS else x
 
 
-def normalise(x: np.ndarray, rms_db: float = -20.0) -> np.ndarray:
+# -26 dBFS RMS puts factory models near the night0908 models' output level (-20 made jukebox_jazz ~6.5 dB hotter)
+def normalise(x: np.ndarray, rms_db: float = -26.0) -> np.ndarray:
   x = x - x.mean()
   rms = np.sqrt(np.mean(x ** 2)) + 1e-9
   x = x * (10 ** (rms_db / 20) / rms)
@@ -120,7 +121,8 @@ def write_set(out: str, chosen: list, minutes: float):
 def main():
   ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   ap.add_argument("--root", required=True)
-  ap.add_argument("--set", required=True, choices=["jukebox_jazz", "wax_percussion", "magnetosphere", "drone", "drone_ambient"])
+  ap.add_argument("--set", required=True, choices=["jukebox_jazz", "wax_percussion", "magnetosphere", "drone", "drone_ambient",
+                                                   "underground", "harbour", "machine_halls", "contact_structure"])
   ap.add_argument("--minutes", type=float, default=75.0)
   ap.add_argument("--seed", type=int, default=0)
   args = ap.parse_args()
@@ -166,6 +168,9 @@ def main():
           ordered.append(by_day[d].pop(0))
     write_set(out, ordered, args.minutes)
 
+  elif args.set in ("underground", "harbour", "machine_halls", "contact_structure"):
+    build_freesound(raw, args.set, out, args.minutes)
+
   elif args.set == "drone_ambient":
     build_drone_ambient(raw, out, args.minutes)
 
@@ -185,6 +190,33 @@ def main():
       scored.append(it)
     scored.sort(key=lambda it: it["score"])          # fewest attacks first
     write_set(out, scored, args.minutes)
+
+
+def build_freesound(raw: str, theme: str, out: str, minutes: float, max_s: float = 300.0):
+  """The Freesound originals picked for a theme (cli/source_freesound.py download): the middle max_s seconds of each."""
+  items = []
+  folder = os.path.join(raw, "freesound", theme)
+  for line in open(os.path.join(folder, "downloaded.jsonl")):
+    it = json.loads(line)
+    path = os.path.join(folder, it["file"])
+    try:
+      x = load_mono(path) if path.endswith(".mp3") else load_any(path)
+    except Exception as e:
+      print(f"  skipped {it['id']}: {e}")
+      continue
+    if len(x) > max_s * FS:
+      a = (len(x) - int(max_s * FS)) // 2
+      x = x[a:a + int(max_s * FS)]
+    items.append(dict(path=f"{path.rsplit('.', 1)[0]}.wav", audio=x, title=it["name"], url=it["url"], credit=it["credit"],
+                      licence=it["licence"]))
+  write_set(out, items, minutes)
+
+
+def load_any(path: str) -> np.ndarray:
+  """Any format ffmpeg reads (wav, flac, aiff, ogg, m4a...), mono at 48 kHz."""
+  raw = subprocess.run(["ffmpeg", "-v", "quiet", "-i", path, "-f", "f32le", "-ac", "1", "-ar", str(FS), "-"],
+                       capture_output=True, check=True).stdout
+  return np.frombuffer(raw, dtype=np.float32).copy()
 
 
 def build_drone_ambient(raw: str, out: str, minutes: float, per_author: int = 6):
