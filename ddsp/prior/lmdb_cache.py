@@ -363,6 +363,7 @@ def _create_tokens_cache_key(
     cond_smooth_frames: int = 64,
     terr_rich: bool = False,
     terr_by_track: bool = False,
+    group_short_files_s: float = 0.0,
 ) -> str:
     ckpt_sig = os.stat(ddsp_checkpoint_path)
     ddsp_sig = f"{ddsp_checkpoint_path}:{int(ckpt_sig.st_mtime)}:{int(ckpt_sig.st_size)}"
@@ -372,6 +373,8 @@ def _create_tokens_cache_key(
         f"{dataset_path}_{n_signal}_{sampling_rate}_{resampling_factor}_{n_channels}_"
         f"tok{int(token_seq_len)}_{stride_factor}_bnd{int(bool(respect_boundaries))}_terr{int(num_territories)}_cond{int(bool(cond_envelope))}x{int(cond_smooth_frames)}_trich{int(bool(terr_rich))}_ttrack{int(bool(terr_by_track))}_{field_sig}_{ddsp_sig}_{comp_sig}"
     )
+    if group_short_files_s > 0:
+        key_string += f"_grp{float(group_short_files_s)}"   # only when set: older keys stay valid
     return hashlib.md5(key_string.encode()).hexdigest()[:8]
 
 
@@ -390,6 +393,7 @@ def ensure_prior_tokens_lmdb(
     cond_smooth_frames: int = 64,
     terr_rich: bool = False,
     terr_by_track: bool = False,
+    group_short_files_s: float = 0.0,
 ) -> dict[str, Any]:
     """Build token LMDB cache if missing.
 
@@ -525,9 +529,36 @@ def ensure_prior_tokens_lmdb(
     cond_dim = 0  # control dimension (captured from data when cond_envelope)
     txn = env.begin(write=True)
     window_track = []  # source segment/track index per window (for track-based territories)
+    def _units():
+        """Control sequences to window over, one per track. Normally one per segment (file). With
+        group_short_files_s, files are chained into tracks of at least that length: a collection of
+        short excerpts gets windows (a window is often longer than one excerpt) and the style
+        encoder still has tracks to tell apart. Files are ordered along the first principal axis
+        of their control statistics before chaining, so each track holds similar material."""
+        if not (group_short_files_s > 0 and len(segments) > 1):
+            for s0, s1 in segments:
+                yield _segment_controls(audio[:, s0:s1], features[s0:s1])
+            return
+        ctrls = [c for c in (_segment_controls(audio[:, s0:s1], features[s0:s1]) for s0, s1 in segments) if c is not None]
+        desc = torch.stack([torch.cat([c.mean(0), c.std(0)]) for c in ctrls])
+        desc = (desc - desc.mean(0)) / (desc.std(0) + 1e-6)
+        _, _, v = torch.pca_lowrank(desc, q=1, center=True)
+        order = torch.argsort((desc @ v[:, 0])).tolist()
+        min_frames = int(group_short_files_s * sr / rf)
+        track, length, n_tracks = [], 0, 0
+        for i in order:
+            track.append(ctrls[i])
+            length += ctrls[i].size(0)
+            if length >= min_frames:
+                yield torch.cat(track, 0)
+                track, length, n_tracks = [], 0, n_tracks + 1
+        if track:
+            yield torch.cat(track, 0)   # the remainder (may be too short for a window)
+            n_tracks += 1
+        print(f"[tokens] grouped {len(ctrls)} files into {n_tracks} tracks of >= {group_short_files_s:.0f} s")
+
     try:
-        for seg_idx, (s0, s1) in enumerate(segments):
-            controls = _segment_controls(audio[:, s0:s1], features[s0:s1])
+        for seg_idx, controls in enumerate(_units()):
             if controls is None:
                 continue
 
@@ -726,6 +757,8 @@ def build_or_load_prior_tokens_cache_from_cfg(
     if getattr(cfg.prior, "discrete", None) is not None and getattr(cfg.prior.discrete, "dataset", None) is not None:
         respect_boundaries = bool(getattr(cfg.prior.discrete.dataset, "respect_boundaries", respect_boundaries))
 
+    group_short_files_s = float(getattr(cfg.prior.dataset, "group_short_files_s", 0.0) or 0.0)
+
     num_territories = 0
     cond_envelope = False
     cond_smooth_frames = 64
@@ -761,6 +794,7 @@ def build_or_load_prior_tokens_cache_from_cfg(
         cond_smooth_frames=cond_smooth_frames,
         terr_rich=terr_rich,
         terr_by_track=terr_by_track,
+        group_short_files_s=group_short_files_s,
     )
     out_path = _default_tokens_cache_path(dataset_path, cache_key)
 
@@ -814,5 +848,6 @@ def build_or_load_prior_tokens_cache_from_cfg(
         cond_smooth_frames=cond_smooth_frames,
         terr_rich=terr_rich,
         terr_by_track=terr_by_track,
+        group_short_files_s=group_short_files_s,
     )
     return out_path, stats

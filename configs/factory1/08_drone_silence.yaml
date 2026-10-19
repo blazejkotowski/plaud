@@ -130,6 +130,7 @@ prior:
   dataset:
     stride_factor: 0.004
     respect_boundaries: true
+    group_short_files_s: 240   # short excerpts / pieces: chain similar files into >= 4 min tracks
     in_memory: true
 
   training:
