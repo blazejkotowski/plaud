@@ -28,7 +28,7 @@ import soundfile as sf
 FS = 48000
 VOICE = re.compile(r"\b(vocals?|vocalists?|tenor|baritone|soprano|contralto|mezzo-soprano|singers?|speakers?|"
                    r"recitation|reciter|monologue|talking|yodel(ing)?|whistl(ing|er)|duet|quartet|trio vocal|"
-                   r"sings?|singing|sung|lyrics?|words by)\b", re.I)
+                   r"sings?|singing|sung|lyrics?|words by|dialogues?|vaudeville|humor|comic|sketch(es)?)\b", re.I)
 CHOIR = re.compile(r"\b(choir|chorus|choral)\b", re.I)
 
 
