@@ -14,7 +14,6 @@ Each set goes to <root>/<name>/audio/*.wav (48 kHz mono, level-normalised) with 
 """
 
 import argparse
-import csv
 import glob
 import json
 import os
@@ -63,18 +62,16 @@ def percussive_share(x: np.ndarray) -> float:
 
 
 def citizen_items(pack: str) -> list:
-  """Excerpts of a Citizen DJ pack with their item's credits text."""
-  rows = list(csv.DictReader(open(os.path.join(pack, "excerpts.csv"))))
+  """Excerpts of a Citizen DJ pack (the files on disk; the CSV lists more) with their item's credits."""
   items = []
-  for r in rows:
-    name = r["clipFilename"]
-    item = name.rsplit("_", 2)[0]
+  for path in sorted(glob.glob(os.path.join(pack, "excerpts", "*.wav"))):
+    item = os.path.basename(path).rsplit("_", 2)[0]          # <title>_<item id>
     att = os.path.join(pack, "attributions", item + ".txt")
     text = open(att).read() if os.path.exists(att) else ""
-    contributors = next((l for l in text.splitlines() if l.startswith("Contributors:")), "")
-    credit = next((l for l in text.splitlines() if l.startswith("Contains samples of")), r["itemTitle"])
-    items.append(dict(path=os.path.join(pack, "excerpts", name), item=r["itemId"], title=r["itemTitle"],
-                      contributors=contributors, url=r["itemUrl"], credit=credit + " (Citizen DJ, Library of Congress)",
+    line = lambda key: next((l[len(key):].strip() for l in text.splitlines() if l.startswith(key)), "")
+    credit = next((l for l in text.splitlines() if l.startswith("Contains samples of")), item)
+    items.append(dict(path=path, item=item, title=line("Title:"), contributors=line("Contributors:"), url=line("URL:"),
+                      credit=credit + " (Citizen DJ, Library of Congress)",
                       licence="Public domain (Citizen DJ, Library of Congress)"))
   return items
 
