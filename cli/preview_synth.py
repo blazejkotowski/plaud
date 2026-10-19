@@ -73,8 +73,9 @@ def main():
                       recon_db=round(float(10 * torch.log10(recon.pow(2).mean() + 1e-12)), 1),
                       orig_db=round(float(10 * torch.log10(audio.pow(2).mean() + 1e-12)), 1)))
     specs.append({k: v.reshape(-1, v.shape[-1])[0].cpu().numpy() for k, v in outs.items()})
+  epoch = int(torch.load(ckpt, map_location="cpu", weights_only=False).get("epoch", -1)) + 1
   with open(os.path.join(args.out, "stats.json"), "w") as f:
-    json.dump(dict(checkpoint=ckpt, clips=stats), f, indent=1)
+    json.dump(dict(checkpoint=ckpt, epoch=epoch, clips=stats), f, indent=1)
 
   import matplotlib
   matplotlib.use("Agg")
