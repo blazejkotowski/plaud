@@ -93,6 +93,8 @@ class Instrument:
     if art:
       matching = [f for f in files if re.search(art, os.path.basename(f), re.I)]
       files = matching or files
+    if not files:
+      raise FileNotFoundError(folder)
     mics = {}
     for f in files:
       m = re.search(r"_([A-Za-z]+)\.wav$", f)
