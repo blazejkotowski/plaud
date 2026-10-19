@@ -1,4 +1,5 @@
 import lightning as L
+import math
 import torch
 import torch.nn.functional as F
 
@@ -147,6 +148,12 @@ class DDSP(L.LightningModule):
                adv_ndf: int = 4,
                adv_disc_update_every: int = 5,
                ddsp_min_lr: float = 0.0,
+               silence_enabled: bool = False,
+               silence_aug_prob: float = 0.3,
+               silence_ramp_s: Tuple[float, float] = (0.05, 0.2),
+               silence_reg_prob: float = 0.25,
+               silence_reg_weight: float = 1.0,
+               silence_floor_db: float = -70.0,
                config_name: str | None = None,
                device: str = 'cuda'):
     super().__init__()
@@ -186,6 +193,18 @@ class DDSP(L.LightningModule):
     self._adv_fm_weight = float(adv_fm_weight)
     self._adv_disc_update_every = max(1, int(adv_disc_update_every))
     self._ddsp_min_lr = float(ddsp_min_lr)
+    # Silence regularisation (optional, for percussive models): loudness 0 must decode to silence.
+    #  - gain envelopes: some chunks get smooth fades / gaps, applied to the audio AND multiplied
+    #    into the loudness feature, so the data itself pairs loudness 0 with silence;
+    #  - a hinge on the decoder's output level with loudness forced to 0 (latents kept), so
+    #    loudness alone is enough, whatever the latents carry.
+    self._silence_enabled = bool(silence_enabled)
+    self._silence_aug_prob = float(silence_aug_prob)
+    self._silence_ramp_s = (float(silence_ramp_s[0]), float(silence_ramp_s[1]))
+    self._silence_reg_prob = float(silence_reg_prob)
+    self._silence_reg_weight = float(silence_reg_weight)
+    self._silence_floor_db = float(silence_floor_db)
+    self._loudness_index = self._feature_index(control_space, 'loudness')
 
     # self.synths = synths
     # self.synths = torch.nn.ModuleList([builder() for builder in self._synth_builders])
@@ -461,6 +480,62 @@ class DDSP(L.LightningModule):
 
 
 
+  @staticmethod
+  def _feature_index(control_space: ControlSpace, name: str) -> int:
+    """Column of the named feature in the feature tensor, or -1."""
+    i = 0
+    for f in control_space.fields:
+      if f.source != "feature":
+        continue
+      if f.name == name:
+        return i
+      i += f.dim
+    return -1
+
+
+  def _silence_envelopes(self, x_audio: torch.Tensor, x_features: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Applies smooth gain envelopes (fade out, fade in or a gap, with cosine ramps) to a random part
+    of the batch: the audio and the loudness feature get the same envelope."""
+    B, T_ctl = x_features.shape[0], x_features.shape[1]
+    ctl_rate = self.fs / self.resampling_factor
+    g = torch.ones(B, T_ctl, device=x_features.device, dtype=x_features.dtype)
+    t = torch.arange(T_ctl, device=x_features.device, dtype=x_features.dtype)
+    any_env = False
+    for b in range(B):
+      if np.random.rand() >= self._silence_aug_prob:
+        continue
+      any_env = True
+      ramp = max(1.0, np.random.uniform(*self._silence_ramp_s) * ctl_rate)
+      kind = np.random.randint(3)              # 0 fade out, 1 fade in, 2 gap
+      a = np.random.uniform(0.1, 0.7) * T_ctl  # silence starts
+      e = np.random.uniform(a + ramp, T_ctl + ramp) if kind == 2 else T_ctl + ramp  # silence ends
+      if kind == 1:
+        a, e = -ramp, np.random.uniform(0.2, 0.8) * T_ctl
+      down = torch.clamp((t - a) / ramp, 0.0, 1.0)      # 0 -> 1 into the silence
+      up = torch.clamp((e - t) / ramp, 0.0, 1.0)        # 1 -> 0 out of it
+      inside = torch.minimum(down, up)
+      g[b] = 1.0 - 0.5 * (1.0 - torch.cos(np.pi * inside))
+    if not any_env:
+      return x_audio, x_features
+    g_audio = F.interpolate(g.unsqueeze(1), size=x_audio.shape[-1], mode='linear', align_corners=False)
+    x_audio = x_audio * (g_audio if x_audio.dim() == 3 else g_audio.squeeze(1))
+    x_features = x_features.clone()
+    x_features[..., self._loudness_index] = x_features[..., self._loudness_index] * g
+    return x_audio, x_features
+
+
+  def _silent_output_db(self, z: torch.Tensor, x_features: torch.Tensor) -> torch.Tensor:
+    """Decodes with loudness forced to 0 (latents and other features kept) and returns the
+    output level per 1024-sample frame in dBFS, [B, frames]."""
+    features = x_features.clone()
+    features[..., self._loudness_index] = 0.0
+    y = self._synthesize(self.decoder(features, z))
+    y = y.reshape(y.shape[0], -1, y.shape[-1])
+    frames = y.unfold(-1, 1024, 512)                    # [B, C, n, 1024]
+    power = frames.pow(2).mean(dim=(-1, 1))             # [B, n]
+    return 10.0 * torch.log10(power + 1e-12)
+
+
   def forward(self, audio: torch.Tensor, features: torch.Tensor) -> torch.Tensor:
     """
     Forward pass of the network.
@@ -519,8 +594,22 @@ class DDSP(L.LightningModule):
     opt_ddsp, opt_disc = self.optimizers()
     sched_ddsp, sched_disc = self.lr_schedulers()
 
+    silence_on = self._silence_enabled and self._loudness_index >= 0
+    if silence_on:
+      x_audio, x_features = self._silence_envelopes(x_audio, x_features)
+
     # Autoencode once
     y_audio, kld_loss = self._autoencode(x_audio, x_features)
+
+    # Silence regulariser: loudness 0 with this chunk's latents must decode to silence
+    silence_loss = torch.tensor(0.0, device=x_audio.device)
+    if silence_on and self._silence_reg_weight > 0.0:
+      B = x_features.shape[0]
+      k = max(1, int(math.ceil(B * self._silence_reg_prob)))
+      idx = torch.randperm(B, device=x_audio.device)[:k]
+      db = self._silent_output_db(self._last_z[idx].detach(), self._last_features[idx])
+      silence_loss = F.relu(db - self._silence_floor_db).mean() / 20.0
+      self.log("silence_db", db.mean().detach(), prog_bar=False, logger=True)
 
     # Match lengths if needed
     if y_audio.shape[-1] != x_audio.shape[-1]:
@@ -573,6 +662,7 @@ class DDSP(L.LightningModule):
     # Log individual loss components for visibility
     self._log_loss_components(y_audio.float(), x_audio.float(), split='train')
     ddsp_loss = recons_loss + self._KLD_WEIGHT * self._beta * kld_loss  # adv term added below if enabled
+    ddsp_loss = ddsp_loss + self._silence_reg_weight * silence_loss
 
     if self._adversarial_loss and self.current_epoch >= self._adv_g_start_epoch:
       self.toggle_optimizer(opt_ddsp)                 # freezes D params for this block
@@ -624,6 +714,8 @@ class DDSP(L.LightningModule):
     self.log("kld", kld_loss, prog_bar=True, logger=True)
     self.log("beta", self._beta, prog_bar=True, logger=True)
     self.log("recons_loss", recons_loss, prog_bar=True, logger=True)
+    if silence_on:
+      self.log("silence_loss", silence_loss, prog_bar=True, logger=True)
     self.log("ddsp_loss", ddsp_loss, prog_bar=True, logger=True)
     # Also expose a canonical 'loss' for dashboards/alerting
     self.log("loss", ddsp_loss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
@@ -641,6 +733,12 @@ class DDSP(L.LightningModule):
     self._log_loss_components(y_audio.float(), x_audio.float(), split='val')
 
     self.log("val_loss", val_loss, prog_bar=True, logger=True)
+
+    # Output level with loudness at 0 (latents kept), for every model, so runs can be compared
+    if self._loudness_index >= 0:
+      with torch.no_grad():
+        db = self._silent_output_db(self._last_z, self._last_features)
+      self.log("val_silence_db", db.mean(), prog_bar=False, logger=True)
 
     # if self._last_validation_in is None:
     #   self._last_validation_in = x_audio
@@ -742,6 +840,7 @@ class DDSP(L.LightningModule):
     # When feature_dim==0, create a dummy single-channel zero feature for decoder path
     x_features_for_decoder = x_features if self.feature_dim > 0 else torch.zeros(x_features.shape[0], x_features.shape[1], 1, device=x_features.device, dtype=x_features.dtype)
     synth_params = self.decoder(x_features_for_decoder, z)
+    self._last_z, self._last_features = z, x_features_for_decoder   # for the silence terms
 
     # Synthesize the output signal
     y_audio = self._synthesize(synth_params)

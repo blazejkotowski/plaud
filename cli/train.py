@@ -30,6 +30,21 @@ from omegaconf import DictConfig
 from hydra.core.hydra_config import HydraConfig
 
 
+def _silence_kwargs(scfg) -> dict:
+  """The optional `silence:` block (percussive models): loudness 0 must decode to silence."""
+  if scfg is None:
+    return {}
+  ramp = list(scfg.get('ramp_s', [0.05, 0.2]))
+  return dict(
+    silence_enabled=bool(scfg.get('enabled', False)),
+    silence_aug_prob=float(scfg.get('envelope_prob', 0.3)),
+    silence_ramp_s=(float(ramp[0]), float(ramp[1])),
+    silence_reg_prob=float(scfg.get('reg_prob', 0.25)),
+    silence_reg_weight=float(scfg.get('reg_weight', 1.0)),
+    silence_floor_db=float(scfg.get('floor_db', -70.0)),
+  )
+
+
 @hydra.main(version_base=None, config_path="../configs", config_name="experiment")
 def main(cfg: DictConfig) -> None:
   # Set default device/tensor type only during CLI execution
@@ -120,6 +135,7 @@ def main(cfg: DictConfig) -> None:
     adv_ndf=int(getattr(cfg.adversarial, 'ndf', 4)),
     adv_disc_update_every=int(getattr(cfg.adversarial, 'disc_update_every', 5)),
     ddsp_min_lr=float(getattr(cfg.model, 'min_lr', 0.0)),
+    **_silence_kwargs(getattr(cfg, 'silence', None)),
     config_name=active_config_name,
   )
 
