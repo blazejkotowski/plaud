@@ -62,7 +62,11 @@ def main():
 
   nodes = []
   for k in args.keyword:
-    found = search(k, args.delay, args.max_pages)
+    try:
+      found = search(k, args.delay, args.max_pages)
+    except Exception as e:
+      print(f"{k}: search failed ({e})", flush=True)
+      continue
     print(f"{k}: {len(found)} results", flush=True)
     nodes += [n for n in found if n not in nodes]
 
@@ -72,7 +76,11 @@ def main():
       url = BASE + node
       if url in seen:
         continue
-      page = fetch(url, args.delay)
+      try:
+        page = fetch(url, args.delay)
+      except Exception as e:
+        print(f"  skipped {url}: {e}", flush=True)
+        continue
       lic = re.search(r"field-name-field-art-licenses.*?</div></div></div>", page, re.S)
       if not lic or "publicdomain/zero" not in lic.group(0):
         skipped += 1
