@@ -232,6 +232,7 @@ def main():
   ap.add_argument("--kits", default="kit,hands,metal")
   ap.add_argument("--field", choices=["off", "on", "both"], default="both")
   ap.add_argument("--seed", type=int, default=0)
+  ap.add_argument("--max-seconds", type=float, default=0.0, help="vary each take's length between --seconds and this")
   args = ap.parse_args()
   rng = np.random.default_rng(args.seed)
   os.makedirs(os.path.join(args.out, "audio"), exist_ok=True)
@@ -243,7 +244,8 @@ def main():
       kit = list(kits)[n % len(kits)]
       style = styles[kit][(n // len(kits)) % len(styles[kit])]
       field = args.field == "on" or (args.field == "both" and (n // len(kits)) % 2 == 1)
-      x, info = render_take(kits[kit], style, args.seconds, rng, field, kit)
+      seconds = rng.uniform(args.seconds, args.max_seconds) if args.max_seconds > args.seconds else args.seconds
+      x, info = render_take(kits[kit], style, seconds, rng, field, kit)
       name = f"{n:03d}_{kit}_{style}{'_field' if field else ''}.wav"
       sf.write(os.path.join(args.out, "audio", name), x, FS, subtype="PCM_24")
       man.write(json.dumps(dict(file="audio/" + name, kit=kit, style=style, field=field, **info,

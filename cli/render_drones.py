@@ -153,6 +153,7 @@ def main():
   ap.add_argument("--takes", type=int, default=8)
   ap.add_argument("--seconds", type=float, default=45.0)
   ap.add_argument("--seed", type=int, default=0)
+  ap.add_argument("--max-seconds", type=float, default=0.0, help="vary each take's length between --seconds and this")
   args = ap.parse_args()
   rng = np.random.default_rng(args.seed)
   roots = {"VSCO": args.vsco, "VCSL": args.vcsl}
@@ -170,7 +171,8 @@ def main():
   with open(os.path.join(args.out, "manifest.jsonl"), "w") as man:
     for n in range(args.takes):
       names = combos[n % len(combos)]
-      x, info = render_take(fams, names, args.seconds, rng)
+      seconds = rng.uniform(args.seconds, args.max_seconds) if args.max_seconds > args.seconds else args.seconds
+      x, info = render_take(fams, names, seconds, rng)
       name = f"{n:03d}_{'+'.join(names)}.wav"
       sf.write(os.path.join(args.out, "audio", name), x, FS, subtype="PCM_24")
       man.write(json.dumps(dict(file="audio/" + name, **info, licence="CC0 (VSCO 2 CE / VCSL samples, generated)",
