@@ -89,6 +89,8 @@ STYLES = {
 NOT_A_HIT = re.compile(r"bow|cresc|roll|scrape|crank|slow|fast|swell|trem|shake|taps|rub|gliss|buzz", re.I)
 DYNAMICS = {"ppp": 1, "pp": 2, "p": 3, "mp": 4, "mf": 5, "f": 6, "ff": 7, "fff": 8}
 MAX_S = dict(kick=1.2, snare=0.9, ghost=0.4, hat=0.3, open=0.9, tom=1.1, crash=2.5)
+# kit drums are damped (concert bass drums and orchestral toms ring for seconds otherwise)
+DAMP_S = dict(kick=0.16, snare=0.22, ghost=0.12, tom=0.3)
 
 
 class Instrument:
@@ -159,7 +161,7 @@ def field_chain(x: np.ndarray, rng) -> np.ndarray:
   return x + sosfilt(butter(2, 2500, "highpass", fs=FS, output="sos"), clicks)  # crackle
 
 
-def render_take(kit: dict, style: str, seconds: float, rng, field: bool) -> tuple[np.ndarray, dict]:
+def render_take(kit: dict, style: str, seconds: float, rng, field: bool, kit_name: str = "") -> tuple[np.ndarray, dict]:
   st = STYLES[style]
   steps = st["steps"]
   bpm = rng.uniform(72, 132) if steps == 16 else rng.uniform(60, 104)
@@ -200,6 +202,8 @@ def render_take(kit: dict, style: str, seconds: float, rng, field: bool) -> tupl
           continue
         vel = np.clip(intensity * (0.55 if role == "ghost" else 1.0) * rng.uniform(0.75, 1.0), 0.05, 1.0)
         x = voices[role].sample(vel, rng)
+        if kit_name == "kit" and role in DAMP_S:
+          x = x * np.exp(-np.arange(len(x)) / (DAMP_S[role] * FS))
         n = int(MAX_S[role] * FS)
         if len(x) > n:   # cap the tail, with a 40 ms fade
           x = x[:n].copy()
@@ -239,7 +243,7 @@ def main():
       kit = list(kits)[n % len(kits)]
       style = styles[kit][(n // len(kits)) % len(styles[kit])]
       field = args.field == "on" or (args.field == "both" and (n // len(kits)) % 2 == 1)
-      x, info = render_take(kits[kit], style, args.seconds, rng, field)
+      x, info = render_take(kits[kit], style, args.seconds, rng, field, kit)
       name = f"{n:03d}_{kit}_{style}{'_field' if field else ''}.wav"
       sf.write(os.path.join(args.out, "audio", name), x, FS, subtype="PCM_24")
       man.write(json.dumps(dict(file="audio/" + name, kit=kit, style=style, field=field, **info,
