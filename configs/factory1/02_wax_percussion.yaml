@@ -79,7 +79,7 @@ trainer:
   force_restart: false
 
 # Silence regularisation (ddsp/ddsp.py): gain envelopes on audio + loudness, and a hinge on the output
-# level with loudness forced to 0. On for percussive models only.
+# level with loudness forced to 0. Batch 1 runs it on every dataset (A/B with the variant without it).
 silence:
   enabled: true
   envelope_prob: 0.3
