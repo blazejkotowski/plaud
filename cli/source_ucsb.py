@@ -25,9 +25,11 @@ import urllib.request
 BASE = "https://cylinders.library.ucsb.edu/"
 UA = {"User-Agent": "Mozilla/5.0 (compatible; plaud-dataset-builder/1.0; github.com/blazejkotowski/plaud)"}
 
-VOICE = re.compile(r"\b(vocals?|vocalists?|tenor|baritone|soprano|contralto|mezzo-soprano|singers?|speakers?|"
-                   r"recitation|reciter|monologue|monologues|songs|talking|comic dialogues?|sketch(es)?|"
-                   r"yodel(ing)?|whistl(ing|er)|choir|chorus|quartet)\b", re.I)
+SOLO_VOICE = (r"vocals?|vocalists?|tenor|baritone|soprano|contralto|mezzo-soprano|singers?|speakers?|"
+              r"recitation|reciter|monologue|monologues|songs|talking|comic dialogues?|sketch(es)?|"
+              r"yodel(ing)?|whistl(ing|er)")
+VOICE = re.compile(r"\b(" + SOLO_VOICE + r"|choir|chorus|quartet)\b", re.I)
+SOLO = re.compile(r"\b(" + SOLO_VOICE + r")\b", re.I)
 VOICE_BASS = re.compile(r"\bbass\b(?!\s*(drum|horn|viol|clarinet|saxophone))", re.I)
 
 
@@ -84,6 +86,7 @@ def main():
   ap.add_argument("--query", action="append", required=True, help="type:text, type in keyword/subject/title/author")
   ap.add_argument("--max-year", type=int, default=1922)
   ap.add_argument("--instrumental", action="store_true", help="drop items with a voice in performers or subjects")
+  ap.add_argument("--allow-choir", action="store_true", help="with --instrumental: keep choirs and vocal ensembles")
   ap.add_argument("--delay", type=float, default=1.0, help="seconds between requests")
   args = ap.parse_args()
 
@@ -113,7 +116,8 @@ def main():
           skipped_year += 1
           continue
         text = " ".join(take["performers"] + take["subjects"] + [take["title"]])
-        if args.instrumental and (VOICE.search(text) or VOICE_BASS.search(" ".join(take["performers"]))):
+        voice = SOLO if args.allow_choir else VOICE
+        if args.instrumental and (voice.search(text) or VOICE_BASS.search(" ".join(take["performers"]))):
           skipped_voice += 1
           continue
         path = os.path.join(args.out, "mp3", f"cyl{take['cylinder']}.mp3")
