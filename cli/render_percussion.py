@@ -116,21 +116,25 @@ class Instrument:
       level = int(v.group(1)) if v else DYNAMICS[d.group(1)] if d else 1
       self.layers.setdefault(level, []).append(f)
     self.keys = sorted(self.layers)
-    self.cache = {}
     if not self.keys:
       raise FileNotFoundError(folder)
+    # one gain for the whole instrument (its loudest sample at 1), so velocity layers keep their levels
+    self.cache = {f: self._load(f) for fs in self.layers.values() for f in fs}
+    peak = max(float(np.abs(x).max()) for x in self.cache.values()) + 1e-9
+    self.cache = {f: x / peak for f, x in self.cache.items()}
+
+  @staticmethod
+  def _load(f: str) -> np.ndarray:
+    x, sr = sf.read(f, dtype="float32", always_2d=True)
+    x = x.mean(1)
+    if sr != FS:
+      import librosa
+      x = librosa.resample(x, orig_sr=sr, target_sr=FS)
+    return x
 
   def sample(self, vel: float, rng) -> np.ndarray:
     k = self.keys[min(len(self.keys) - 1, int(vel * len(self.keys)))]
-    f = self.layers[k][rng.integers(len(self.layers[k]))]
-    if f not in self.cache:
-      x, sr = sf.read(f, dtype="float32", always_2d=True)
-      x = x.mean(1)
-      if sr != FS:
-        import librosa
-        x = librosa.resample(x, orig_sr=sr, target_sr=FS)
-      self.cache[f] = x / (np.abs(x).max() + 1e-9)
-    return self.cache[f]
+    return self.cache[self.layers[k][rng.integers(len(self.layers[k]))]]
 
 
 def room_ir(rng, rt60: float, pre_ms: float = 8.0) -> np.ndarray:
@@ -171,7 +175,7 @@ def render_take(kit: dict, style: str, seconds: float, rng, field: bool) -> tupl
         break
       except FileNotFoundError:
         continue
-  gains = dict(kick=1.0, snare=0.85, ghost=0.35, hat=0.4, open=0.45, tom=0.75, crash=0.5)
+  gains = {r: 10 ** (db / 20) for r, db in dict(kick=0, snare=-2, ghost=-12, hat=-14, open=-11, tom=-4, crash=-10).items()}
   intensity = rng.uniform(0.5, 1.0)
   for bar in range(bars):
     # dynamics drift; every 4th / 8th bar ends with a fill
@@ -202,12 +206,12 @@ def render_take(kit: dict, style: str, seconds: float, rng, field: bool) -> tupl
           x[-1920:] *= np.linspace(1.0, 0.0, 1920)
         lag = rng.normal(0.0, 0.006) + (0.008 if role == "snare" else 0.0)    # laid-back snare
         i0 = max(0, int((t + lag) * FS))
-        x = x[: len(out) - i0] * gains[role] * (0.4 + 0.6 * vel)
+        x = x[: len(out) - i0] * gains[role] * (0.6 + 0.4 * vel)
         out[i0:i0 + len(x)] += x
   out = out[: int(seconds * FS)]
   rt60 = rng.uniform(0.25, 0.9)
   wet = fftconvolve(out, room_ir(rng, rt60))[: len(out)]
-  mix = out + wet * rng.uniform(0.15, 0.45)
+  mix = out + wet * rng.uniform(0.06, 0.2)
   if field:
     mix = field_chain(mix / (np.abs(mix).max() + 1e-9) * 0.7, rng)
   mix = mix / (np.abs(mix).max() + 1e-9) * 0.9
