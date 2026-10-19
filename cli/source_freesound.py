@@ -108,15 +108,19 @@ def cmd_search(args):
 
 
 def cmd_previews(args):
+  """A 40 s excerpt from the middle of each top candidate's HQ preview (64 kbps mono MP3), cut over HTTP."""
+  import subprocess
   out_dir = os.path.join(args.out, args.theme)
-  os.makedirs(os.path.join(out_dir, "previews"), exist_ok=True)
+  os.makedirs(os.path.join(out_dir, "excerpts"), exist_ok=True)
   rows = [json.loads(l) for l in open(os.path.join(out_dir, "candidates.jsonl"))][: args.top]
   for s in rows:
-    path = os.path.join(out_dir, "previews", f"{s['id']}.ogg")
-    if not os.path.exists(path):
-      urllib.request.urlretrieve(s["previews"]["preview-hq-ogg"], path)
-      time.sleep(0.5)
-  print(f"{len(rows)} previews in {out_dir}/previews")
+    path = os.path.join(out_dir, "excerpts", f"{s['id']}.mp3")
+    if os.path.exists(path):
+      continue
+    start = max(0.0, s["duration"] / 2 - 20.0)
+    subprocess.run(["ffmpeg", "-v", "quiet", "-y", "-ss", f"{start:.1f}", "-t", "40", "-i", s["previews"]["preview-hq-ogg"],
+                    "-ac", "1", "-b:a", "64k", path], check=False)
+  print(f"{len(rows)} excerpts in {out_dir}/excerpts")
 
 
 def cmd_token(args):
