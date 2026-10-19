@@ -1,0 +1,190 @@
+# drone_ambient_nosilence -- The most sustained CC0 ambient tracks from OpenGameArt.org (cli/source_opengameart.py,
+# cli/build_factory.py --set drone_ambient).
+# Silence regularisation OFF (A/B baseline). ~75 min, 48 kHz mono, CC0 only.
+#
+# Factory batch 2 (2026-10-19). Recipe: configs/factory1 (rafael: BendableNoiseBandSynth n_filters 1000,
+# resampling_factor 128, discrete prior), mono, no post-net. Sources and credits: <dataset>/manifest.jsonl.
+
+experiment:
+  name: drone_ambient_nosilence
+  training_dir: training
+
+audio:
+  fs: 48000
+  chunk_duration_s: 2.0
+  n_channels: 1
+
+data:
+  dataset_path: /mnt/mariadata/datasets/factory/drone_ambient/audio
+  augmentations:
+    - type: RandomMute
+      params:
+        prob: 0.1
+
+model:
+  resampling_factor: 128
+  control_space:
+    - name: loudness
+      dim: 1
+      source: feature
+      extractor: LibrosaFeatureExtractor
+      params:
+        feature_fn_name: rms
+        smoothing_kernel_size: 1
+        postprocess: true
+    - name: centroid
+      dim: 1
+      source: feature
+      extractor: LibrosaFeatureExtractor
+      params:
+        feature_fn_name: spectral_centroid
+        smoothing_kernel_size: 1
+        postprocess: true
+    - name: latents
+      dim: 2
+      source: latent
+  synths:
+    - type: BendableNoiseBandSynth
+      params:
+        n_filters: 1000
+  latent_smoothing_kernel: 129
+  decoder_gru_layers: 2
+  decoder_temporal_stride: 4
+  learning_rate: 1e-4
+  plateau_patience: 15000
+  capacity: 24
+  beta:
+    target: 0.001
+    start_epoch: 30
+    end_epoch: 50
+
+losses:
+  - type: MRSTFT
+    weight: 1.0
+    params:
+      fft_sizes: [2053, 1021, 509, 257, 129, 65, 33]
+
+adversarial:
+  enabled: false
+  weights:
+    gen: 0.01
+    disc: 0.01
+    fm: 0.01
+  schedule:
+    g_start_epoch: 50
+    d_start_epoch: 60
+
+trainer:
+  batch_size: 6
+  max_epochs: 160    # ~60k steps: 75 min / 2 s chunks / batch 6 = 375 steps per epoch
+  log_every_n_steps: 10
+  force_restart: false
+
+prior:
+  enabled: true
+
+  discrete:
+    enabled: true
+    compressor_ckpt: null
+    cond_envelope: false
+    cond_smooth_frames: 64
+    cfg_dropout: 0.15
+    cond_dropout: 0.5
+    joint_codebooks: true
+    terr_rich: true
+    terr_by_track: false
+    num_territories: 12
+    # ── learned style encoder (the main steering; XY pad at play time) ──
+    style_dim: 64            # >0 enables the StyleEncoder + style XY pad
+    style_dropout: 0.2       # zeros `s` sometimes -> a clean null for style-CFG at inference
+    style_aux_weight: 0.3    # track-classification aux on `s` -> separable style space
+    # ── generation robustness ──
+    context_dropout: 0.0     # 0: keep loudness dynamics (>0 forces style reliance but compresses them)
+    ss_prob: 0.3             # iterated scheduled sampling: train on the model's own drifted context
+    ss_iters: 3              # >1 = multi-step drift (keeps free-running dynamics from flattening)
+    ss_anneal_steps: 4000    # ramp ss_prob 0 -> target
+    ss_temperature: 1.0
+
+  model:
+    embedding_dim: 64
+    nhead: 8
+    num_layers: 4
+    dim_feedforward: 1024
+    # dropout 0.0 caused the style-conditioned transformer to MEMORIZE each window via the
+    # style fingerprint -> train_acc 0.96 / val_acc 0.14 (val_style_sep_acc 0.0). Any nonzero
+    # dropout breaks that memorization: dropout 0.05/0.15 both give val_acc ~0.997 and
+    # val_style_sep_acc ~0.98 (style code now transfers to held-out windows). 0.1 = robust
+    # sweet spot for a long run while staying close to the tight-memorization character.
+    dropout: 0.1
+    max_len: 512
+
+  dataset:
+    stride_factor: 0.004
+    respect_boundaries: true
+    group_short_files_s: 240   # tracks of 1-5 min: chain similar files into >= 4 min tracks
+    in_memory: true
+
+  training:
+    batch_size: 64
+    max_epochs: 10000
+    # max_steps drives the warmup->cosine->5%-floor LR schedule (without it the epoch-plateau
+    # scheduler never fires on this small corpus and LR stays pinned at 5e-4). val_acc converges
+    # to ~0.997 within ~2k steps; 20k gives the joint/SS head time to anneal for clean generation.
+    max_steps: 20000
+    num_workers: 4
+    lr: 5e-4
+    force_restart: false
+    # val_fraction 0.05 (261 held-out windows, blocked_random gap=256) gives a MEANINGFUL,
+    # averaged val_acc instead of the previous single-window (val_fraction 0.0) noise.
+    val_fraction: 0.05
+    split_strategy: blocked_random
+    split_gap: null
+    split_seed: 0
+
+compressor:
+  force_restart: true
+  hidden_dim: 64
+  compressed_dim: 64
+  strides: [4, 4, 2, 2]
+  stride_factor: 0.5
+  num_residual_layers: 2
+  kernel_size: 5
+  max_channels: 448
+  use_skip_connections: false
+
+  vq:
+    enabled: true
+    num_codebooks: 4
+    codebook_size: 256
+    beta: 0.25
+    loss_weight: 0.2
+
+  batch_size: 32
+  max_epochs: 250
+  learning_rate: 1e-4
+  num_workers: 0
+
+# Post-net: not used any more (kept disabled). Faithful post-net (optional streaming enhancer behind the `postnet_mix` knob). Trained by
+# cli.train_postnet after the synth; auto-consumed by cli.export. cond_dim is derived from the model.
+postnet:
+  enabled: false   # disabled: never timed on this box, the one unbounded stage. Re-enable with a measured budget once stage timings are known.
+  model:
+    ch: 128
+    layers: 10
+    ch2: 96
+    layers2: 8
+    max_gain_db: 15.0
+    phase_cap: 1.57
+    la_f: 3
+  data:
+    chunk_s: 1.0
+    hop_s: 0.25
+  training:
+    max_steps: 36000
+    batch_size: 16
+    lr: 3.0e-4
+    bend_aug_p: 0.4
+    gain_slew_w: 0.5
+    ema: 0.999
+    val_fraction: 0.1
+    force_restart: false

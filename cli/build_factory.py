@@ -120,7 +120,7 @@ def write_set(out: str, chosen: list, minutes: float):
 def main():
   ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   ap.add_argument("--root", required=True)
-  ap.add_argument("--set", required=True, choices=["jukebox_jazz", "wax_percussion", "magnetosphere", "drone"])
+  ap.add_argument("--set", required=True, choices=["jukebox_jazz", "wax_percussion", "magnetosphere", "drone", "drone_ambient"])
   ap.add_argument("--minutes", type=float, default=75.0)
   ap.add_argument("--seed", type=int, default=0)
   args = ap.parse_args()
@@ -166,6 +166,9 @@ def main():
           ordered.append(by_day[d].pop(0))
     write_set(out, ordered, args.minutes)
 
+  elif args.set == "drone_ambient":
+    build_drone_ambient(raw, out, args.minutes)
+
   elif args.set == "drone":
     items = []
     for pack in ["loc.gov_national-jukebox-classical", "loc.gov_national-jukebox-popular",
@@ -182,6 +185,30 @@ def main():
       scored.append(it)
     scored.sort(key=lambda it: it["score"])          # fewest attacks first
     write_set(out, scored, args.minutes)
+
+
+def build_drone_ambient(raw: str, out: str, minutes: float, per_author: int = 6):
+  """CC0 OpenGameArt tracks, the most sustained first (fewest onsets per second), >= 45 s, a few per composer."""
+  items = []
+  for line in open(os.path.join(raw, "oga", "items.jsonl")):
+    it = json.loads(line)
+    for f in it["files"]:
+      try:
+        x = load_mono(os.path.join(raw, "oga", f))
+      except Exception:
+        continue
+      if len(x) < 45 * FS or np.sqrt(np.mean(x ** 2)) < 1e-3:
+        continue
+      items.append(dict(path=os.path.join(raw, "oga", f), audio=x, title=it["title"], url=it["page"], author=it["author"],
+                        credit=it["credit"], licence=it["licence"], score=round(onset_rate(x), 3)))
+      break   # one file per entry (the others are usually loops or alternate mixes of the same piece)
+  items.sort(key=lambda it: it["score"])
+  per, chosen = {}, []
+  for it in items:
+    if per.get(it["author"], 0) < per_author:
+      per[it["author"]] = per.get(it["author"], 0) + 1
+      chosen.append(it)
+  write_set(out, chosen, minutes)
 
 
 if __name__ == "__main__":
