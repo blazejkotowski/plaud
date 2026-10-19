@@ -73,6 +73,27 @@ section.
 > Jupyter/GPU host) — mount your dataset, pick a config, and it drives the same `cli.train` pipeline.
 > (`notebooks/Train_PLAUD_Colab.ipynb` is a Colab-specific variant.)
 
+#### Silence at loudness 0 (optional, for percussive models)
+
+By default nothing ties loudness 0 to silence: the loudness feature is normalised between the dataset's
+5th and 95th percentiles, and the old `RandomMute` augmentation mutes the audio but keeps its cached
+features, so silence ends up carried by the latents. A `silence:` block (off by default) makes
+loudness alone enough, by regularisation:
+
+```yaml
+silence:
+  enabled: true
+  envelope_prob: 0.3     # share of chunks that get a smooth gain envelope (fade out, fade in or gap)
+  ramp_s: [0.05, 0.2]    # envelope ramp lengths; the same envelope scales the audio and the loudness feature
+  reg_prob: 0.25         # share of each batch decoded again with loudness forced to 0 (latents kept)
+  reg_weight: 1.0        # weight of the hinge on that output's level above floor_db
+  floor_db: -70.0
+```
+
+Use it for drums and other material with sharp attacks; drones and textures don't need it. Drop
+`RandomMute` from `data.augmentations` when it is on. Every model logs `val_silence_db`, the output
+level with loudness at 0, so runs can be compared.
+
 ### 2) Train the codec + prior
 
 ```zsh
@@ -254,6 +275,20 @@ the Max patch wiring, and the `--from_ts` requirement.
 `model.control_space` is a list of fields; each has `name`, `dim`, `source` (`feature` or `latent`),
 and — for features — an `extractor` (registry name) plus `params`. `feature_dim` and `latent_dim` are
 the sums of the respective fields; their total is the control vector the prior generates.
+
+## Factory datasets
+
+`cli/source_*.py` collect openly licensed audio and `cli/build_factory.py` turns it into training sets
+(48 kHz mono, level-normalised, with `manifest.jsonl` and `CREDITS.md` per set):
+
+- `cli.source_ucsb`: public-domain (pre-1923) cylinders from the UCSB Cylinder Audio Archive, by
+  keyword, optionally without voices.
+- `cli.source_cassini`: Cassini RPWS wideband electric-field waveforms (NASA PDS, public domain),
+  joined into audio.
+- Citizen DJ (Library of Congress) packs are downloaded as zips from
+  `https://citizen-dj.labs.loc.gov/<collection>/use/`.
+
+`configs/factory1/` trains the first batch from them.
 
 ## Multichannel
 

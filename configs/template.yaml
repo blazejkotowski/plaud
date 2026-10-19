@@ -107,6 +107,15 @@ trainer:                         # SYNTH training loop
   log_every_n_steps: 10
   force_restart: false           # true = ignore existing checkpoint and train from scratch
 
+# Optional: make loudness 0 decode to silence (percussive models; see README "Silence at loudness 0").
+# silence:
+#   enabled: true
+#   envelope_prob: 0.3             # chunks given a smooth gain envelope on audio AND loudness feature
+#   ramp_s: [0.05, 0.2]
+#   reg_prob: 0.25                 # batch share decoded again with loudness = 0 (latents kept)
+#   reg_weight: 1.0                # hinge on that output's level above floor_db
+#   floor_db: -70.0
+
 # ── PRIOR + CODEC ─────────────────────────────────────────────────────────────────────────────
 # This template configures the DISCRETE codec prior (the nn~ style instrument). For the simpler CONTINUOUS
 # mu-law prior instead, set `discrete.enabled: false` and use `prior.model` mu-law keys
