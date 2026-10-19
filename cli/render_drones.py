@@ -76,6 +76,10 @@ class Family:
 
   def tone(self, midi: float, seconds: float, rng) -> np.ndarray:
     m, x, _ = min(self.notes, key=lambda n: abs(n[0] - midi) + rng.uniform(0, 0.5))
+    while midi - m > 5:                            # never re-pitch by more than 5 semitones:
+      midi -= 12                                   # move the note by octaves instead
+    while m - midi > 5:
+      midi += 12
     ratio = 2 ** ((midi - m) / 12)                 # re-pitch by resampling
     up, down = int(round(1000 / ratio)), 1000
     x = resample_poly(x, up, down).astype(np.float32)
