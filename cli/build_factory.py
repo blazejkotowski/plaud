@@ -148,12 +148,17 @@ def main():
     items = []
     for line in open(os.path.join(raw, "cassini", "items.jsonl")):
       it = json.loads(line)
-      items.append(dict(path=os.path.join(raw, "cassini", it["file"]), url=it["source"], title=it["day"] + " " + it["band"],
-                        credit=it["credit"], licence=it["licence"], day=it["day"]))
-    # round-robin over days so every event is represented before any day repeats
+      path = os.path.join(raw, "cassini", it["file"])
+      x = load_mono(path)
+      seg = 90 * FS                                   # 90 s pieces, so no single long file dominates
+      for k in range(0, len(x), seg):
+        items.append(dict(path=f"{path[:-4]}_s{k // seg:02d}.wav", audio=x[k:k + seg], url=it["source"],
+                          title=it["day"] + " " + it["band"], credit=it["credit"], licence=it["licence"],
+                          key=(it["day"], it["band"])))
+    # round-robin over (day, band) so every event and both bands are represented before any repeats
     by_day = {}
     for it in items:
-      by_day.setdefault(it["day"], []).append(it)
+      by_day.setdefault(it["key"], []).append(it)
     ordered = []
     while any(by_day.values()):
       for d in sorted(by_day):
