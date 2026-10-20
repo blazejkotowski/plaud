@@ -769,8 +769,8 @@ class SubbandSineSynth(BaseSynth):
     self.register_buffer('_phase_ramp', torch.empty(0))  # ω·t, lazily built per block length
     # Fixed, seeded random start phases. Starting every sine at 0 makes the equally spaced bank (12 Hz
     # apart below 3 kHz) line up every 83 ms into a 12 Hz pulse; random phases never line up.
-    _g = torch.Generator().manual_seed(1234)
-    self.register_buffer('_phase_init', torch.rand(self._n_sines, generator=_g) * 2 * math.pi, persistent=False)
+    _g = torch.Generator(device='cpu').manual_seed(1234)   # CPU even when training sets CUDA as the default device
+    self.register_buffer('_phase_init', torch.rand(self._n_sines, generator=_g, device='cpu') * 2 * math.pi, persistent=False)
     self._ramp_len: int = -1
     self._ws_factor: float = -1.0   # cached waveshaper knob + its analytic RMS scalar
     self._ws_scale: float = 1.0
