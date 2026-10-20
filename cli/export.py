@@ -114,6 +114,14 @@ class ScriptedDDSP(nn_tilde.Module):
     self.register_attribute("spectral_roll", 0.0)
     self.register_attribute("spectral_stretch", 0.0)
     self.register_attribute("spectral_warp", 0.0)
+    # Harmonise: snap the bands to held notes. harmonise_notes is a 12-bit pitch-class mask (C = 1,
+    # C# = 2, ... B = 2048) sent as a float; 0 = off. Focus 0 = soft peaks, 1 = one band per note.
+    self.register_attribute("harmonise_amount", 0.0)
+    self.register_attribute("harmonise_notes", 0.0)
+    self.register_attribute("harmonise_focus", 0.0)
+    # Sine path (Shape > 0): play each spectral peak as one retuned sine (1) instead of one sine per
+    # band (0), which beats at the 12 Hz band spacing.
+    self.register_attribute("partial_merge", 1.0)
     # Post-net strength: 0 = raw synth (post-net bypassed), 1 = fully transformed. Default on.
     self.register_attribute("postnet_mix", 1.0 if self.has_stage2 else 0.0)
 
@@ -220,7 +228,9 @@ class ScriptedDDSP(nn_tilde.Module):
     synth_params = self.pretrained.decoder(features, latents)
     audio = self.pretrained._synthesize(synth_params, waveshaping_factor=self.waveshaping[0], limit_components=self.limit_components[0],
                                         limit_mode=int(self.limit_mode[0]), spectral_roll=self.spectral_roll[0],
-                                        spectral_stretch=self.spectral_stretch[0], spectral_warp=self.spectral_warp[0])
+                                        spectral_stretch=self.spectral_stretch[0], spectral_warp=self.spectral_warp[0],
+                                        harmonise_amount=self.harmonise_amount[0], harmonise_notes=int(self.harmonise_notes[0]),
+                                        harmonise_focus=self.harmonise_focus[0], partial_merge=self.partial_merge[0] > 0.5)
     # print("Audio shape before interpolation:", audio.shape)
 
     # Stage-2 faithful post-net: transform the synth output, conditioned on the full control
@@ -501,6 +511,42 @@ class ScriptedDDSP(nn_tilde.Module):
   @torch.jit.export
   def set_spectral_warp(self, value: float):
     self.spectral_warp = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_amount(self) -> float:
+    return self.harmonise_amount[0]
+
+  @torch.jit.export
+  def set_harmonise_amount(self, value: float):
+    self.harmonise_amount = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_notes(self) -> float:
+    return self.harmonise_notes[0]
+
+  @torch.jit.export
+  def set_harmonise_notes(self, value: float):
+    self.harmonise_notes = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_focus(self) -> float:
+    return self.harmonise_focus[0]
+
+  @torch.jit.export
+  def set_harmonise_focus(self, value: float):
+    self.harmonise_focus = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_partial_merge(self) -> float:
+    return self.partial_merge[0]
+
+  @torch.jit.export
+  def set_partial_merge(self, value: float):
+    self.partial_merge = (value, )
     return 0
 
 

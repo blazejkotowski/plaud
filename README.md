@@ -205,10 +205,16 @@ generates. All default to `0` (neutral / off).
 | `spectral_roll` | `0…1` | Circular spectral shift **up** the spectrum, wrapping the top back to the bottom. `0` = none, `1` = full 360° wrap (returns to the start). A barber-pole / Shepard-style spectral glide. |
 | `spectral_stretch` | `−1…+1` | Scale the spectrum. `>0` spreads energy toward the highs (brighter/wider), `<0` compresses toward the lows. `0` = neutral. |
 | `spectral_warp` | `−1…+1` | Energy-preserving skew of the spectral envelope. `>0` pushes energy toward the low end (darker), `<0` toward the highs (brighter). `0` = neutral. |
+| `harmonise_amount` | `0…1` | How much of each band's power moves onto the notes in `harmonise_notes`. `0` = off. |
+| `harmonise_notes` | `0…4095` (int) | Pitch classes to snap to, one bit each: C = 1, C♯ = 2, D = 4 … B = 2048 (D F A C = 4 + 32 + 512 + 1 = 549). Every band between 30 Hz and 12 kHz sends its power to the band nearest its nearest allowed note, in any octave. `0` = off. With `waveshaping > 0` the snapped sines are retuned to the exact note. |
+| `harmonise_focus` | `0…1` | `0` = soft peaks (each note spread over ±0.35 semitone), `1` = laser (each note in a single band). |
+| `partial_merge` | `0/1` | Sine path only (`waveshaping > 0`). `1` (default) plays each spectral peak as one sine at its interpolated frequency; `0` = one sine per band, which beats at the band spacing (12 Hz below 3 kHz) when a partial falls between two bands. |
 
 Notes:
-- **Order of effect:** bends first (`stretch → warp → roll`), then limiting. So limiting thins
-  whatever spectrum the bends produced.
+- **Order of effect:** bends first (`stretch → warp → roll`), then harmonise, then limiting. So
+  harmonise snaps the bent spectrum, and limiting thins what harmonise produced.
+- **The sine bank starts at fixed random phases.** Starting every sine at 0 lined the equally spaced
+  bank up every 83 ms into a 12 Hz pulse.
 - **Click-free:** limiting and bends are computed at control rate and smoothed by the synth's
   upsampling, so sweeping `limit_mode`, `limit_components`, or any bend does not click. Their CPU
   cost is negligible; only `waveshaping > 0` is expensive (it enables the sine bank).
