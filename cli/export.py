@@ -122,6 +122,9 @@ class ScriptedDDSP(nn_tilde.Module):
     # Sine path (Shape > 0): play each spectral peak as one retuned sine (1) instead of one sine per
     # band (0), which beats at the 12 Hz band spacing.
     self.register_attribute("partial_merge", 1.0)
+    # Harmonise detune per pitch class, in cents (harmonise_cents_0 = C ... harmonise_cents_11 = B).
+    for k in range(12):
+      self.register_attribute(f"harmonise_cents_{k}", 0.0)
     # Post-net strength: 0 = raw synth (post-net bypassed), 1 = fully transformed. Default on.
     self.register_attribute("postnet_mix", 1.0 if self.has_stage2 else 0.0)
 
@@ -230,7 +233,11 @@ class ScriptedDDSP(nn_tilde.Module):
                                         limit_mode=int(self.limit_mode[0]), spectral_roll=self.spectral_roll[0],
                                         spectral_stretch=self.spectral_stretch[0], spectral_warp=self.spectral_warp[0],
                                         harmonise_amount=self.harmonise_amount[0], harmonise_notes=int(self.harmonise_notes[0]),
-                                        harmonise_focus=self.harmonise_focus[0], partial_merge=self.partial_merge[0] > 0.5)
+                                        harmonise_focus=self.harmonise_focus[0], partial_merge=self.partial_merge[0] > 0.5,
+                                        harmonise_cents=[self.harmonise_cents_0[0], self.harmonise_cents_1[0], self.harmonise_cents_2[0],
+                                                         self.harmonise_cents_3[0], self.harmonise_cents_4[0], self.harmonise_cents_5[0],
+                                                         self.harmonise_cents_6[0], self.harmonise_cents_7[0], self.harmonise_cents_8[0],
+                                                         self.harmonise_cents_9[0], self.harmonise_cents_10[0], self.harmonise_cents_11[0]])
     # print("Audio shape before interpolation:", audio.shape)
 
     # Stage-2 faithful post-net: transform the synth output, conditioned on the full control
@@ -538,6 +545,114 @@ class ScriptedDDSP(nn_tilde.Module):
   @torch.jit.export
   def set_harmonise_focus(self, value: float):
     self.harmonise_focus = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_cents_0(self) -> float:
+    return self.harmonise_cents_0[0]
+
+  @torch.jit.export
+  def set_harmonise_cents_0(self, value: float):
+    self.harmonise_cents_0 = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_cents_1(self) -> float:
+    return self.harmonise_cents_1[0]
+
+  @torch.jit.export
+  def set_harmonise_cents_1(self, value: float):
+    self.harmonise_cents_1 = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_cents_2(self) -> float:
+    return self.harmonise_cents_2[0]
+
+  @torch.jit.export
+  def set_harmonise_cents_2(self, value: float):
+    self.harmonise_cents_2 = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_cents_3(self) -> float:
+    return self.harmonise_cents_3[0]
+
+  @torch.jit.export
+  def set_harmonise_cents_3(self, value: float):
+    self.harmonise_cents_3 = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_cents_4(self) -> float:
+    return self.harmonise_cents_4[0]
+
+  @torch.jit.export
+  def set_harmonise_cents_4(self, value: float):
+    self.harmonise_cents_4 = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_cents_5(self) -> float:
+    return self.harmonise_cents_5[0]
+
+  @torch.jit.export
+  def set_harmonise_cents_5(self, value: float):
+    self.harmonise_cents_5 = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_cents_6(self) -> float:
+    return self.harmonise_cents_6[0]
+
+  @torch.jit.export
+  def set_harmonise_cents_6(self, value: float):
+    self.harmonise_cents_6 = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_cents_7(self) -> float:
+    return self.harmonise_cents_7[0]
+
+  @torch.jit.export
+  def set_harmonise_cents_7(self, value: float):
+    self.harmonise_cents_7 = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_cents_8(self) -> float:
+    return self.harmonise_cents_8[0]
+
+  @torch.jit.export
+  def set_harmonise_cents_8(self, value: float):
+    self.harmonise_cents_8 = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_cents_9(self) -> float:
+    return self.harmonise_cents_9[0]
+
+  @torch.jit.export
+  def set_harmonise_cents_9(self, value: float):
+    self.harmonise_cents_9 = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_cents_10(self) -> float:
+    return self.harmonise_cents_10[0]
+
+  @torch.jit.export
+  def set_harmonise_cents_10(self, value: float):
+    self.harmonise_cents_10 = (value, )
+    return 0
+
+  @torch.jit.export
+  def get_harmonise_cents_11(self) -> float:
+    return self.harmonise_cents_11[0]
+
+  @torch.jit.export
+  def set_harmonise_cents_11(self, value: float):
+    self.harmonise_cents_11 = (value, )
     return 0
 
   @torch.jit.export

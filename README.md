@@ -199,7 +199,7 @@ generates. All default to `0` (neutral / off).
 | Attribute | Range | What it does |
 |---|---|---|
 | `postnet_mix` | `0…1` | Strength of the **faithful post-net** — a neural enhancer that reshapes the synth's output (sharper transients, corrected envelope). `0` = raw synth (post-net bypassed, no extra CPU), `1` = fully enhanced (default). Intermediate values are a phase-coherent wet/dry blend. Present only when the model was exported with a post-net. See [PostNet_Architecture.md](docs/PostNet_Architecture.md). |
-| `waveshaping` | `0…1` | Morph **and** drive on one knob. `0` = pure noise-band synth (cheapest). `0→0.5` crossfades noise → sinusoidal bank. `0.5` = pure sines. `0.5→1` adds `tanh` waveshaping (saturation). **Note:** anything above `0` switches on the sine bank, which costs much more CPU than the noise synth. |
+| `waveshaping` | `0…1` | Morph **and** drive on one knob. `0` = pure noise-band synth (cheapest). `0→0.5` crossfades noise → sinusoidal bank (equal power, and each sine plays at its noise band's level, so the loudness and tilt stay put). `0.5` = pure sines. `0.5→1` adds `tanh` waveshaping (saturation). **Note:** anything above `0` switches on the sine bank, which costs much more CPU than the noise synth. |
 | `limit_components` | `0…1` | Partial-thinning **amount**. `0` = keep all bands; toward `1` keeps progressively fewer (`k = (1−amount)·N` bands). |
 | `limit_mode` | `0…5` (int) | **Which** bands survive when limiting: `0` loudest (global top-k), `1` density (evenly spread across the spectrum), `2` lower (low-pass), `3` higher (high-pass), `4` peaks (the k most prominent spectral peaks — tonal skeleton), `5` stochastic (random, grainy). |
 | `spectral_roll` | `0…1` | Circular spectral shift **up** the spectrum, wrapping the top back to the bottom. `0` = none, `1` = full 360° wrap (returns to the start). A barber-pole / Shepard-style spectral glide. |
@@ -208,6 +208,7 @@ generates. All default to `0` (neutral / off).
 | `harmonise_amount` | `0…1` | How much of each band's power moves onto the notes in `harmonise_notes`. `0` = off. |
 | `harmonise_notes` | `0…4095` (int) | Pitch classes to snap to, one bit each: C = 1, C♯ = 2, D = 4 … B = 2048 (D F A C = 4 + 32 + 512 + 1 = 549). Every band between 30 Hz and 12 kHz sends its power to the band nearest its nearest allowed note, in any octave. `0` = off. With `waveshaping > 0` the snapped sines are retuned to the exact note. |
 | `harmonise_focus` | `0…1` | `0` = soft peaks (each note spread over ±0.35 semitone), `1` = laser (each note in a single band). |
+| `harmonise_cents_0` … `harmonise_cents_11` | `−100…+100` | Detune per pitch class in cents (`_0` = C … `_11` = B), for microtonal tunings. Exact on the sine path; on the noise path the band nearest the detuned note gets the energy. |
 | `partial_merge` | `0/1` | Sine path only (`waveshaping > 0`). `1` (default) plays each spectral peak as one sine at its interpolated frequency; `0` = one sine per band, which beats at the band spacing (12 Hz below 3 kHz) when a partial falls between two bands. |
 
 Notes:

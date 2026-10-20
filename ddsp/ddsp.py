@@ -70,7 +70,7 @@ from ddsp.discriminator import Discriminator
 from ddsp.synths import BaseSynth, SineSynth, SubbandSineSynth, NoiseBandSynth, BendableNoiseBandSynth
 from sklearn.decomposition import PCA
 
-from typing import List, Tuple, Dict, Any
+from typing import List, Optional, Tuple, Dict, Any
 
 from ddsp.losses import MultiScaleSlicedWassersteinLoss
 from ddsp.interfaces import ControlSpace
@@ -883,7 +883,8 @@ class DDSP(L.LightningModule):
   def _synthesize(self, params: torch.Tensor, waveshaping_factor: float=0.0, limit_components: float=0.0,
                   limit_mode: int=0, spectral_roll: float=0.0, spectral_stretch: float=0.0,
                   spectral_warp: float=0.0, harmonise_amount: float=0.0, harmonise_notes: int=0,
-                  harmonise_focus: float=0.0, partial_merge: bool=True) -> torch.Tensor:
+                  harmonise_focus: float=0.0, partial_merge: bool=True,
+                  harmonise_cents: Optional[List[float]]=None) -> torch.Tensor:
     """
     Synthesizes a signal from the predicted amplitudes and the baked noise bands.
     Args:
@@ -916,7 +917,8 @@ class DDSP(L.LightningModule):
                            limit_mode=limit_mode, spectral_roll=spectral_roll,
                            spectral_stretch=spectral_stretch, spectral_warp=spectral_warp,
                            harmonise_amount=harmonise_amount, harmonise_notes=harmonise_notes,
-                           harmonise_focus=harmonise_focus, partial_merge=partial_merge))
+                           harmonise_focus=harmonise_focus, partial_merge=partial_merge,
+                           harmonise_cents=harmonise_cents))
       elif name in ("SineSynth",):
         audio.append(synth(synth_params, limit_components=limit_components))
       else:

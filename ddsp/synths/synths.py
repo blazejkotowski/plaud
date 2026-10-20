@@ -9,7 +9,7 @@ from ddsp.filterbank import FilterBank
 # from ddsp.sgd.sinusoidal_gradient_descent.core import complex_oscillator
 
 
-from typing import Type, Callable, Dict, Any, List, Tuple
+from typing import Type, Callable, Dict, Any, List, Optional, Tuple
 
 _SYNTH_REGISTRY = {}
 
@@ -293,7 +293,8 @@ class NoiseBandSynth(BaseSynth):
   def forward(self, amplitudes: torch.Tensor, limit_components: float = 0.0, waveshaping_factor: float = 0.0,
               limit_mode: int = 0, spectral_roll: float = 0.0, spectral_stretch: float = 0.0,
               spectral_warp: float = 0.0, harmonise_amount: float = 0.0, harmonise_notes: int = 0,
-              harmonise_focus: float = 0.0, partial_merge: bool = True) -> torch.Tensor:
+              harmonise_focus: float = 0.0, partial_merge: bool = True,
+              harmonise_cents: Optional[List[float]] = None) -> torch.Tensor:
     # limit_mode / spectral_* / harmonise_* / partial_merge accepted for a uniform _synthesize call signature; only
     # BendableNoiseBandSynth acts on them.
     """
@@ -438,9 +439,17 @@ class BendableNoiseBandSynth(BaseSynth):
     self.register_buffer('_harm_freq', torch.zeros(0), persistent=False)
     self._harm_notes: int = -1
     self._harm_focus: float = -1.0
+    self._harm_cents: List[float] = [0.0] * 12
     # Partial merge picks peaks on a smoothed copy of the band levels (state carried across blocks).
     self.register_buffer('_merge_smooth', torch.zeros(0, 0), persistent=False)
     self._merge_alpha: float = 1.0 - math.exp(-1.0 / (0.04 * fs / resampling_factor))   # ~40 ms
+    # The sine path plays each band at its noise band's level. A unit sine is ~17 dB louder than a
+    # noise band at the same amplitude (11-18 dB across the spectrum), so Shape changed both the
+    # loudness and the tilt.
+    fb = self._noiseband_synth._filterbank
+    nb_rms = torch.stack([(fb.noisebands[i].float() * fb.noisebands_scale[i]).pow(2).mean().sqrt()
+                          for i in range(fb.noisebands.shape[0])])
+    self.register_buffer('_sine_gain', (nb_rms * math.sqrt(2.0)).float(), persistent=False)
 
   @property
   def n_params(self):
@@ -550,17 +559,20 @@ class BendableNoiseBandSynth(BaseSynth):
       x = x * self._limit_mask(x, limit_components, limit_mode)
     return x
 
-  def _build_harmonise(self, notes: int, focus: float):
+  def _build_harmonise(self, notes: int, focus: float, cents: List[float]):
     """
     Remap for a set of pitch classes (`notes`: bit k = pitch class k, C = 0) at a focus (0 soft,
-    1 laser). Every snappable band sends its power to the band nearest its nearest allowed note
-    (any octave); a soft focus spreads that arrival over a Gaussian of up to ±0.35 semitone.
+    1 laser), each pitch class detuned by `cents[k]`. Every snappable band sends its power to the
+    band nearest its nearest allowed note (any octave); a soft focus spreads that arrival over a
+    Gaussian of up to ±0.35 semitone.
     """
     N = self._n_bands
     dev = self._band_pitch.device
     bits = torch.tensor([(notes >> k) & 1 for k in range(12)], device=dev)
+    detune = torch.tensor(cents, dtype=torch.float32, device=dev) / 100.0
     midi = torch.arange(24, 128, device=dev)
-    targets = midi[bits[midi % 12] == 1].float()                                 # [M] allowed MIDI notes
+    allowed = bits[midi % 12] == 1
+    targets = midi[allowed].float() + detune[midi[allowed] % 12]                 # [M] allowed (detuned) MIDI pitches
     pitch = self._band_pitch
     which = torch.argmin(torch.abs(pitch.unsqueeze(1) - targets.unsqueeze(0)), dim=1)    # [N] nearest note
     nearest_note = targets[which]
@@ -592,11 +604,16 @@ class BendableNoiseBandSynth(BaseSynth):
     self._harm_freq = freq
     self._harm_notes = notes
     self._harm_focus = focus
+    self._harm_cents = cents
 
-  def _harmonise(self, x: torch.Tensor, amount: float, notes: int, focus: float) -> torch.Tensor:
+  def _harmonise(self, x: torch.Tensor, amount: float, notes: int, focus: float, cents: List[float]) -> torch.Tensor:
     """Moves `amount` of each band's power (bands are incoherent, so power adds) onto the held notes."""
-    if notes != self._harm_notes or abs(focus - self._harm_focus) > 1.0e-4 or self._harm_idx.shape[0] != x.shape[1]:
-      self._build_harmonise(notes, focus)
+    changed = notes != self._harm_notes or abs(focus - self._harm_focus) > 1.0e-4 or self._harm_idx.shape[0] != x.shape[1]
+    for k in range(12):
+      if abs(cents[k] - self._harm_cents[k]) > 1.0e-3:
+        changed = True
+    if changed:
+      self._build_harmonise(notes, focus, cents)
     P = x * x
     moved = torch.zeros_like(P)
     for k in range(self._harm_idx.shape[1]):
@@ -657,7 +674,8 @@ class BendableNoiseBandSynth(BaseSynth):
   def forward(self, parameters: torch.Tensor, limit_components: float = 0.0, waveshaping_factor: float = 0.0,
               limit_mode: int = 0, spectral_roll: float = 0.0, spectral_stretch: float = 0.0,
               spectral_warp: float = 0.0, harmonise_amount: float = 0.0, harmonise_notes: int = 0,
-              harmonise_focus: float = 0.0, partial_merge: bool = True):
+              harmonise_focus: float = 0.0, partial_merge: bool = True,
+              harmonise_cents: Optional[List[float]] = None):
     """
     Waveshaping factor controls the amount of interpolation between noisebands and sinewaves when in the range [0, 0.5].
     On the other hand, in the rangee [0.5, 1], it controls the amount of waveshaping applied to the sinewaves.
@@ -665,8 +683,8 @@ class BendableNoiseBandSynth(BaseSynth):
     limit_mode selects the partial-limiting strategy (0 loudest, 1 density, 2 lower, 3 higher,
     4 peaks, 5 stochastic). spectral_roll/stretch/warp are spectral bend amounts (0 = neutral).
 
-    harmonise_*: snap the bands to the pitch classes in `harmonise_notes` (12-bit mask, C = bit 0);
-    amount 0 or no notes = off. partial_merge: the sine path plays each peak as one retuned sine.
+    harmonise_*: snap the bands to the pitch classes in `harmonise_notes` (12-bit mask, C = bit 0),
+    each detuned by harmonise_cents[pitch class]; amount 0 or no notes = off. partial_merge: the sine path plays each peak as one retuned sine.
     """
     # waveshaping_factor = kwargs.pop('waveshaping', 0.0)
     # Clamp waveshaping factor to [0, 1]
@@ -687,7 +705,10 @@ class BendableNoiseBandSynth(BaseSynth):
     harmonising = harmonise_amount > 0.0 and (harmonise_notes & 4095) != 0
     parameters = self._apply_spectral(parameters, spectral_roll, spectral_stretch, spectral_warp, 0.0, limit_mode)
     if harmonising:
-      parameters = self._harmonise(parameters, harmonise_amount, harmonise_notes & 4095, harmonise_focus)
+      cents = [0.0] * 12
+      if harmonise_cents is not None and len(harmonise_cents) == 12:
+        cents = [max(-100.0, min(float(c), 100.0)) for c in harmonise_cents]
+      parameters = self._harmonise(parameters, harmonise_amount, harmonise_notes & 4095, harmonise_focus, cents)
     if limit_components > 0.0:
       parameters = parameters * self._limit_mask(parameters, limit_components, limit_mode)
 
@@ -701,12 +722,14 @@ class BendableNoiseBandSynth(BaseSynth):
     if interpolation == 1.0:
       return sine_signal
     noise_signal = self._noiseband_synth(parameters, limit_components=0.0)
-    return (1-interpolation)*noise_signal + interpolation*sine_signal
+    # equal-power crossfade: the two paths are uncorrelated, so a linear one dipped 3 dB midway
+    return math.sqrt(1.0 - interpolation) * noise_signal + math.sqrt(interpolation) * sine_signal
 
   def _sines(self, x: torch.Tensor, waveshaping_factor: float, retune: float, partial_merge: bool) -> torch.Tensor:
     """The sine path: merged partials (or one sine per band), with harmonised bands pulled to their
     exact note by `retune` (the harmonise amount)."""
     base = self._sine_synth._base_freqs.float().view(1, -1, 1)
+    x = x * self._sine_gain.view(1, -1, 1)
     if partial_merge:
       amps, freqs = self._merge_partials(x)
     else:
@@ -787,7 +810,8 @@ class SubbandSineSynth(BaseSynth):
   def forward(self, parameters: torch.Tensor, limit_components: float = 0.0, waveshaping_factor: float = 0.0,
               limit_mode: int = 0, spectral_roll: float = 0.0, spectral_stretch: float = 0.0,
               spectral_warp: float = 0.0, harmonise_amount: float = 0.0, harmonise_notes: int = 0,
-              harmonise_focus: float = 0.0, partial_merge: bool = True):
+              harmonise_focus: float = 0.0, partial_merge: bool = True,
+              harmonise_cents: Optional[List[float]] = None):
     # limit_mode / spectral_* / harmonise_* / partial_merge accepted for a uniform _synthesize call signature; unused here.
     """
     Generates a mixture of sinewaves with the given frequencies and amplitudes per sample.
