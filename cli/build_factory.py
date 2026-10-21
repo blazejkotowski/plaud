@@ -1,6 +1,7 @@
 """Build the factory training sets from the raw sources (see cli/source_*.py).
 
-Each set goes to <root>/<name>/audio/*.wav (48 kHz mono, level-normalised) with a manifest
+Each set goes to <out-root>/<name>/audio/*.wav (48 kHz stereo, level-normalised; a mono source sits on both
+channels) with a manifest
 (manifest.jsonl: file, source, licence, credit) and CREDITS.md next to it. Selection:
 
   jukebox_jazz     Citizen DJ National Jukebox: Jazz excerpts without a voice in the credits.
@@ -11,6 +12,8 @@ Each set goes to <root>/<name>/audio/*.wav (48 kHz mono, level-normalised) with 
                    UCSB organ, choir, harmonium, strings..., the fewest attacks first.
 
   python -m cli.build_factory --root /mnt/mariadata/datasets/factory --set jukebox_jazz --minutes 75
+
+The sets were mono until 2026-10-21 (every source was downmixed); <root>/<name> still holds those.
 """
 
 import argparse
@@ -32,19 +35,16 @@ VOICE = re.compile(r"\b(vocals?|vocalists?|tenor|baritone|soprano|contralto|mezz
 CHOIR = re.compile(r"\b(choir|chorus|choral)\b", re.I)
 
 
-def load_mono(path: str) -> np.ndarray:
-  if path.endswith(".mp3"):
-    raw = subprocess.run(["ffmpeg", "-v", "quiet", "-i", path, "-f", "f32le", "-ac", "1", "-ar", str(FS), "-"],
-                         capture_output=True, check=True).stdout
-    return np.frombuffer(raw, dtype=np.float32).copy()
-  x, sr = sf.read(path, dtype="float32", always_2d=True)
-  x = x.mean(axis=1)
-  return librosa.resample(x, orig_sr=sr, target_sr=FS) if sr != FS else x
+def load_audio(path: str) -> np.ndarray:
+  """Any format ffmpeg reads (wav, flac, aiff, ogg, mp3, m4a...), stereo at 48 kHz: [T, 2]."""
+  raw = subprocess.run(["ffmpeg", "-v", "quiet", "-i", path, "-f", "f32le", "-ac", "2", "-ar", str(FS), "-"],
+                       capture_output=True, check=True).stdout
+  return np.frombuffer(raw, dtype=np.float32).reshape(-1, 2).copy()
 
 
 # -26 dBFS RMS puts factory models near the night0908 models' output level (-20 made jukebox_jazz ~6.5 dB hotter)
 def normalise(x: np.ndarray, rms_db: float = -26.0) -> np.ndarray:
-  x = x - x.mean()
+  x = x - x.mean(axis=0)
   rms = np.sqrt(np.mean(x ** 2)) + 1e-9
   x = x * (10 ** (rms_db / 20) / rms)
   peak = np.abs(x).max()
@@ -53,12 +53,12 @@ def normalise(x: np.ndarray, rms_db: float = -26.0) -> np.ndarray:
 
 def onset_rate(x: np.ndarray) -> float:
   """Onsets per second."""
-  on = librosa.onset.onset_detect(y=x, sr=FS, hop_length=512, units="time")
+  on = librosa.onset.onset_detect(y=x.mean(axis=1), sr=FS, hop_length=512, units="time")
   return len(on) / max(1.0, len(x) / FS)
 
 
 def percussive_share(x: np.ndarray) -> float:
-  S = np.abs(librosa.stft(x, n_fft=2048, hop_length=512))
+  S = np.abs(librosa.stft(x.mean(axis=1), n_fft=2048, hop_length=512))
   H, P = librosa.decompose.hpss(S)
   return float((P ** 2).sum() / ((H ** 2).sum() + (P ** 2).sum() + 1e-12))
 
@@ -101,7 +101,7 @@ def write_set(out: str, chosen: list, minutes: float):
         break
       x = it.get("audio")
       if x is None:
-        x = load_mono(it["path"])
+        x = load_audio(it["path"])
         x = x[int(it.get("trim", 0.0) * FS):]
       if len(x) < 2 * FS:
         continue
@@ -120,7 +120,8 @@ def write_set(out: str, chosen: list, minutes: float):
 
 def main():
   ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-  ap.add_argument("--root", required=True)
+  ap.add_argument("--root", required=True, help="the folder with _raw/")
+  ap.add_argument("--out-root", default=None, help="where the set goes (default: --root)")
   ap.add_argument("--set", required=True, choices=["jukebox_jazz", "wax_percussion", "magnetosphere", "drone", "drone_ambient",
                                                    "underground", "harbour", "machine_halls", "contact_structure"])
   ap.add_argument("--minutes", type=float, default=75.0)
@@ -129,7 +130,7 @@ def main():
   random.seed(args.seed)
   raw = os.path.join(args.root, "_raw")
   cdj = os.path.join(raw, "citizendj")
-  out = os.path.join(args.root, args.set)
+  out = os.path.join(args.out_root or args.root, args.set)
 
   if args.set == "jukebox_jazz":
     items = [it for it in citizen_items(os.path.join(cdj, "loc.gov_national-jukebox-jazz"))
@@ -140,7 +141,7 @@ def main():
   elif args.set == "wax_percussion":
     items = ucsb_items(os.path.join(raw, "ucsb"), allow_choir=False)
     for it in items:
-      x = load_mono(it["path"])[int(it["trim"] * FS):]
+      x = load_audio(it["path"])[int(it["trim"] * FS):]
       it["audio"] = x
       it["score"] = round(percussive_share(x) * onset_rate(x), 4)
     items.sort(key=lambda it: -it["score"])
@@ -151,7 +152,7 @@ def main():
     for line in open(os.path.join(raw, "cassini", "items.jsonl")):
       it = json.loads(line)
       path = os.path.join(raw, "cassini", it["file"])
-      x = load_mono(path)
+      x = load_audio(path)
       seg = 90 * FS                                   # 90 s pieces, so no single long file dominates
       for k in range(0, len(x), seg):
         items.append(dict(path=f"{path[:-4]}_s{k // seg:02d}.wav", audio=x[k:k + seg], url=it["source"],
@@ -182,7 +183,7 @@ def main():
     items += ucsb_items(os.path.join(raw, "ucsb_sustained"), allow_choir=True)
     scored = []
     for it in items:
-      x = load_mono(it["path"])[int(it.get("trim", 0.0) * FS):]
+      x = load_audio(it["path"])[int(it.get("trim", 0.0) * FS):]
       if len(x) < 5 * FS or np.sqrt(np.mean(x ** 2)) < 1e-3:
         continue
       it["audio"] = x
@@ -200,7 +201,7 @@ def build_freesound(raw: str, theme: str, out: str, minutes: float, max_s: float
     it = json.loads(line)
     path = os.path.join(folder, it["file"])
     try:
-      x = load_mono(path) if path.endswith(".mp3") else load_any(path)
+      x = load_audio(path)
     except Exception as e:
       print(f"  skipped {it['id']}: {e}")
       continue
@@ -212,13 +213,6 @@ def build_freesound(raw: str, theme: str, out: str, minutes: float, max_s: float
   write_set(out, items, minutes)
 
 
-def load_any(path: str) -> np.ndarray:
-  """Any format ffmpeg reads (wav, flac, aiff, ogg, m4a...), mono at 48 kHz."""
-  raw = subprocess.run(["ffmpeg", "-v", "quiet", "-i", path, "-f", "f32le", "-ac", "1", "-ar", str(FS), "-"],
-                       capture_output=True, check=True).stdout
-  return np.frombuffer(raw, dtype=np.float32).copy()
-
-
 def build_drone_ambient(raw: str, out: str, minutes: float, per_author: int = 6):
   """CC0 OpenGameArt tracks, the most sustained first (fewest onsets per second), >= 45 s, a few per composer."""
   items = []
@@ -226,7 +220,7 @@ def build_drone_ambient(raw: str, out: str, minutes: float, per_author: int = 6)
     it = json.loads(line)
     for f in it["files"]:
       try:
-        x = load_mono(os.path.join(raw, "oga", f))
+        x = load_audio(os.path.join(raw, "oga", f))
       except Exception:
         continue
       if len(x) < 45 * FS or np.sqrt(np.mean(x ** 2)) < 1e-3:

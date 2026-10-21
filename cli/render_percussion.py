@@ -9,7 +9,9 @@ fall), so the output is CC0 as well. Kits:
   metal   anvil, brake drum, slit drum, cowbells, agogo, gongs, triangles, ratchet
 
 Each take goes through a synthetic room; --field adds a gritty chain (tape saturation, band limit,
-noise floor, crackle). Writes 48 kHz mono WAVs and a manifest.
+noise floor, crackle). Writes 48 kHz stereo WAVs and a manifest: each role has its place in the stereo
+field, the room and the noise floor are decorrelated per channel. The grooves are the ones the mono
+version rendered with the same seed (the stereo randomness comes from a second generator).
 
   python -m cli.render_percussion --vcsl .../VCSL --out .../percussion_audition --takes 12 --seconds 30
 """
@@ -91,6 +93,14 @@ DYNAMICS = {"ppp": 1, "pp": 2, "p": 3, "mp": 4, "mf": 5, "f": 6, "ff": 7, "fff":
 MAX_S = dict(kick=1.2, snare=0.9, ghost=0.4, hat=0.3, open=0.9, tom=1.1, crash=2.5)
 # kit drums are damped (concert bass drums and orchestral toms ring for seconds otherwise)
 DAMP_S = dict(kick=0.16, snare=0.22, ghost=0.12, tom=0.3)
+# stereo position per role, -1 (left) .. 1 (right)
+PAN = dict(kick=0.0, snare=-0.08, ghost=0.18, hat=0.35, open=0.3, tom=-0.3, crash=-0.4)
+
+
+def pan_gains(pan: float) -> np.ndarray:
+  """Constant-power pan, unity at the centre."""
+  a = (pan + 1.0) * np.pi / 4
+  return np.array([np.cos(a), np.sin(a)], dtype=np.float32) * np.float32(np.sqrt(2.0))
 
 
 class Instrument:
@@ -128,11 +138,11 @@ class Instrument:
   @staticmethod
   def _load(f: str) -> np.ndarray:
     x, sr = sf.read(f, dtype="float32", always_2d=True)
-    x = x.mean(1)
+    x = np.repeat(x, 2, axis=1) if x.shape[1] == 1 else x[:, :2]          # [T, 2]
     if sr != FS:
       import librosa
-      x = librosa.resample(x, orig_sr=sr, target_sr=FS)
-    return x
+      x = librosa.resample(x.T, orig_sr=sr, target_sr=FS).T
+    return np.ascontiguousarray(x)
 
   def sample(self, vel: float, rng) -> np.ndarray:
     k = self.keys[min(len(self.keys) - 1, int(vel * len(self.keys)))]
@@ -149,26 +159,28 @@ def room_ir(rng, rt60: float, pre_ms: float = 8.0) -> np.ndarray:
   return ir / np.sqrt((ir ** 2).sum())
 
 
-def field_chain(x: np.ndarray, rng) -> np.ndarray:
+def field_chain(x: np.ndarray, rng, side) -> np.ndarray:
+  """x [T, 2]. The left channel's noise floor comes from rng as in the mono version, the right one's from side."""
   x = np.tanh(x * 2.2) / np.tanh(2.2)                                  # tape saturation
   sos = butter(2, [70, rng.uniform(5000, 9000)], "bandpass", fs=FS, output="sos")
-  x = sosfilt(sos, x)
-  noise = np.cumsum(rng.standard_normal(len(x))) ; noise -= np.convolve(noise, np.ones(4800) / 4800, "same")
-  noise = sosfilt(butter(1, 200, "highpass", fs=FS, output="sos"), noise)
-  x = x + noise / (np.abs(noise).max() + 1e-9) * 10 ** (-38 / 20)    # noise floor
+  x = sosfilt(sos, x, axis=0)
+  for c, g in enumerate((rng, side)):
+    noise = np.cumsum(g.standard_normal(len(x))) ; noise -= np.convolve(noise, np.ones(4800) / 4800, "same")
+    noise = sosfilt(butter(1, 200, "highpass", fs=FS, output="sos"), noise)
+    x[:, c] += noise / (np.abs(noise).max() + 1e-9) * 10 ** (-38 / 20)    # noise floor
   clicks = np.zeros(len(x)); idx = rng.integers(0, len(x), int(len(x) / FS * rng.uniform(2, 9)))
   clicks[idx] = rng.uniform(-1, 1, len(idx)) * 10 ** (-24 / 20)
-  return x + sosfilt(butter(2, 2500, "highpass", fs=FS, output="sos"), clicks)  # crackle
+  return x + sosfilt(butter(2, 2500, "highpass", fs=FS, output="sos"), clicks)[:, None]  # crackle
 
 
-def render_take(kit: dict, style: str, seconds: float, rng, field: bool, kit_name: str = "") -> tuple[np.ndarray, dict]:
+def render_take(kit: dict, style: str, seconds: float, rng, side, field: bool, kit_name: str = "") -> tuple[np.ndarray, dict]:
   st = STYLES[style]
   steps = st["steps"]
   bpm = rng.uniform(72, 132) if steps == 16 else rng.uniform(60, 104)
   step_s = 60.0 / bpm / (4 if steps == 16 else 3)
   swing = rng.uniform(0.0, 0.18) if steps == 16 else 0.0
   bars = int(np.ceil(seconds / (step_s * steps)))
-  out = np.zeros(int((bars * steps * step_s + 4) * FS), dtype=np.float32)
+  out = np.zeros((int((bars * steps * step_s + 4) * FS), 2), dtype=np.float32)
   voices = {}
   for role, alts in kit.items():
     for folder, art in rng.permutation(np.array(alts, dtype=object)):
@@ -203,21 +215,21 @@ def render_take(kit: dict, style: str, seconds: float, rng, field: bool, kit_nam
         vel = np.clip(intensity * (0.55 if role == "ghost" else 1.0) * rng.uniform(0.75, 1.0), 0.05, 1.0)
         x = voices[role].sample(vel, rng)
         if kit_name == "kit" and role in DAMP_S:
-          x = x * np.exp(-np.arange(len(x)) / (DAMP_S[role] * FS))
+          x = x * np.exp(-np.arange(len(x)) / (DAMP_S[role] * FS))[:, None]
         n = int(MAX_S[role] * FS)
         if len(x) > n:   # cap the tail, with a 40 ms fade
           x = x[:n].copy()
-          x[-1920:] *= np.linspace(1.0, 0.0, 1920)
+          x[-1920:] *= np.linspace(1.0, 0.0, 1920)[:, None]
         lag = rng.normal(0.0, 0.006) + (0.008 if role == "snare" else 0.0)    # laid-back snare
         i0 = max(0, int((t + lag) * FS))
-        x = x[: len(out) - i0] * gains[role] * (0.6 + 0.4 * vel)
+        x = x[: len(out) - i0] * gains[role] * (0.6 + 0.4 * vel) * pan_gains(PAN[role])
         out[i0:i0 + len(x)] += x
   out = out[: int(seconds * FS)]
   rt60 = rng.uniform(0.25, 0.9)
-  wet = fftconvolve(out, room_ir(rng, rt60))[: len(out)]
+  wet = np.stack([fftconvolve(out[:, c], room_ir(g, rt60))[: len(out)] for c, g in enumerate((rng, side))], axis=1)
   mix = out + wet * rng.uniform(0.06, 0.2)
   if field:
-    mix = field_chain(mix / (np.abs(mix).max() + 1e-9) * 0.7, rng)
+    mix = field_chain(mix / (np.abs(mix).max() + 1e-9) * 0.7, rng, side)
   mix = mix / (np.abs(mix).max() + 1e-9) * 0.9
   return mix.astype(np.float32), dict(bpm=round(bpm, 1), swing=round(swing, 3), rt60=round(rt60, 2),
                                       voices={r: os.path.basename(os.path.dirname(v.layers[v.keys[0]][0])) for r, v in voices.items()})
@@ -245,7 +257,7 @@ def main():
       style = styles[kit][(n // len(kits)) % len(styles[kit])]
       field = args.field == "on" or (args.field == "both" and (n // len(kits)) % 2 == 1)
       seconds = rng.uniform(args.seconds, args.max_seconds) if args.max_seconds > args.seconds else args.seconds
-      x, info = render_take(kits[kit], style, seconds, rng, field, kit)
+      x, info = render_take(kits[kit], style, seconds, rng, np.random.default_rng([args.seed, n, 1]), field, kit)
       name = f"{n:03d}_{kit}_{style}{'_field' if field else ''}.wav"
       sf.write(os.path.join(args.out, "audio", name), x, FS, subtype="PCM_24")
       man.write(json.dumps(dict(file="audio/" + name, kit=kit, style=style, field=field, **info,

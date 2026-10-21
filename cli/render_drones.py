@@ -4,7 +4,9 @@ Each take is a slow progression of mellow voicings (fifths, sus2, minor 7, add9,
 one or two instrument families: organ, string sections (sustain with vibrato), bowed psaltery, wine
 glasses, harmonicas. Notes are the nearest sample re-pitched by up to a few semitones; tones are
 extended by crossfade-looping the sustain; chords crossfade over several seconds; a long synthetic
-hall goes on top. Sample pitch comes from the file name when it has a note, else from pYIN.
+hall goes on top. Stereo: the samples keep their own stereo image, a chord's root sits in the centre and
+its other voices spread left and right, and the hall is decorrelated per channel (from a second
+generator, so the takes are the ones the mono version rendered with the same seed). Sample pitch comes from the file name when it has a note, else from pYIN.
 
   python -m cli.render_drones --vsco .../VSCO-2-CE --vcsl .../VCSL --out .../drone_audition --takes 8 --seconds 45
 """
@@ -32,6 +34,7 @@ FAMILIES = {
     "harmonica": ["VCSL/Aerophones/Free Aerophones/Harmonica-Hohner-Special20-C", "VCSL/Aerophones/Free Aerophones/Harmonica-Hohner-Super64"],
 }
 VOICINGS = [[0, 7, 12], [0, 7, 14], [0, 2, 7, 12], [0, 3, 10, 14], [0, 5, 7, 12], [0, 7, 12, 16], [0, 4, 11, 14], [0, 12, 19]]
+VOICE_PAN = [0.0, -0.45, 0.45, -0.25, 0.25]   # per voice of a chord, the root in the centre
 PROGRESSIONS = [[0, 5, 0, 7], [0, -2, -4, -2], [0, 3, 5, 3], [0, 0, 5, 5], [0, -5, -3, 0], [0, 2, 0, -2]]
 
 
@@ -62,12 +65,12 @@ class Family:
         files = [f for f in files if art.lower() in os.path.basename(f).lower()]
       for f in files:
         x, sr = sf.read(f, dtype="float32", always_2d=True)
-        x = x.mean(1)
+        x = np.repeat(x, 2, axis=1) if x.shape[1] == 1 else x[:, :2]       # [T, 2]
         if sr != FS:
-          x = librosa.resample(x, orig_sr=sr, target_sr=FS)
+          x = librosa.resample(x.T, orig_sr=sr, target_sr=FS).T
         if len(x) < 2 * FS:
           continue
-        m = midi_of(f, x)
+        m = midi_of(f, x.mean(1))
         if m is not None:
           self.notes.append((m, x / (np.abs(x).max() + 1e-9), f))
     if not self.notes:
@@ -82,18 +85,24 @@ class Family:
       midi += 12
     ratio = 2 ** ((midi - m) / 12)                 # re-pitch by resampling
     up, down = int(round(1000 / ratio)), 1000
-    x = resample_poly(x, up, down).astype(np.float32)
+    x = resample_poly(x, up, down, axis=0).astype(np.float32)
     # sustain loop: from 25 % to 85 % of the sample, crossfaded by 0.8 s
     a, b = int(len(x) * 0.25), int(len(x) * 0.85)
     loop, xf = x[a:b], int(0.8 * FS)
     if len(loop) < 2 * xf:
-      return np.resize(x, int(seconds * FS))
+      return np.resize(x, (int(seconds * FS), 2))
     out = x[:b].copy()
-    ramp = np.linspace(0.0, 1.0, xf, dtype=np.float32)
+    ramp = np.linspace(0.0, 1.0, xf, dtype=np.float32)[:, None]
     while len(out) < seconds * FS:
       out[-xf:] = out[-xf:] * (1 - ramp) + loop[:xf] * ramp
       out = np.concatenate([out, loop[xf:]])
     return out[: int(seconds * FS)].astype(np.float32)
+
+
+def pan_gains(pan: float) -> np.ndarray:
+  """Constant-power pan, unity at the centre."""
+  a = (pan + 1.0) * np.pi / 4
+  return np.array([np.cos(a), np.sin(a)], dtype=np.float32) * np.float32(np.sqrt(2.0))
 
 
 def hall(rng, rt60: float) -> np.ndarray:
@@ -104,7 +113,7 @@ def hall(rng, rt60: float) -> np.ndarray:
   return ir / np.sqrt((ir ** 2).sum())
 
 
-def render_take(fams: dict, names: list, seconds: float, rng) -> tuple[np.ndarray, dict]:
+def render_take(fams: dict, names: list, seconds: float, rng, side) -> tuple[np.ndarray, dict]:
   lo = max(fams[n].range[0] for n in names)
   hi = min(fams[n].range[1] for n in names)
   root = float(rng.integers(int(lo) + 2, max(int(lo) + 3, int(min(hi - 14, lo + 18)))))
@@ -112,7 +121,7 @@ def render_take(fams: dict, names: list, seconds: float, rng) -> tuple[np.ndarra
   chord_s = rng.uniform(10, 18)
   xfade = min(chord_s * 0.45, rng.uniform(4, 7))
   n_chords = int(np.ceil(seconds / chord_s)) + 1
-  out = np.zeros(int((seconds + chord_s + 10) * FS), dtype=np.float32)
+  out = np.zeros((int((seconds + chord_s + 10) * FS), 2), dtype=np.float32)
   used = []
   for c in range(n_chords):
     voicing = VOICINGS[rng.integers(len(VOICINGS))]
@@ -132,15 +141,15 @@ def render_take(fams: dict, names: list, seconds: float, rng) -> tuple[np.ndarra
       env[:fi] = np.linspace(0, 1, fi) ** 1.5
       env[-int(xfade * FS):] = np.linspace(1, 0, int(xfade * FS)) ** 1.5
       i0 = int(t0 * FS)
-      out[i0:i0 + len(x)] += (x * env)[: len(out) - i0]
+      out[i0:i0 + len(x)] += (x * env[:, None] * pan_gains(VOICE_PAN[k % len(VOICE_PAN)]))[: len(out) - i0]
     used.append(dict(at=round(c * chord_s, 1), root=base, voicing=voicing))
   out = out[: int(seconds * FS)]
   rt60 = rng.uniform(3.0, 6.0)
-  wet = fftconvolve(out, hall(rng, rt60))[: len(out)]
+  wet = np.stack([fftconvolve(out[:, c], hall(g, rt60))[: len(out)] for c, g in enumerate((rng, side))], axis=1)
   mix = out * 0.7 + wet * rng.uniform(0.35, 0.6)
   fade = int(3 * FS)
-  mix[:fade] *= np.linspace(0, 1, fade)
-  mix[-fade:] *= np.linspace(1, 0, fade)
+  mix[:fade] *= np.linspace(0, 1, fade)[:, None]
+  mix[-fade:] *= np.linspace(1, 0, fade)[:, None]
   mix = mix / (np.abs(mix).max() + 1e-9) * 0.8
   return mix.astype(np.float32), dict(families=names, rt60=round(rt60, 1), chord_s=round(chord_s, 1), chords=used)
 
@@ -172,7 +181,7 @@ def main():
     for n in range(args.takes):
       names = combos[n % len(combos)]
       seconds = rng.uniform(args.seconds, args.max_seconds) if args.max_seconds > args.seconds else args.seconds
-      x, info = render_take(fams, names, seconds, rng)
+      x, info = render_take(fams, names, seconds, rng, np.random.default_rng([args.seed, n, 1]))
       name = f"{n:03d}_{'+'.join(names)}.wav"
       sf.write(os.path.join(args.out, "audio", name), x, FS, subtype="PCM_24")
       man.write(json.dumps(dict(file="audio/" + name, **info, licence="CC0 (VSCO 2 CE / VCSL samples, generated)",
