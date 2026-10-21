@@ -14,7 +14,7 @@ force_weights_only_false()
 import os
 import shutil
 
-from torch.utils.data import DataLoader, Subset, random_split
+from torch.utils.data import DataLoader, RandomSampler, Subset, random_split
 from ddsp import DDSP, AudioFeatureDataset
 from ddsp.synths import BendableNoiseBandSynth
 from ddsp.callbacks import BetaWarmupEpochCallback
@@ -97,7 +97,15 @@ def main(cfg: DictConfig) -> None:
   synth_indices = torch.randperm(synth_total_len, generator=generator)
   synth_val_indices = synth_indices[:synth_val_len]
   train_indices = synth_indices
-  train_loader = DataLoader(Subset(synth_dataset, train_indices), batch_size=batch_size, shuffle=True, num_workers=0, generator=generator)
+  # trainer.samples_per_epoch (optional): a fixed epoch length, sampled with replacement, so a small dataset
+  # gets the steps (and epoch-based schedules: beta warm-up, checkpoints) of a larger one
+  samples_per_epoch = int(getattr(cfg.trainer, 'samples_per_epoch', 0) or 0)
+  if samples_per_epoch > 0:
+    sampler = RandomSampler(Subset(synth_dataset, train_indices), replacement=True, num_samples=samples_per_epoch,
+                            generator=generator)
+    train_loader = DataLoader(Subset(synth_dataset, train_indices), batch_size=batch_size, sampler=sampler, num_workers=0)
+  else:
+    train_loader = DataLoader(Subset(synth_dataset, train_indices), batch_size=batch_size, shuffle=True, num_workers=0, generator=generator)
   val_loader = DataLoader(Subset(synth_dataset, synth_val_indices), batch_size=batch_size, shuffle=False, num_workers=0, generator=generator)
 
   # Synths from config
@@ -152,6 +160,11 @@ def main(cfg: DictConfig) -> None:
     ))
 
   callbacks.append(ModelCheckpoint(dirpath=synth_training_path, filename='best', monitor='val_loss', mode='min', save_top_k=1, save_last=True))
+  # trainer.save_every_n_epochs (optional): keep a checkpoint every n epochs (e<epoch>.ckpt), for learning curves
+  every = int(getattr(cfg.trainer, 'save_every_n_epochs', 0) or 0)
+  if every > 0:
+    callbacks.append(ModelCheckpoint(dirpath=synth_training_path, filename='e{epoch}', every_n_epochs=every, save_top_k=-1,
+                                     auto_insert_metric_name=False))
 
   # Trainer
   synth_trainer = L.Trainer(
