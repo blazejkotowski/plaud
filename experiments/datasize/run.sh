@@ -4,6 +4,7 @@
 #   nohup experiments/datasize/run.sh > ~/datasize.log 2>&1 &
 cd /home/btadeusz/code/plaud
 PY=/home/btadeusz/miniconda3/envs/ddsp/bin/python
+export PYTHONPATH=/home/btadeusz/code/plaud
 D=/mnt/mariadata/datasets/research/datasize
 R=experiments/datasize/results
 SETS=(harbour percussion drone_sampled)
