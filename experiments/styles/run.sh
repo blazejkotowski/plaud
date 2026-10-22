@@ -1,6 +1,7 @@
 #!/bin/zsh
 # Style experiments runner (maria): E1 oracle, E3 lat4, E2 k12, E4 rangeadv on one set, one at a time with
-# the GPU to itself (PLANC processes, cwd ~/code/planc, are SIGSTOPped while a run trains or is evaluated).
+# the GPU to itself. The PLANC queue is stopped for the whole series (a SIGSTOPped PLANC codec still holds
+# ~15 GB of GPU memory) and restarted at the end; it resumes from its last.ckpt.
 # After each run: passage reconstructions of every checkpoint, then the scores (percept env).
 #   nohup experiments/styles/run.sh percussion > ~/styles.log 2>&1 &
 set=${1:-percussion}
@@ -16,10 +17,18 @@ FULL=(harbour configs/factory3/04_harbour_nosilence.yaml percussion configs/fact
 DATA=$(grep -m1 "^  dataset_path:" $FULL[$set] | awk '{print $2}')
 
 planc_pids() { for p in $(pgrep python); do [ "$(readlink /proc/$p/cwd)" = /home/btadeusz/code/planc ] && echo $p; done }
-pause_planc() { while true; do for p in $(planc_pids); do kill -STOP $p 2>/dev/null; done; sleep 15; done }
-hold() { pause_planc & HOLD=$!; sleep 1; echo "$(date) PLANC paused"; }
-release() { kill $HOLD 2>/dev/null; wait $HOLD 2>/dev/null; for p in $(planc_pids); do kill -CONT $p 2>/dev/null; done; echo "$(date) PLANC resumed"; }
+hold() {
+  for p in $(pgrep -f "/home/btadeusz/planc_[q]ueue.sh"); do kill $p; done
+  for p in $(planc_pids); do kill $p; done; sleep 10
+  for p in $(planc_pids); do kill -9 $p; done
+  echo "$(date) PLANC stopped"
+}
+release() {
+  pgrep -f "/home/btadeusz/planc_[q]ueue.sh" > /dev/null || { nohup zsh /home/btadeusz/planc_queue.sh >> /home/btadeusz/planc_queue.log 2>&1 &; }
+  echo "$(date) PLANC restarted"
+}
 trap 'release; exit 1' INT TERM
+hold
 
 for mode in oracle k12; do
   [ -f experiments/styles/labels/${set}_$mode.npy ] || $PY experiments/styles/make_styles.py --dataset $DATA \
@@ -27,14 +36,11 @@ for mode in oracle k12; do
 done
 $PY experiments/styles/make_configs.py --set $set
 
-hold
 [ -d $R/base/e160 ] || $PY experiments/styles/eval_passages.py --config $FULL[$set] --excerpts $EX \
     --ckpt $(ls training/synth/$(grep -m1 "^  name:" $FULL[$set] | awk '{print $2}')/last.ckpt) --out $R/base/e160
-release
 
 for exp in oracle lat4 k12 rangeadv; do
   name=st_${set}_$exp
-  hold
   if [ ! -f training/research/synth/$name/e159.ckpt ]; then
     echo "$(date) train $name"
     SYNTH_NO_PBAR=1 $PY -m cli.train_multiple configs/research_styles --configs ${set}_$exp --stages synth \
@@ -45,8 +51,8 @@ for exp in oracle lat4 k12 rangeadv; do
     [ -d $R/$exp/e$e ] || $PY experiments/styles/eval_passages.py --config configs/research_styles/${set}_$exp.yaml \
         --excerpts $EX --ckpt $c --out $R/$exp/e$e
   done
-  release
   $PERCEPT experiments/styles/score_passages.py --results $R 2>/dev/null | tail -n +1 > $R/summary_after_$exp.txt
   echo "$(date) scored after $exp"; cat $R/summary_after_$exp.txt
 done
+release
 echo "$(date) style experiments finished ($set)"
