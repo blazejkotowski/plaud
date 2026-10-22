@@ -14,6 +14,7 @@ set's full factory model (the *_nosilence config, whose trained synth is the E0 
                 (the steps are a zipper hiss), baseline loss
   syn250    E11 250 bands, iteratively flattened (flat envelope, exactly band-limited), clean stopband, int16, ramps
   syn500    E12 the same with 500 bands (the best ideal-control ceiling on drone and harbour, on par on drums)
+  syn500env E13 syn500 with the band-envelope loss (the candidate recipe: new synth + MRSTFT + EnvelopeLoss 0.1)
 
 Checkpoints every 20 epochs. Style labels come from make_styles.py (experiments/styles/labels).
 
@@ -54,7 +55,8 @@ def main():
                     ("flat1000", "1000 constant-envelope noise bands"),
                     ("clean1000", "int16 noise bands and linear amplitude ramps"),
                     ("syn250", "250 flattened, band-limited int16 noise bands with linear ramps"),
-                    ("syn500", "500 flattened, band-limited int16 noise bands with linear ramps")]:
+                    ("syn500", "500 flattened, band-limited int16 noise bands with linear ramps"),
+                    ("syn500env", "500 flattened, band-limited int16 noise bands with linear ramps, band-envelope loss")]:
     c = sub(r"^  name: \S+", f"  name: st_{args.set}_{exp}", base)
     if exp in ("oracle", "k12"):
       c = sub(r"^(data:\n)", rf"\1  styles: {LABELS}/{args.set}_{exp}.npy\n", c)
@@ -63,12 +65,12 @@ def main():
       c = sub(r"(- name: latents\n\s+dim: )2", r"\g<1>4", c)
     if exp in ("rangeadv", "range"):
       c = sub(r"^(losses:\n)", r"\1  - type: DynamicRangeLoss\n    weight: 0.1\n    params:\n      fs: 48000\n", c)
-    if exp == "env":
+    if exp in ("env", "syn500env"):
       c = sub(r"^(losses:\n)", r"\1  - type: EnvelopeLoss\n    weight: 0.1\n    params:\n      fs: 48000\n", c)
     if exp == "clean1000":
       c = sub(r"^(\s+)n_filters: (\d+)\n", r"\1n_filters: \2\n\1noise_bits: 16\n\1ramp: true\n", c)
-    if exp in ("syn250", "syn500"):
-      c = sub(r"^(\s+)n_filters: \d+\n", rf"\1n_filters: {exp[3:]}\n\1flatten_noise: true\n\1flatten_iters: 8\n"
+    if exp in ("syn250", "syn500", "syn500env"):
+      c = sub(r"^(\s+)n_filters: \d+\n", rf"\1n_filters: {exp[3:6]}\n\1flatten_noise: true\n\1flatten_iters: 8\n"
               r"\1clean_stopband: true\n\1noise_bits: 16\n\1ramp: true\n", c)
     if exp.startswith("flat"):
       c = sub(r"^(\s+)n_filters: \d+\n", rf"\1n_filters: {exp[4:]}\n\1flatten_noise: true\n", c)
