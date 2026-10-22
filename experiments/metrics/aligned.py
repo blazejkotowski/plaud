@@ -13,6 +13,9 @@ level in dB, floored 80 dB below the original's loudest band frame (so inaudible
   tail_cut        how much quieter the decays after onsets are (10-400 ms after the peak), dB, >= 0
   tail_long       how much louder they are (smeared or held tails, hiss under the decay), dB, >= 0
   floor           rise of the 10th percentile level, log-energy weighted (as in the earlier score), dB, >= 0
+  ltas            the long-term spectrum at fine resolution (8192-point STFT, ~6 Hz bins), mean |difference| over
+                  bins within 60 dB of the original's peak, weighted by the original's level; dB (tonal detail,
+                  which the 48 bands above can't see)
 Lower is better for all.
 
   python experiments/metrics/aligned.py ORIG.wav RECON.wav
@@ -104,6 +107,12 @@ def scores(orig, recon):
   Do, Dr = _db(sm(Po, 20), floor), _db(sm(Pr, 20), floor)
   lo, rlo = np.percentile(Do, 10, 1), np.percentile(Dr, 10, 1)
   out["floor"] = float((np.maximum(rlo - lo, 0) * w).sum())
+
+  lt = lambda x: 10 * np.log10((np.abs(librosa.stft(x, n_fft=8192, hop_length=2048)) ** 2).mean(1) + 1e-12)
+  Lo, Lr = lt(xo[:n]), lt(xr[:n])
+  live = Lo > Lo.max() - 60
+  wl = (Lo - (Lo.max() - 60))[live]
+  out["ltas"] = float((np.abs(Lr - Lo)[live] * wl).sum() / wl.sum())
   return out
 
 
