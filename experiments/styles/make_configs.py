@@ -7,6 +7,7 @@ set's full factory model (the *_nosilence config, whose trained synth is the E0 
   rangeadv  E4  dynamic-range loss + the adversarial loss, no styles (loss-side fix)
   range     E5  dynamic-range loss alone (separates the two halves of E4)
   adv       E6  adversarial loss alone (distribution matching, no range loss)
+  env       E7  time-aligned band-envelope loss (EnvelopeLoss) next to the spectral loss
 
 Checkpoints every 20 epochs. Style labels come from make_styles.py (experiments/styles/labels).
 
@@ -42,7 +43,8 @@ def main():
   os.makedirs("configs/research_styles", exist_ok=True)
   for exp, what in [("oracle", "one style embedding per 16 s passage"), ("k12", "12 style clusters of 16 s passages"),
                     ("lat4", "4 latents, no styles"), ("rangeadv", "dynamic-range loss + adversarial loss"),
-                    ("range", "dynamic-range loss alone"), ("adv", "adversarial loss alone")]:
+                    ("range", "dynamic-range loss alone"), ("adv", "adversarial loss alone"),
+                    ("env", "band-envelope loss")]:
     c = sub(r"^  name: \S+", f"  name: st_{args.set}_{exp}", base)
     if exp in ("oracle", "k12"):
       c = sub(r"^(data:\n)", rf"\1  styles: {LABELS}/{args.set}_{exp}.npy\n", c)
@@ -51,6 +53,8 @@ def main():
       c = sub(r"(- name: latents\n\s+dim: )2", r"\g<1>4", c)
     if exp in ("rangeadv", "range"):
       c = sub(r"^(losses:\n)", r"\1  - type: DynamicRangeLoss\n    weight: 0.1\n    params:\n      fs: 48000\n", c)
+    if exp == "env":
+      c = sub(r"^(losses:\n)", r"\1  - type: EnvelopeLoss\n    weight: 0.1\n    params:\n      fs: 48000\n", c)
     if exp in ("rangeadv", "adv"):
       c = sub(r"^(adversarial:\n  )enabled: false", r"\1enabled: true", c)
       c = sub(r"g_start_epoch: \d+", "g_start_epoch: 40", c)
