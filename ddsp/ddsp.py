@@ -154,6 +154,8 @@ class DDSP(L.LightningModule):
                silence_reg_prob: float = 0.25,
                silence_reg_weight: float = 1.0,
                silence_floor_db: float = -70.0,
+               n_styles: int = 0,
+               style_dim: int = 16,
                config_name: str | None = None,
                device: str = 'cuda'):
     super().__init__()
@@ -253,10 +255,15 @@ class DDSP(L.LightningModule):
         resampling_factor=self.resampling_factor,
       )
 
+    ## Style embeddings (optional, research): a learned vector per style label (a cluster of
+    ## passages, or each passage), concatenated to the latents at the decoder input only
+    self.n_styles, self.style_dim = int(n_styles), int(style_dim) if n_styles > 0 else 0
+    self.style_emb = torch.nn.Embedding(self.n_styles, self.style_dim) if self.n_styles > 0 else None
+
     ## Decoder to predict the amplitudes of the noise bands
     self.decoder = Decoder(
       n_params=self._total_synth_params,
-      latent_size=max(self.latent_size, 1),
+      latent_size=max(self.latent_size, 1) + self.style_dim,
       n_features=max(self.feature_dim, 1),
       n_channels=n_channels,
       layer_sizes=(np.array(decoder_ratios)*capacity).tolist(),
@@ -590,7 +597,7 @@ class DDSP(L.LightningModule):
     Returns:
       loss: torch.Tensor[batch_size, 1], tensor of loss
     """
-    x_audio, x_features = batch
+    x_audio, x_features, style = self._unpack(batch)
     opt_ddsp, opt_disc = self.optimizers()
     sched_ddsp, sched_disc = self.lr_schedulers()
 
@@ -599,7 +606,7 @@ class DDSP(L.LightningModule):
       x_audio, x_features = self._silence_envelopes(x_audio, x_features)
 
     # Autoencode once
-    y_audio, kld_loss = self._autoencode(x_audio, x_features)
+    y_audio, kld_loss = self._autoencode(x_audio, x_features, style)
 
     # Silence regulariser: loudness 0 with this chunk's latents must decode to silence
     silence_loss = torch.tensor(0.0, device=x_audio.device)
@@ -723,10 +730,10 @@ class DDSP(L.LightningModule):
 
   def validation_step(self, batch: Tuple[torch.Tensor, torch.Tensor], batch_idx: int) -> torch.Tensor:
     """Compute the loss for validation data"""
-    x_audio, x_features = batch
+    x_audio, x_features, style = self._unpack(batch)
 
     with torch.no_grad():
-      y_audio, _ = self._autoencode(x_audio, x_features)
+      y_audio, _ = self._autoencode(x_audio, x_features, style)
 
     val_loss = self._reconstruction_loss(y_audio.float(), x_audio.float())
     # Log validation loss components (epoch-level)
@@ -806,11 +813,29 @@ class DDSP(L.LightningModule):
       return z_smooth
 
 
-  def _autoencode(self, x_audio: torch.Tensor, x_features: torch.Tensor) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+  @staticmethod
+  def _unpack(batch):
+    """(audio, features) or (audio, features, style labels)."""
+    return (batch[0], batch[1], batch[2]) if len(batch) > 2 else (batch[0], batch[1], None)
+
+  def _with_style(self, z: torch.Tensor, style: torch.Tensor | None) -> torch.Tensor:
+    """Concatenate the style embeddings to the latents: style [B] (one per chunk) or [B, T_s] (per frame)."""
+    if self.style_emb is None:
+      return z
+    assert style is not None, "this model is style-conditioned: pass style labels"
+    e = self.style_emb(style.long().to(z.device))
+    if e.dim() == 2:
+      e = e[:, None, :].expand(-1, z.shape[1], -1)
+    elif e.shape[1] != z.shape[1]:
+      e = F.interpolate(e.transpose(1, 2), size=z.shape[1], mode='nearest').transpose(1, 2)
+    return torch.cat([z, e], dim=-1)
+
+  def _autoencode(self, x_audio: torch.Tensor, x_features: torch.Tensor, style: torch.Tensor | None = None) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """
     Autoencode the audio signal
     Args:
       - x_audio: torch.Tensor[batch_size, n_signal], the input audio signal
+      - style: optional style labels, [batch_size] or [batch_size, T], for a style-conditioned model
     Returns:
       - y_audio: torch.Tensor[batch_size, n_signal], the autoencoded audio signal
       - kld: torch.Tensor[], the KL divergence of the latent distribution
@@ -836,6 +861,7 @@ class DDSP(L.LightningModule):
       T_min = min(T_feat, T_z)
       x_features = x_features[:, :T_min, :]
       z = z[:, :T_min, :]
+    z = self._with_style(z, style)
 
     # When feature_dim==0, create a dummy single-channel zero feature for decoder path
     x_features_for_decoder = x_features if self.feature_dim > 0 else torch.zeros(x_features.shape[0], x_features.shape[1], 1, device=x_features.device, dtype=x_features.dtype)

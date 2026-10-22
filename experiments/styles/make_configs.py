@@ -1,0 +1,62 @@
+"""Configs for the style experiments: configs/research_styles/<set>_<exp>.yaml, each a variant of the
+set's full factory model (the *_nosilence config, whose trained synth is the E0 baseline):
+
+  oracle    E1  one style embedding per 16 s passage (upper limit of conditioning)
+  k12       E2  12 style clusters of 16 s passages (the version a style pad would use)
+  lat4      E3  4 latents instead of 2, no styles (capacity within a passage)
+  rangeadv  E4  dynamic-range loss + the adversarial loss, no styles (loss-side fix)
+
+Checkpoints every 20 epochs. Style labels come from make_styles.py (experiments/styles/labels).
+
+  python experiments/styles/make_configs.py --set percussion
+"""
+
+import argparse
+import os
+import re
+
+FULL = {
+    "harbour": "configs/factory3/04_harbour_nosilence.yaml",
+    "percussion": "configs/factory2/02_percussion_nosilence.yaml",
+    "drone_sampled": "configs/factory2/04_drone_sampled_nosilence.yaml",
+}
+LABELS = "/home/btadeusz/code/plaud/experiments/styles/labels"
+
+
+def sub(pattern, repl, s):
+  s2, k = re.subn(pattern, repl, s, count=1, flags=re.M)
+  assert k == 1, pattern
+  return s2
+
+
+def main():
+  ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+  ap.add_argument("--set", required=True, choices=list(FULL))
+  args = ap.parse_args()
+  src = FULL[args.set]
+  base = open(src).read()
+  base = sub(r"^  training_dir: \S+", "  training_dir: training/research", base)
+  base = sub(r"^(trainer:\n)", r"\1  save_every_n_epochs: 20\n", base)
+  os.makedirs("configs/research_styles", exist_ok=True)
+  for exp, what in [("oracle", "one style embedding per 16 s passage"), ("k12", "12 style clusters of 16 s passages"),
+                    ("lat4", "4 latents, no styles"), ("rangeadv", "dynamic-range loss + adversarial loss")]:
+    c = sub(r"^  name: \S+", f"  name: st_{args.set}_{exp}", base)
+    if exp in ("oracle", "k12"):
+      c = sub(r"^(data:\n)", rf"\1  styles: {LABELS}/{args.set}_{exp}.npy\n", c)
+      c = sub(r"^(model:\n)", r"\1  style_dim: 16\n", c)
+    if exp == "lat4":
+      c = sub(r"(- name: latents\n\s+dim: )2", r"\g<1>4", c)
+    if exp == "rangeadv":
+      c = sub(r"^(losses:\n)", r"\1  - type: DynamicRangeLoss\n    weight: 0.1\n    params:\n      fs: 48000\n", c)
+      c = sub(r"^(adversarial:\n  )enabled: false", r"\1enabled: true", c)
+      c = sub(r"g_start_epoch: \d+", "g_start_epoch: 40", c)
+      c = sub(r"d_start_epoch: \d+", "d_start_epoch: 30", c)
+    head = (f"# STYLE EXPERIMENT (2026-10-22): {src} with {what}.\n"
+            f"# experiments/styles/make_configs.py. Synth stage only.\n#\n")
+    out = f"configs/research_styles/{args.set}_{exp}.yaml"
+    open(out, "w").write(head + c)
+    print(out)
+
+
+if __name__ == "__main__":
+  main()
