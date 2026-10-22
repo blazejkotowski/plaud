@@ -3,8 +3,9 @@
 # the GPU to itself. The PLANC queue is stopped for the whole series (a SIGSTOPped PLANC codec still holds
 # ~15 GB of GPU memory) and restarted at the end; it resumes from its last.ckpt.
 # After each run: passage reconstructions of every checkpoint, then the scores (percept env).
-#   nohup experiments/styles/run.sh percussion > ~/styles.log 2>&1 &
+#   nohup experiments/styles/run.sh percussion [exp ...] > ~/styles.log 2>&1 &
 set=${1:-percussion}
+exps=(${@[2,-1]}); (( $#exps )) || exps=(oracle lat4 k12 rangeadv)
 cd /home/btadeusz/code/plaud
 PY=/home/btadeusz/miniconda3/envs/ddsp/bin/python
 PERCEPT=/home/btadeusz/miniconda3/envs/percept/bin/python
@@ -39,7 +40,7 @@ $PY experiments/styles/make_configs.py --set $set
 [ -d $R/base/e160 ] || $PY experiments/styles/eval_passages.py --config $FULL[$set] --excerpts $EX \
     --ckpt $(ls training/synth/$(grep -m1 "^  name:" $FULL[$set] | awk '{print $2}')/last.ckpt) --out $R/base/e160
 
-for exp in oracle lat4 k12 rangeadv; do
+for exp in $exps; do
   name=st_${set}_$exp
   if [ ! -f training/research/synth/$name/e159.ckpt ]; then
     echo "$(date) train $name"
