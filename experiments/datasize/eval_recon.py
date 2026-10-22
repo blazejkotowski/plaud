@@ -3,7 +3,10 @@
 The core (excerpts.json: excerpts[0]) is in every subset and in the full set, so all models are scored
 on the same 16 s. It is located inside the model's OWN dataset (features are normalised over the whole
 training set, 5th-95th percentile, so the core must go through the features the model was trained with),
-cut into 2 s chunks as in training and reconstructed (encoder latents + features -> synth). Per chunk:
+reconstructed (encoder latents + features -> synth) and cut into 2 s chunks for the per-chunk scores.
+By default the 16 s are reconstructed in one pass with the latent means, as the plugin hears them
+(--mode chunks reconstructs each 2 s chunk on its own, as in training, with audible seams; --latents
+sample draws z as in training). Per chunk:
 
   mrstft     the training loss: spectral convergence + log-magnitude L1 over the config's FFT sizes
   logmel_db  mean |log-mel difference| in dB (128 mels, 2048 / 512)
@@ -82,6 +85,8 @@ def main():
   ap.add_argument("--ckpt", default="last", help="last, best, or a checkpoint path")
   ap.add_argument("--out", required=True, help="results .json (the WAVs go next to it)")
   ap.add_argument("--train-chunks", type=int, default=32)
+  ap.add_argument("--mode", choices=["whole", "chunks"], default="whole")
+  ap.add_argument("--latents", choices=["mean", "sample"], default="mean")
   args = ap.parse_args()
 
   cfg = OmegaConf.load(args.config)
@@ -93,6 +98,8 @@ def main():
   else:
     ckpt = args.ckpt
   model = DDSP.load_from_checkpoint(ckpt, control_space=cs, map_location="cuda", weights_only=False).cuda().eval()
+  if args.latents == "mean" and model.encoder is not None:
+    model.encoder.reparametrize = lambda mean, scale: (mean, torch.tensor(0.0, device=mean.device))
   epoch = int(torch.load(ckpt, map_location="cpu", weights_only=False).get("epoch", -1)) + 1
   data = AudioFeatureDataset(dataset_path=cfg.data.dataset_path, n_signal=n, sampling_rate=fs, resampling_factor=rf,
                              control_space=cs, n_channels=int(cfg.audio.n_channels))
@@ -109,8 +116,14 @@ def main():
   assert err < 1e-3, f"core mismatch in {cfg.data.dataset_path}: max diff {err}"
 
   with torch.no_grad():
-    a, f = chunks(data, off, n_core, n, rf)
-    rec, _ = model._autoencode(a, f)
+    if args.mode == "whole":
+      wa, wf = chunks(data, off, 1, n_core * n, rf)
+      wrec, _ = model._autoencode(wa, wf)
+      a = wa.reshape(wa.shape[1], n_core, n).transpose(0, 1)
+      rec = wrec.reshape(wa.shape[1], -1)[:, : n_core * n].reshape(wa.shape[1], n_core, n).transpose(0, 1)
+    else:
+      a, f = chunks(data, off, n_core, n, rf)
+      rec, _ = model._autoencode(a, f)
     x, y = a.sum(1), rec.reshape(a.shape).sum(1)                   # mono sums, [B, T]
     core = dict(mrstft=mrstft(x, y, ffts).tolist(), logmel_db=logmel_db(x, y, fs).tolist())
     g = torch.Generator().manual_seed(0)
@@ -127,7 +140,7 @@ def main():
   stem = os.path.splitext(args.out)[0]
   sf.write(stem + "_orig.wav", a.permute(1, 0, 2).reshape(a.shape[1], -1).T.cpu().numpy(), fs)
   sf.write(stem + "_recon.wav", rec.reshape(a.shape).permute(1, 0, 2).reshape(a.shape[1], -1).T.cpu().numpy(), fs)
-  res = dict(config=args.config, name=cfg.experiment.name, ckpt=ckpt, epoch=epoch, dataset=cfg.data.dataset_path,
+  res = dict(config=args.config, name=cfg.experiment.name, ckpt=ckpt, epoch=epoch, mode=args.mode, latents=args.latents, dataset=cfg.data.dataset_path,
              dataset_s=round(len(data) * n / fs, 1), core=core,
              core_mean={k: float(np.mean(v)) for k, v in core.items()},
              train_mean={k: float(np.mean(v)) for k, v in tr.items()})

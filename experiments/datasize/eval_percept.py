@@ -4,9 +4,11 @@ eval_recon.py writes), to find a metric that agrees with listening better than l
 Per reconstruction and embedding model (fadtk loaders):
   cos   mean cosine distance between time-aligned frames of the original and the reconstruction
   fad   Frechet distance between the two passages' frame sets (frame-rich models only: EnCodec, MERT)
-plus CDPAM (a learned just-noticeable-difference metric), mean over 1 s windows.
+plus two time-aligned DSP scores, which FAD can't see (it compares frame sets, not their order):
+  flux  1 - correlation of the positive spectral flux in 16 mel bands (onsets and transients: timing, attack)
+  env   mean |difference| of the 16 mel-band log envelopes, dB (dynamics per band, 20 ms resolution)
 
-Runs in the `percept` env (fadtk, cdpam):
+Runs in the `percept` env (fadtk):
   python experiments/datasize/eval_percept.py --results experiments/datasize/results --out experiments/datasize/percept.json
 """
 
@@ -53,6 +55,23 @@ def cos_dist(a: np.ndarray, b: np.ndarray) -> float:
   return float(np.mean(1 - (a * b).sum(1) / (np.linalg.norm(a, axis=1) * np.linalg.norm(b, axis=1) + 1e-9)))
 
 
+def bands(x: np.ndarray, fs: int) -> np.ndarray:
+  """[16, T] mel-band log energies, dB, 10 ms hop."""
+  m = librosa.feature.melspectrogram(y=x, sr=fs, n_fft=2048, hop_length=fs // 100, n_mels=16, fmin=30)
+  return 10 * np.log10(m + 1e-8)
+
+
+def aligned(orig: str, recon: str) -> dict:
+  o, fs = librosa.load(orig, sr=None)
+  r, _ = librosa.load(recon, sr=fs)
+  bo, br = bands(o, fs), bands(r, fs)
+  fo, fr = np.maximum(np.diff(bo, axis=1), 0), np.maximum(np.diff(br, axis=1), 0)
+  corr = np.mean([np.corrcoef(a, b)[0, 1] for a, b in zip(fo, fr) if a.std() > 0 and b.std() > 0])
+  k = 2                                                             # 20 ms
+  env = np.abs(bo[:, : bo.shape[1] // k * k].reshape(16, -1, k).mean(2) - br[:, : br.shape[1] // k * k].reshape(16, -1, k).mean(2))
+  return {"flux": float(1 - corr), "env": float(env.mean())}
+
+
 def main():
   ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
   ap.add_argument("--results", required=True)
@@ -67,11 +86,11 @@ def main():
     m = re.match(r"(?:ds_)?(harbour|percussion|drone_sampled)_(full|s\d+)_e(\d+)$", stem)
     if m:
       takes.append(dict(stem=stem, set=m[1], size=m[2], epoch=int(m[3]), recon=r, orig=r.replace("_recon.wav", "_orig.wav")))
-  out = {t["stem"]: dict(set=t["set"], size=t["size"], epoch=t["epoch"]) for t in takes}
+  out = {t["stem"]: dict(set=t["set"], size=t["size"], epoch=t["epoch"], **aligned(t["orig"], t["recon"])) for t in takes}
 
   if os.path.exists(args.out):                                    # resume: keep the models already scored
     for stem, v in json.load(open(args.out)).items():
-      out.setdefault(stem, {}).update(v)
+      out.setdefault(stem, {}).update({k: x for k, x in v.items() if k not in out.get(stem, {})})
   models = {m.name: m for m in get_all_models()}
   for name in MODELS:
     if all(f"{name}/cos" in v for v in out.values()):
@@ -89,20 +108,6 @@ def main():
     json.dump(out, open(args.out, "w"), indent=1)
     del model
 
-  import cdpam
-  loss = cdpam.CDPAM(dev="cpu")
-  for t in takes:
-    o, _ = librosa.load(t["orig"], sr=22050)
-    r, _ = librosa.load(t["recon"], sr=22050)
-    w = 22050
-    ds = []
-    with torch.no_grad():
-      for k in range(0, len(o) - w + 1, w):
-        a = torch.tensor(np.round(o[k:k + w] * 32768)[None], dtype=torch.float32)
-        b = torch.tensor(np.round(r[k:k + w] * 32768)[None], dtype=torch.float32)
-        ds.append(float(loss.forward(a, b)))
-    out[t["stem"]]["cdpam"] = float(np.mean(ds))
-  print("cdpam done", flush=True)
   json.dump(out, open(args.out, "w"), indent=1)
 
 
