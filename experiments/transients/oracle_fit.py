@@ -48,6 +48,8 @@ def main():
   ap.add_argument("--env-smooth", type=float, nargs="+", default=[20.0, 100.0], help="EnvelopeLoss smoothing, ms")
   ap.add_argument("--mrstft-weight", type=float, default=1.0, help="scales the model's own loss items")
   ap.add_argument("--modes", nargs="+", default=["fixed", "random"])
+  ap.add_argument("--stride", type=int, default=1, help="controls at 1/stride of the control rate, linearly "
+                  "interpolated (as the decoder's temporal_stride does)")
   ap.add_argument("--n-filters", type=int, default=0)
   ap.add_argument("--flatten", action="store_true")
   ap.add_argument("--fb", nargs="*", default=[], help="filterbank options key=value (flatten_noise=1 flatten_iters=8 "
@@ -98,7 +100,11 @@ def main():
 
   def synth(log_amp, shift):
     nb._noisebands_shift = shift
-    return nb(torch.exp(log_amp), limit_components=0.0)          # [1, 1, n]
+    amp = torch.exp(log_amp)
+    if args.stride > 1:
+      amp = torch.nn.functional.interpolate(amp, size=n_ctrl_cur[0], mode="linear", align_corners=False)
+    return nb(amp, limit_components=0.0)          # [1, 1, n]
+  n_ctrl_cur = [0]
 
   for p in args.passages:
     orig = os.path.join(args.results, f"p{p:02d}_orig.wav")
@@ -109,10 +115,14 @@ def main():
     rep = {} if args.no_model else {"model": scores(orig, os.path.join(args.results, f"p{p:02d}_recon.wav"))}
     for mode in args.modes:
       torch.manual_seed(p)
+      n_ctrl_cur[0] = n_ctrl
       if args.init == "analysis":
-        log_amp = analysis_init(y).detach().clone().requires_grad_(True)
+        log_amp = analysis_init(y).detach().clone()
+        if args.stride > 1:
+          log_amp = log_amp[:, :, ::args.stride]
+        log_amp = log_amp.requires_grad_(True)
       else:
-        log_amp = torch.full((1, nb.n_params, n_ctrl), float(args.init), device="cuda", requires_grad=True)
+        log_amp = torch.full((1, nb.n_params, -(-n_ctrl // args.stride)), float(args.init), device="cuda", requires_grad=True)
       opt = torch.optim.Adam([log_amp], lr=args.lr)
       for step in range(args.steps):
         shift = 0 if mode == "fixed" else int(torch.randint(0, band_len // rf, (1,))) * rf
