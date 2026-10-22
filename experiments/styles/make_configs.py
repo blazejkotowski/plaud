@@ -8,6 +8,11 @@ set's full factory model (the *_nosilence config, whose trained synth is the E0 
   range     E5  dynamic-range loss alone (separates the two halves of E4)
   adv       E6  adversarial loss alone (distribution matching, no range loss)
   env       E7  time-aligned band-envelope loss (EnvelopeLoss) next to the spectral loss
+  flat250   E8  synth with 250 constant-envelope noise bands (flatten_noise), baseline loss
+  flat1000  E9  synth with its 1000 bands made constant-envelope, baseline loss
+  clean1000 E10 synth fixes only: int16 noise bands (int8's quantisation floor is a hiss) and linear amplitude ramps
+                (the steps are a zipper hiss), baseline loss
+  syn250    E11 250 bands, iteratively flattened (flat envelope, exactly band-limited), clean stopband, int16, ramps
 
 Checkpoints every 20 epochs. Style labels come from make_styles.py (experiments/styles/labels).
 
@@ -44,7 +49,10 @@ def main():
   for exp, what in [("oracle", "one style embedding per 16 s passage"), ("k12", "12 style clusters of 16 s passages"),
                     ("lat4", "4 latents, no styles"), ("rangeadv", "dynamic-range loss + adversarial loss"),
                     ("range", "dynamic-range loss alone"), ("adv", "adversarial loss alone"),
-                    ("env", "band-envelope loss")]:
+                    ("env", "band-envelope loss"), ("flat250", "250 constant-envelope noise bands"),
+                    ("flat1000", "1000 constant-envelope noise bands"),
+                    ("clean1000", "int16 noise bands and linear amplitude ramps"),
+                    ("syn250", "250 flattened, band-limited int16 noise bands with linear ramps")]:
     c = sub(r"^  name: \S+", f"  name: st_{args.set}_{exp}", base)
     if exp in ("oracle", "k12"):
       c = sub(r"^(data:\n)", rf"\1  styles: {LABELS}/{args.set}_{exp}.npy\n", c)
@@ -55,6 +63,13 @@ def main():
       c = sub(r"^(losses:\n)", r"\1  - type: DynamicRangeLoss\n    weight: 0.1\n    params:\n      fs: 48000\n", c)
     if exp == "env":
       c = sub(r"^(losses:\n)", r"\1  - type: EnvelopeLoss\n    weight: 0.1\n    params:\n      fs: 48000\n", c)
+    if exp == "clean1000":
+      c = sub(r"^(\s+)n_filters: (\d+)\n", r"\1n_filters: \2\n\1noise_bits: 16\n\1ramp: true\n", c)
+    if exp == "syn250":
+      c = sub(r"^(\s+)n_filters: \d+\n", r"\1n_filters: 250\n\1flatten_noise: true\n\1flatten_iters: 8\n"
+              r"\1clean_stopband: true\n\1noise_bits: 16\n\1ramp: true\n", c)
+    if exp.startswith("flat"):
+      c = sub(r"^(\s+)n_filters: \d+\n", rf"\1n_filters: {exp[4:]}\n\1flatten_noise: true\n", c)
     if exp in ("rangeadv", "adv"):
       c = sub(r"^(adversarial:\n  )enabled: false", r"\1enabled: true", c)
       c = sub(r"g_start_epoch: \d+", "g_start_epoch: 40", c)

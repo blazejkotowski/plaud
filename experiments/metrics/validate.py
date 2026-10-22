@@ -25,7 +25,7 @@ ROOT = os.path.dirname(os.path.dirname(HERE))
 DS = os.path.join(ROOT, "experiments/datasize/results_whole")
 ST = os.path.join(ROOT, "experiments/styles/results/percussion")
 CACHE = os.path.join(HERE, "aligned_scores.json")
-MEASURES = ["env20", "env100", "hf20", "dyncorr", "attack", "tail_cut", "tail_long", "floor"]
+MEASURES = ["env20", "env100", "hf20", "dyncorr", "attack", "tail_cut", "tail_long", "floor", "ltas"]
 
 
 def _job(r):

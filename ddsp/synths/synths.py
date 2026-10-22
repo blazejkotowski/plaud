@@ -257,17 +257,30 @@ class NoiseBandSynth(BaseSynth):
     - fs: int, the sampling rate of the input signal
     - resampling_factor: int, the internal up / down sampling factor for the signal
     - device: str, the device to use
+    - flatten_noise, flatten_iters, clean_stopband, noise_bits: how the noise bands are baked (FilterBank)
+    - ramp: bool, ramp each band's amplitude linearly from the previous control frame to the current one instead of
+      holding it for the frame; the steps are clicks on loud bands, heard as a zipper hiss (1-3 kHz on dark
+      material). Costs a second render: sum_b noise_b * (prev_b + r * delta_b) = render(prev) + r * render(delta).
   """
 
-  def __init__(self, n_filters: int = 2048, fs: int = 44100, resampling_factor: int = 32, device: str = 'cuda'):
+  def __init__(self, n_filters: int = 2048, fs: int = 44100, resampling_factor: int = 32, device: str = 'cuda',
+               flatten_noise: bool = False,
+               flatten_iters: int = 0, clean_stopband: bool = False, noise_bits: int = 8, ramp: bool = False):
     super().__init__()
     self._resampling_factor = resampling_factor
     self._device = device
+    self._ramp = ramp
+    # last control frame of the previous call (streaming continuity of the ramp); empty = start from the first frame
+    self.register_buffer('_ramp_prev', torch.zeros(0, 0, 0), persistent=False)
 
     self._filterbank = FilterBank(
       n_filters=n_filters,
       fs=fs,
-      device=self._device
+      device=self._device,
+      flatten_noise=flatten_noise,
+      flatten_iters=flatten_iters,
+      clean_stopband=clean_stopband,
+      noise_bits=noise_bits,
     )
 
     # Shift of the noisebands between inferences, to maintain continuity
@@ -309,11 +322,9 @@ class NoiseBandSynth(BaseSynth):
     limit_components = max(0.0, min(limit_components, 1.0))
     rf = int(self._resampling_factor)
     noisebands = self._noisebands  # int8 [n_filters, band_len] (mem exp3)
-    nb_scale = self._filterbank.noisebands_scale  # [n_filters] per-band; dequant = int8_slice.float() * scale[:,None]
     band_len = noisebands.shape[-1]
     n_ctrl = amplitudes.shape[-1]
     total_len = n_ctrl * rf
-    batch_size = amplitudes.shape[0]
 
     if self.training:
       # Roll noisebands randomly during training to avoid overfitting to specific noise values
@@ -322,6 +333,36 @@ class NoiseBandSynth(BaseSynth):
     # Track shift for streaming continuity (start_pos is always a multiple of rf)
     start_pos = self._noisebands_shift % band_len
     self._noisebands_shift = (self._noisebands_shift + total_len) % band_len
+
+    if not self._ramp:
+      return self._render(amplitudes, noisebands, start_pos, limit_components)
+
+    # ramp from the previous frame (the last frame of the previous call when streaming the same shape)
+    first = amplitudes[:, :, :1]
+    if (not self.training) and self._ramp_prev.dim() == 3 and self._ramp_prev.shape[0] == amplitudes.shape[0] \
+        and self._ramp_prev.shape[1] == amplitudes.shape[1]:
+      first = self._ramp_prev
+    prev = torch.cat([first, amplitudes[:, :, :-1]], dim=-1)
+    if not self.training:
+      self._ramp_prev = amplitudes[:, :, -1:].detach()
+    if limit_components > 0:
+      max_bands = max(int(self.n_params * (1 - limit_components)), 1)
+      _, indices = torch.topk(amplitudes.mean(dim=-1), max_bands, dim=1)
+      mask = torch.zeros_like(amplitudes[:, :, :1]).scatter_(1, indices.unsqueeze(-1), 1.0)
+      amplitudes = amplitudes * mask
+      prev = prev * mask
+    r = ((torch.arange(rf, device=amplitudes.device, dtype=amplitudes.dtype) + 1.0) / rf).repeat(n_ctrl)
+    return self._render(prev, noisebands, start_pos, 0.0) + r * self._render(amplitudes - prev, noisebands, start_pos, 0.0)
+
+  def _render(self, amplitudes: torch.Tensor, noisebands: torch.Tensor, start_pos: int,
+              limit_components: float) -> torch.Tensor:
+    """Stepwise render: each band's amplitude held for its control frame, noise read from start_pos."""
+    rf = int(self._resampling_factor)
+    nb_scale = self._filterbank.noisebands_scale  # [n_filters] per-band; dequant = int8_slice.float() * scale[:,None]
+    band_len = noisebands.shape[-1]
+    n_ctrl = amplitudes.shape[-1]
+    total_len = n_ctrl * rf
+    batch_size = amplitudes.shape[0]
 
     if limit_components > 0:
       upsampled_amplitudes = amplitudes.repeat_interleave(rf, dim=-1)
@@ -391,7 +432,9 @@ class BendableNoiseBandSynth(BaseSynth):
                fs: int = 44100,
                resampling_factor: int = 32,
                device: str = 'cuda',
-               streaming: bool = False):
+               streaming: bool = False,
+               flatten_noise: bool = False,
+               flatten_iters: int = 0, clean_stopband: bool = False, noise_bits: int = 8, ramp: bool = False):
     super().__init__()
 
     print(f"Initializing BendableNoiseBandSynth with resampling_factor {resampling_factor}...")
@@ -404,6 +447,11 @@ class BendableNoiseBandSynth(BaseSynth):
       fs=fs,
       resampling_factor=resampling_factor,
       device=device,
+      flatten_noise=flatten_noise,
+      flatten_iters=flatten_iters,
+      clean_stopband=clean_stopband,
+      noise_bits=noise_bits,
+      ramp=ramp,
     )
 
     boundaries = self._noiseband_synth._filterbank._boundaries

@@ -33,12 +33,36 @@ def main():
   ap.add_argument("--ckpt", required=True)
   ap.add_argument("--out", required=True)
   ap.add_argument("--n", type=int, default=8)
+  ap.add_argument("--noise-bits", type=int, default=0, help="re-bake the synth's noise bands at 16 bits (same noise)")
+  ap.add_argument("--interp", default="", help="'linear': ramp the band amplitudes between control frames")
   args = ap.parse_args()
 
   cfg = OmegaConf.load(args.config)
   fs, rf = int(cfg.audio.fs), int(cfg.model.resampling_factor)
   cs = build_control_space(cfg.model.control_space)
   model = DDSP.load_from_checkpoint(args.ckpt, control_space=cs, map_location="cuda", weights_only=False).cuda().eval()
+  if args.noise_bits or args.interp:
+    from ddsp.filterbank import FilterBank
+    from ddsp.synths.synths import NoiseBandSynth
+    for syn in model.synths:
+      nbs = getattr(syn, "_noiseband_synth", None)
+      if nbs is None:
+        continue
+      if args.noise_bits:
+        old = nbs._filterbank
+        new = FilterBank(n_filters=old._n_filters + 2, fs=old._fs, device="cuda", noise_bits=args.noise_bits)
+        nbs._filterbank.noisebands, nbs._filterbank.noisebands_scale = new.noisebands.cuda(), new.noisebands_scale.cuda()
+      if args.interp == "linear":
+        def fwd(amplitudes, *a, _nbs=nbs, **k):
+          rf = int(_nbs._resampling_factor); T = amplitudes.shape[-1] * rf
+          bands = _nbs._noisebands.to(torch.float32) * _nbs._filterbank.noisebands_scale[:, None]
+          idx = torch.arange(T, device=amplitudes.device) % bands.shape[-1]
+          out = torch.zeros(amplitudes.shape[0], 1, T, device=amplitudes.device)
+          for b0 in range(0, bands.shape[0], 50):                                 # chunked: [B, 50, T] at a time
+            up = torch.nn.functional.interpolate(amplitudes[:, b0:b0 + 50], size=T, mode="linear", align_corners=False)
+            out[:, 0] += (up * bands[b0:b0 + 50][:, idx]).sum(1)
+          return out
+        nbs.forward = fwd
   if model.encoder is not None:
     model.encoder.reparametrize = lambda mean, scale: (mean, torch.tensor(0.0, device=mean.device))
   data = AudioFeatureDataset(dataset_path=cfg.data.dataset_path, n_signal=int(fs * float(cfg.audio.chunk_duration_s)),
