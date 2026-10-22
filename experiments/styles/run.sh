@@ -4,6 +4,7 @@
 # ~15 GB of GPU memory) and restarted at the end; it resumes from its last.ckpt.
 # After each run: passage reconstructions of every checkpoint, then the scores (percept env).
 #   nohup experiments/styles/run.sh percussion [exp ...] > ~/styles.log 2>&1 &
+# KEEP_HOLD=1 leaves PLANC stopped at the end (for a queue of several runner calls).
 set=${1:-percussion}
 exps=(${@[2,-1]}); (( $#exps )) || exps=(oracle lat4 k12 rangeadv)
 cd /home/btadeusz/code/plaud
@@ -55,5 +56,5 @@ for exp in $exps; do
   $PERCEPT experiments/styles/score_passages.py --results $R 2>/dev/null | tail -n +1 > $R/summary_after_$exp.txt
   echo "$(date) scored after $exp"; cat $R/summary_after_$exp.txt
 done
-release
+[ -n "$KEEP_HOLD" ] || release
 echo "$(date) style experiments finished ($set)"
