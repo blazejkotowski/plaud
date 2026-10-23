@@ -14,8 +14,7 @@ force_weights_only_false()
 import os
 import shutil
 
-from torch.utils.data import DataLoader, Dataset, RandomSampler, Subset, random_split
-import numpy as np
+from torch.utils.data import DataLoader, RandomSampler, Subset, random_split
 from ddsp import DDSP, AudioFeatureDataset
 from ddsp.synths import BendableNoiseBandSynth
 from ddsp.callbacks import BetaWarmupEpochCallback
@@ -44,21 +43,6 @@ def _silence_kwargs(scfg) -> dict:
     silence_reg_weight=float(scfg.get('reg_weight', 1.0)),
     silence_floor_db=float(scfg.get('floor_db', -70.0)),
   )
-
-
-class _WithStyle(Dataset):
-  """Adds each chunk's style label (data.styles: a .npy of one label per chunk index, from
-  experiments/styles/make_styles.py) to the dataset's (audio, features)."""
-  def __init__(self, base: Dataset, labels: np.ndarray):
-    assert len(labels) >= len(base), f"{len(labels)} style labels for {len(base)} chunks"
-    self.base, self.labels = base, torch.as_tensor(labels, dtype=torch.long)
-
-  def __len__(self):
-    return len(self.base)
-
-  def __getitem__(self, idx):
-    audio, features = self.base[idx]
-    return audio, features, self.labels[idx % len(self.base)]
 
 
 @hydra.main(version_base=None, config_path="../configs", config_name="experiment")
@@ -104,15 +88,6 @@ def main(cfg: DictConfig) -> None:
     transform_fn=transform_fn,
     n_channels=n_channels,
   )
-
-  # Style labels (optional, research): data.styles, one label per chunk
-  styles_path = getattr(cfg.data, 'styles', None)
-  n_styles = 0
-  if styles_path:
-    labels = np.load(styles_path)
-    n_styles = int(labels.max()) + 1
-    synth_dataset = _WithStyle(synth_dataset, labels)
-    print(f"Style labels: {styles_path} ({n_styles} styles)")
 
   # Dataloaders
   batch_size = int(cfg.trainer.batch_size)
@@ -169,8 +144,6 @@ def main(cfg: DictConfig) -> None:
     adv_disc_update_every=int(getattr(cfg.adversarial, 'disc_update_every', 5)),
     ddsp_min_lr=float(getattr(cfg.model, 'min_lr', 0.0)),
     **_silence_kwargs(getattr(cfg, 'silence', None)),
-    n_styles=n_styles,
-    style_dim=int(getattr(cfg.model, 'style_dim', 16)),
     config_name=active_config_name,
   )
 

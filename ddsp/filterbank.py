@@ -19,9 +19,6 @@ class FilterBank(nn.Module):
     - transition_width: float, the width of the transition band of the kaiser filters
     - stopband_attenuation: float, the attenuation in the stopband of the kaiser filters, in dB
     - fs: int, the sampling frequency of the input signal
-    - flatten_noise: bool, give each baked noise band a constant envelope (the cosine of its phase, same RMS), so
-      the amplitude control alone sets its level over time; a narrow band's own random envelope is slow (tens of
-      ms), which a decoder can't predict and so answers with mush
   """
 
   def __init__(self,
@@ -33,11 +30,7 @@ class FilterBank(nn.Module):
                stopband_attenuation: float = 50.0,
                max_freq: Optional[float] = None,
                fs: int = 44100,
-               device='cuda',
-               flatten_noise: bool = False,
-               flatten_iters: int = 0,
-               clean_stopband: bool = False,
-               noise_bits: int = 8):
+               device='cuda'):
     super().__init__()
     self._n_filters = n_filters - 2 # lowpass and highpass filters are added in default at the limits of the spectrum
     self._stopband_attenuation = stopband_attenuation
@@ -47,20 +40,16 @@ class FilterBank(nn.Module):
     self._lin_filters_cutoff_ratio = lin_filters_cutoff_ratio
     self._lowpass_cutoff = lowpass_cutoff
     self._max_freq = max_freq
-    self._flatten_noise = flatten_noise
-    self._flatten_iters = flatten_iters
-    self._clean_stopband = clean_stopband
 
     self._boundaries = self._calculate_boundaries()
 
     self._filters = self._build_filterbank(self._boundaries)
     # self.register_buffer('noisebands', torch.from_numpy(np.array(self._bake_noisebands())))
 
-    # optimisation: store the baked noisebands as int8 (or int16) + per-band float scales instead of float32
+    # optimisation: store the baked noisebands as int8 + per-band float scales instead of float32
     _nb = torch.from_numpy(np.array(self._bake_noisebands())).float()  # [n_filters, n_signal]
-    qmax, qtype = (32767.0, torch.int16) if noise_bits == 16 else (127.0, torch.int8)
-    _nb_scale = (_nb.abs().amax(dim=1) / qmax).clamp_min(1e-12)        # [n_filters] per-band
-    _nb_q = torch.round(_nb / _nb_scale.unsqueeze(1)).clamp(-qmax - 1, qmax).to(qtype)
+    _nb_scale = (_nb.abs().amax(dim=1) / 127.0).clamp_min(1e-12)       # [n_filters] per-band
+    _nb_q = torch.round(_nb / _nb_scale.unsqueeze(1)).clamp(-128.0, 127.0).to(torch.int8)
     self.register_buffer('noisebands', _nb_q, persistent=False)
     self.register_buffer('noisebands_scale', _nb_scale, persistent=False)  # [n_filters]
 
@@ -124,8 +113,6 @@ class FilterBank(nn.Module):
 
       # get the mangnitude only
       magH = np.abs(bigH)
-      if self._clean_stopband:
-        magH = np.where(magH >= magH.max() * 10 ** (-self._stopband_attenuation / 20), magH, 0.0)
 
       # generate filtered white noise by randomising the phase of the frequency response
       # the phase needs to be 0 at the beginning and the end to make signal loopable
@@ -135,19 +122,6 @@ class FilterBank(nn.Module):
 
       # inverse fft to get the time domain signal
       y = np.fft.irfft(bigY)
-      if self._flatten_noise:
-        # constant envelope: the analytic signal's phase only (circular, so the band stays loopable); with
-        # flatten_iters, alternate with the band's magnitude response and end on it
-        rms = np.sqrt(np.mean(y ** 2))
-        h = np.zeros(len(y)); h[0] = 1; h[1:(len(y) + 1) // 2] = 2
-        if len(y) % 2 == 0: h[len(y) // 2] = 1
-        for it in range(max(1, self._flatten_iters)):
-          a = np.fft.ifft(np.fft.fft(y) * h)
-          y = np.real(a / np.maximum(np.abs(a), 1e-12)) * rms
-          if self._flatten_iters > 0:
-            Y = np.fft.rfft(y)
-            y = np.fft.irfft(magH * np.exp(1j * np.angle(Y)), n=len(y))
-            y *= rms / max(np.sqrt(np.mean(y ** 2)), 1e-20)
 
       # append to noisebank
       noisebands.append(y)
